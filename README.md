@@ -2,12 +2,12 @@
 
 Browser-based SSML text-to-speech generator powered by Microsoft Edge TTS.
 
-Paste SSML or use the visual **Text Input** builder to pick a voice, set speed/pitch, and generate speech. All synthesis happens locally via [edge-tts](https://github.com/rany2/edge-tts) — no cloud API key needed.
+paste SSML or use the visual **Text Input** builder to pick a voice, set speed/pitch, and generate speech. Uses [edge-tts](https://github.com/rany2/edge-tts) which communicates with Microsoft's online TTS service — your text is sent over the network. No API key required.
 
 ## Features
 
 - **SSML tab** — raw SSML editing with live template pre-fill
-- **Text Input tab** — visual voice picker with 322 voices across 142 languages
+- **Text Input tab** — visual voice picker with hundreds of voices across many languages
   - Language dropdown + gender filter + voice search
   - Two-column voice list (Preview | Selected)
   - Speed slider (−50% to +200%)
@@ -34,7 +34,12 @@ The server runs on `http://localhost:5000`. Open `index.html` in a browser — i
 
 ## Configuration
 
-All settings via environment variables:
+Copy `config.example.json` to `config.json` and edit:
+```bash
+cp config.example.json config.json
+```
+
+All settings via `config.json` or environment variables. Env vars take precedence.
 
 | Variable | Default | Description |
 |---|---|---|

@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Text-to-speech via Microsoft Edge TTS. Select text, right-click, or use the popup.",
   "permissions": ["contextMenus", "storage", "activeTab", "scripting"],
-  "host_permissions": ["http://localhost:5000/*"],
+  "host_permissions": ["http://localhost:5000/*", "http://127.0.0.1:5000/*", "http://localhost:*/*", "http://127.0.0.1:*/*"],
   "background": {
     "service_worker": "background.js"
   },

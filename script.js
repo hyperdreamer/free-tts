@@ -66,9 +66,10 @@ const pitchValue      = $("#pitchValue");
 const previewBtn      = $("#previewBtn");
 const stopBtn         = $("#stopBtn");
 const downloadTextBtn  = $("#downloadTextBtn");
-const ssmlPreview     = $("#ssmlPreview");
+const ssmlPreview = $("#ssmlPreview");
 const resultsList     = $("#resultsList");
 const audioPlayer     = $("#audioPlayer");
+const errorMsg        = $("#errorMsg");
 
 // ---------------------------------------------------------------------------
 // XML escaping
@@ -297,7 +298,7 @@ voiceSearch.addEventListener("input", renderVoiceList);
 // ---------------------------------------------------------------------------
 function updateSliderDisplay() {
   speedValue.textContent = speedSlider.value + "%";
-  pitchValue.textContent = pitchSlider.value + "%";
+  pitchValue.textContent = pitchSlider.value + " Hz";
 }
 
 function updateSSMLPreview() {
@@ -315,26 +316,47 @@ textInputArea.addEventListener("input", updateSSMLPreview);
 // TTS API call
 // ---------------------------------------------------------------------------
 async function callTTS(ssml) {
-  const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ssml }),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssml }),
+      signal: controller.signal,
+    });
 
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ error: resp.statusText }));
-    throw new Error(err.error || "TTS request failed");
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      throw new Error(err.error || "TTS request failed");
+    }
+
+    return await resp.blob();
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return await resp.blob();
 }
 
 function playBlob(blob) {
+  // Revoke previous blob URL to prevent memory leaks
+  if (audioPlayer.src && audioPlayer.src.startsWith("blob:")) {
+    URL.revokeObjectURL(audioPlayer.src);
+  }
   const url = URL.createObjectURL(blob);
   audioPlayer.src = url;
   audioPlayer.play();
   showStopButton();
-  audioPlayer.onended = hideStopButton;
+  audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); };
+}
+
+function stopAudio() {
+  audioPlayer.pause();
+  audioPlayer.currentTime = 0;
+  if (audioPlayer.src && audioPlayer.src.startsWith("blob:")) {
+    URL.revokeObjectURL(audioPlayer.src);
+  }
+  audioPlayer.src = "";
+  hideStopButton();
 }
 
 function downloadBlob(blob, filename = "tts-output.mp3") {
@@ -346,13 +368,6 @@ function downloadBlob(blob, filename = "tts-output.mp3") {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function stopAudio() {
-  audioPlayer.pause();
-  audioPlayer.currentTime = 0;
-  audioPlayer.src = "";
-  hideStopButton();
 }
 
 function showStopButton() {

@@ -10,8 +10,8 @@
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <div class="tab active-tab" data-tab="text">Text Input</div>
-            <div class="tab" data-tab="ssml">SSML</div>
+            <button class="tab active-tab" data-tab="text" role="tab" aria-selected="true">Text Input</button>
+            <button class="tab" data-tab="ssml" role="tab" aria-selected="false">SSML</button>
         </div>
 
         <!-- Text Input Tab -->
@@ -86,7 +86,7 @@
                         <div class="field-group slider-group">
                             <label class="field-label">
                                 Pitch
-                                <span class="slider-value" id="pitchValue">0%</span>
+                                <span class="slider-value" id="pitchValue">0 Hz</span>
                             </label>
                             <input type="range" id="pitchSlider" class="slider" min="-50" max="50" value="0" step="1">
                         </div>

@@ -32,7 +32,7 @@ import os
 import signal
 import sys
 import time
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET  # type: ignore[import-untyped]
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -101,7 +101,7 @@ DEFAULT_RATE: str = _cfg("default_rate", "TTS_DEFAULT_RATE", "+0%")
 DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 """Default pitch (edge-tts format) when <prosody pitch> is missing."""
 
-SERVER_HOST: str = _cfg("host", "TTS_HOST", "0.0.0.0")
+SERVER_HOST: str = _cfg("host", "TTS_HOST", "127.0.0.1")
 SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 
 MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024, coerce=int)
@@ -109,6 +109,9 @@ MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024,
 
 TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 60, coerce=int)
 """Maximum seconds for a single TTS generation request."""
+
+TTS_MAX_CONCURRENT: int = _cfg("max_concurrent", "TTS_MAX_CONCURRENT", 2, coerce=int)
+"""Maximum concurrent TTS generation requests. 0 = unlimited."""
 
 WAITRESS_THREADS: int = _cfg("waitress_threads", "TTS_WAITRESS_THREADS", 4, coerce=int)
 """Number of Waitress worker threads."""
@@ -289,6 +292,7 @@ def _parse_rate(raw: Optional[str]) -> str:
 
     Rules (applied in order):
         - ``None`` or empty  →  ``DEFAULT_RATE``
+        - ``"+N%"`` or ``"-N%"`` (signed relative) → passed through as-is
         - ``"0%"``           →  ``"+0%"``   (safe no-change representation)
         - ``"N%"`` where N < 100  →  ``"-{100-N}%"``   (slow-down relative to 100 %)
         - ``"N%"`` where N ≥ 100  →  ``"+{N-100}%"``   (speed-up relative to 100 %)
@@ -298,6 +302,10 @@ def _parse_rate(raw: Optional[str]) -> str:
         return DEFAULT_RATE
 
     raw = raw.strip()
+    # Already a signed relative value (e.g. "+20%", "-10%") — pass through
+    if raw.startswith("+") or raw.startswith("-"):
+        return raw
+
     if raw.endswith("%"):
         try:
             val = float(raw[:-1])
@@ -374,14 +382,14 @@ def extract_tts_params(ssml: str) -> TTSRequest:
         if prosody_el is not None:
             rate = _parse_rate(prosody_el.get("rate"))
             pitch = _parse_pitch(prosody_el.get("pitch"))
-            text = (prosody_el.text or "").strip()
+            text = " ".join(prosody_el.itertext()).strip()
         else:
-            text = (voice_el.text or "").strip()
+            text = " ".join(voice_el.itertext()).strip()
             logger.warning(
                 "No <prosody> inside <voice>; using default rate/pitch."
             )
     else:
-        text = (root.text or "").strip()
+        text = " ".join(root.itertext()).strip()
         logger.warning(
             "No <voice> element found; using default voice, rate, and pitch."
         )
@@ -468,8 +476,20 @@ def create_app() -> Flask:
 
     # Don't serve static files or templates — API only
     app.config["PROPAGATE_EXCEPTIONS"] = True  # let WSGI server handle errors
+    # Reject oversized request bodies before JSON parsing
+    app.config["MAX_CONTENT_LENGTH"] = max(MAX_SSML_LENGTH * 2, 64 * 1024)
 
     CORS(app)
+
+    # Concurrency limiter
+    _tts_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT) if TTS_MAX_CONCURRENT > 0 else None
+
+    # Populate voice cache on startup (works with any WSGI entrypoint)
+    if not _voice_cache_ready:
+        try:
+            asyncio.run(_refresh_voice_cache())
+        except Exception as exc:
+            logger.error("Failed to initialise voice cache: %s", exc)
 
     # -- Request logging -----------------------------------------------------
     @app.before_request
@@ -548,12 +568,19 @@ def create_app() -> Flask:
 
         # 2. Synthesise
         try:
-            audio = await generate_audio(tts_req)
-        except TimeoutError as exc:
-            logger.error("TTS timeout: %s", exc)
+            if _tts_semaphore is not None:
+                async with _tts_semaphore:
+                    audio = await asyncio.wait_for(generate_audio(tts_req), timeout=TTS_TIMEOUT)
+            else:
+                audio = await asyncio.wait_for(generate_audio(tts_req), timeout=TTS_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            logger.error("TTS timeout after %ds", TTS_TIMEOUT)
             return jsonify({"error": _error_message(exc)}), 504  # type: ignore[return-value]
         except RuntimeError as exc:
             logger.error("TTS generation failed: %s", exc)
+            return jsonify({"error": _error_message(exc)}), 500  # type: ignore[return-value]
+        except Exception as exc:
+            logger.exception("Unexpected TTS error")
             return jsonify({"error": _error_message(exc)}), 500  # type: ignore[return-value]
 
         # 3. Respond
@@ -585,9 +612,6 @@ signal.signal(signal.SIGINT, _handle_shutdown)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     application = create_app()
-
-    # Populate voice cache from edge-tts on every reboot
-    asyncio.run(_refresh_voice_cache())
 
     if not _voice_cache_ready:
         logger.critical(
@@ -644,25 +668,22 @@ if __name__ == "__main__":
             )
             sys.exit(1)
     else:
-        try:
-            from waitress import serve  # type: ignore[import-untyped]
-        except ImportError:
-            logger.warning(
-                "Waitress not installed; falling back to Flask development server. "
-                "Install with: pip install waitress"
-            )
-            application.run(host=SERVER_HOST, port=SERVER_PORT)
-        else:
+        if PRODUCTION:
+            try:
+                from waitress import serve  # type: ignore[import-untyped]
+            except ImportError:
+                logger.critical(
+                    "Waitress not installed in production. Install with: pip install waitress"
+                )
+                sys.exit(1)
             logger.info(
                 "Starting Waitress on %s:%d (threads=%d)",
                 SERVER_HOST,
                 SERVER_PORT,
                 WAITRESS_THREADS,
             )
-            serve(
-                application,
-                host=SERVER_HOST,
-                port=SERVER_PORT,
-                threads=WAITRESS_THREADS,
-                _quiet=True,
-            )
+            serve(application, host=SERVER_HOST, port=SERVER_PORT, threads=WAITRESS_THREADS, _quiet=True)
+        else:
+            # FLASK_DEBUG mode: use Flask dev server
+            logger.info("Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT)
+            application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)

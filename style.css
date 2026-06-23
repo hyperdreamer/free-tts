@@ -62,7 +62,10 @@ body {
     cursor: pointer;
     font-size: 14px;
     font-weight: 500;
+    font-family: var(--font);
     color: var(--text-secondary);
+    background: none;
+    border: none;
     border-bottom: 2px solid transparent;
     transition: color 0.15s, border-color 0.15s;
     user-select: none;
