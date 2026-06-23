@@ -28,11 +28,6 @@ async function init() {
   const { voice: savedVoice } = await chrome.storage.sync.get({ voice: DEFAULT_VOICE });
   defaultVoice = savedVoice;
 
-  // Render cached voices immediately, then refresh in the background
-  const cached = await chrome.storage.local.get({ voices: [] });
-  voices = cached.voices || [];
-  if (voices.length) renderVoiceSelect();
-
   // Auto-fill with selected text from the active tab
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -48,9 +43,8 @@ async function init() {
     // scripting permission not available everywhere
   }
 
-  // Do not block the popup on network checks. Refresh async.
-  checkServer();
-  loadVoices();
+  await checkServer();
+  await loadVoices();
 
   // Save voice selection on change
   voiceSelect.addEventListener("change", () => {
@@ -87,16 +81,14 @@ async function checkServer() {
 // --- Load voices ----------------------------------------------------------
 async function loadVoices() {
   try {
-    const resp = await fetch(`${serverUrl}/voices`, { signal: AbortSignal.timeout(3000) });
+    const resp = await fetch(`${serverUrl}/voices`, { signal: AbortSignal.timeout(5000) });
     if (!resp.ok) throw new Error("Failed");
     const data = await resp.json();
     voices = data.voices || [];
-    await chrome.storage.local.set({ voices, voicesUpdatedAt: Date.now() });
-    renderVoiceSelect();
   } catch {
-    // Keep cached voices if available; only show error when cache is empty.
-    if (voices.length === 0) renderVoiceSelect();
+    voices = [];
   }
+  renderVoiceSelect();
 }
 
 function renderVoiceSelect() {
