@@ -485,8 +485,16 @@ def create_app() -> Flask:
 
     CORS(app)
 
-    # Concurrency limiter
-    _tts_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT) if TTS_MAX_CONCURRENT > 0 else None
+    # Concurrency limiter — created lazily in request to use correct event loop
+    _tts_semaphore: "asyncio.Semaphore | None" = None
+
+    def _get_semaphore() -> "asyncio.Semaphore | None":
+        nonlocal _tts_semaphore
+        if TTS_MAX_CONCURRENT <= 0:
+            return None
+        if _tts_semaphore is None:
+            _tts_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT)
+        return _tts_semaphore
 
     # Populate voice cache on startup (works with any WSGI entrypoint)
     if not _voice_cache_ready:
@@ -572,8 +580,9 @@ def create_app() -> Flask:
 
         # 2. Synthesise (stall timeout handled inside generate_audio)
         try:
-            if _tts_semaphore is not None:
-                async with _tts_semaphore:
+            sem = _get_semaphore()
+            if sem is not None:
+                async with sem:
                     audio = await generate_audio(tts_req)
             else:
                 audio = await generate_audio(tts_req)
