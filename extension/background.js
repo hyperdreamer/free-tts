@@ -11,6 +11,12 @@ chrome.runtime.onInstalled.addListener(() => {
     title: "Speak this",
     contexts: ["selection"],
   });
+  chrome.alarms.create("refresh-voices", { periodInMinutes: 360 });
+  refreshVoicesCache();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "refresh-voices") refreshVoicesCache();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -72,6 +78,22 @@ async function speakInTab(tabId, text) {
     });
   } catch (err) {
     console.error("free-tts:", err);
+  }
+}
+
+// --- Fetch and cache voices in background ----------------------------------
+async function refreshVoicesCache() {
+  try {
+    const { serverUrl } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
+    const resp = await fetch(`${serverUrl}/voices`, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    await chrome.storage.local.set({
+      voices: data.voices || [],
+      voicesUpdatedAt: Date.now(),
+    });
+  } catch (err) {
+    console.warn("free-tts: voice cache refresh failed", err);
   }
 }
 
