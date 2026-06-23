@@ -9,6 +9,24 @@ let activePlayback = { tabId: null };
 let playbackTimeout = null;
 let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl }
 
+function logError(context, error) {
+  console.error(`free-tts background: ${context}`, error);
+}
+
+function callContextMenuApi(method, ...args) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.contextMenus[method](...args, () => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 function clearPlayback() {
   activePlayback = { tabId: null };
   if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
@@ -17,31 +35,49 @@ function clearPlayback() {
 }
 
 function updateStopMenu() {
-  chrome.contextMenus.update("stop-speaking", {
+  callContextMenuApi("update", "stop-speaking", {
     visible: !!activePlayback.tabId,
-  });
+  }).catch(() => {});
 }
 
-// --- Context menu ----------------------------------------------------------
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
+async function createContextMenus() {
+  await callContextMenuApi("removeAll");
+  await callContextMenuApi("create", {
     id: "speak-selection",
     title: "Speak this",
     contexts: ["selection"],
   });
-  chrome.contextMenus.create({
+  await callContextMenuApi("create", {
     id: "stop-speaking",
     title: "Stop speaking",
     contexts: ["page"],
     visible: false,
   });
+}
+
+// --- Context menu ----------------------------------------------------------
+chrome.runtime.onInstalled.addListener(() => {
+  createContextMenus().catch((error) => logError("creating context menus on install", error));
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  createContextMenus().catch((error) => logError("creating context menus on startup", error));
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === "speak-selection" && info.selectionText) {
-    await startSentenceTTS(tab.id, info.selectionText);
-  } else if (info.menuItemId === "stop-speaking") {
-    await stopPlayback();
+  try {
+    if (info.menuItemId === "speak-selection") {
+      const text = info.selectionText?.trim();
+      if (!tab?.id || !text) return;
+      await startSentenceTTS(tab.id, text);
+      return;
+    }
+
+    if (info.menuItemId === "stop-speaking") {
+      await stopPlayback();
+    }
+  } catch (error) {
+    logError("handling context menu click", error);
   }
 });
 
@@ -57,8 +93,9 @@ chrome.commands.onCommand.addListener(async (command) => {
       });
       const text = results?.[0]?.result;
       if (text) await startSentenceTTS(tab.id, text);
-    } catch {
+    } catch (error) {
       // scripting permission may not be available on all URLs
+      logError("handling keyboard shortcut", error);
     }
   }
 });
@@ -73,7 +110,9 @@ async function stopPlayback() {
         func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
       });
       await cleanupPageHighlighting(activePlayback.tabId);
-    } catch {}
+    } catch (error) {
+      logError("stopping playback in page", error);
+    }
   }
   clearPlayback();
 }
@@ -97,7 +136,9 @@ async function initPageHighlighting(tabId, sentences) {
       },
       args: [sentences, highlightColor],
     });
-  } catch {}
+  } catch (error) {
+    logError("initializing page highlighting", error);
+  }
 }
 
 async function highlightCurrentSentence(tabId, idx) {
@@ -144,7 +185,9 @@ async function highlightCurrentSentence(tabId, idx) {
       },
       args: [idx],
     });
-  } catch {}
+  } catch (error) {
+    logError("highlighting current sentence", error);
+  }
 }
 
 async function cleanupPageHighlighting(tabId) {
@@ -157,10 +200,22 @@ async function cleanupPageHighlighting(tabId) {
         delete window.__freeTtsColor;
       },
     });
-  } catch {}
+  } catch (error) {
+    logError("cleaning page highlighting", error);
+  }
 }
 
 // --- Fetch audio for one sentence ------------------------------------------
+function arrayBufferToDataUrl(buffer, mimeType = "audio/mpeg") {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+}
+
 async function fetchSentenceAudio(serverUrl, voice, sentence) {
   const ssml = buildSSML(sentence, voice);
   const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
@@ -169,17 +224,15 @@ async function fetchSentenceAudio(serverUrl, voice, sentence) {
     body: JSON.stringify({ ssml }),
   });
   if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
-  const blob = await resp.blob();
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
+  const buffer = await resp.arrayBuffer();
+  const contentType = resp.headers.get("content-type") || "audio/mpeg";
+  return arrayBufferToDataUrl(buffer, contentType);
 }
 
 // --- Main sentence TTS pipeline --------------------------------------------
 async function startSentenceTTS(tabId, text) {
+  if (!tabId || !text?.trim()) return;
+
   const { serverUrl, voice } = await chrome.storage.sync.get({
     serverUrl: DEFAULT_SERVER,
     voice: "en-US-AvaMultilingualNeural",
@@ -202,7 +255,7 @@ async function startSentenceTTS(tabId, text) {
   for (let i = 0; i < preloadCount; i++) {
     fetchSentenceAudio(serverUrl, voice, sentences[i])
       .then(url => cache.set(i, url))
-      .catch(() => {});
+      .catch((error) => logError(`preloading sentence ${i}`, error));
   }
 
   // Wait a bit for first sentence to cache, then play
@@ -230,8 +283,14 @@ async function playNextSentence() {
   }
   if (!dataUrl) {
     // Fallback: fetch directly
-    try { dataUrl = await fetchSentenceAudio(serverUrl, voice, sentences[currentIdx]); }
-    catch { clearPlayback(); return; }
+    try {
+      dataUrl = await fetchSentenceAudio(serverUrl, voice, sentences[currentIdx]);
+      cache.set(currentIdx, dataUrl);
+    } catch (error) {
+      logError(`fetching sentence ${currentIdx}`, error);
+      clearPlayback();
+      return;
+    }
   }
 
   // Pre-fetch upcoming sentences
@@ -239,7 +298,7 @@ async function playNextSentence() {
     if (!cache.has(i)) {
       fetchSentenceAudio(serverUrl, voice, sentences[i])
         .then(url => cache.set(i, url))
-        .catch(() => {});
+        .catch((error) => logError(`preloading sentence ${i}`, error));
     }
   }
 
@@ -250,14 +309,13 @@ async function playNextSentence() {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (url, callback) => {
+      func: (url) => {
         if (window.__freeTtsAudio) { window.__freeTtsAudio.pause(); }
         const a = new Audio(url);
         a.play().catch(() => {});
-        a.onended = () => { if (typeof callback === "function") callback(); };
         window.__freeTtsAudio = a;
       },
-      args: [dataUrl, true],  // flag to indicate completion
+      args: [dataUrl],
     });
 
     // Wait for audio to end (polling approach)
@@ -279,7 +337,8 @@ async function playNextSentence() {
       sentencePipeline.currentIdx++;
       await playNextSentence();
     }
-  } catch {
+  } catch (error) {
+    logError(`playing sentence ${currentIdx}`, error);
     clearPlayback();
   }
 }
