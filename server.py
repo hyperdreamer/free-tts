@@ -104,8 +104,8 @@ DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 SERVER_HOST: str = _cfg("host", "TTS_HOST", "127.0.0.1")
 SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 
-MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 256 * 1024, coerce=int)
-"""Maximum SSML payload size in bytes. 256 KB default."""
+MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 0, coerce=int)
+"""Maximum SSML payload size in bytes. 0 = unlimited."""
 
 TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 0, coerce=int)
 """Gunicorn worker timeout. 0 = no limit (stall detection handles timeouts)."""
@@ -358,11 +358,12 @@ def extract_tts_params(ssml: str) -> TTSRequest:
         ValueError: If the SSML is malformed or contains no speakable text.
     """
     # Size guard — reject before parsing to prevent XML bomb attacks
-    ssml_bytes = len(ssml.encode("utf-8"))
-    if ssml_bytes > MAX_SSML_LENGTH:
-        raise ValueError(
-            f"SSML too large ({ssml_bytes} bytes). Maximum is {MAX_SSML_LENGTH} bytes."
-        )
+    if MAX_SSML_LENGTH > 0:
+        ssml_bytes = len(ssml.encode("utf-8"))
+        if ssml_bytes > MAX_SSML_LENGTH:
+            raise ValueError(
+                f"SSML too large ({ssml_bytes} bytes). Maximum is {MAX_SSML_LENGTH} bytes."
+            )
 
     try:
         root = ET.fromstring(ssml)
@@ -483,7 +484,7 @@ def create_app() -> Flask:
     # Don't serve static files or templates — API only
     app.config["PROPAGATE_EXCEPTIONS"] = True  # let WSGI server handle errors
     # Reject oversized request bodies before JSON parsing
-    app.config["MAX_CONTENT_LENGTH"] = max(MAX_SSML_LENGTH * 2, 64 * 1024)
+    app.config["MAX_CONTENT_LENGTH"] = max(MAX_SSML_LENGTH * 2, 64 * 1024) if MAX_SSML_LENGTH > 0 else None
 
     CORS(app)
 
