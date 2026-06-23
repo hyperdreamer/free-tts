@@ -14,8 +14,8 @@ Architecture:
     - Health-check endpoint for monitoring.
 
 Usage:
-    python app.py                 # production mode (Waitress, port 5000)
-    FLASK_DEBUG=1 python app.py   # development mode (Flask built-in, auto-reload)
+    python server.py                 # production mode (Waitress, port 5000)
+    FLASK_DEBUG=1 python server.py   # development mode (Flask built-in, auto-reload)
 """
 
 from __future__ import annotations
