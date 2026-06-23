@@ -3,7 +3,7 @@
     "port": 5000,
     "default_voice": "en-US-AvaMultilingualNeural",
     "max_ssml_length": 51200,
-    "tts_timeout": 900,
+    "tts_timeout": 0,
     "tts_stall_timeout": 60,
     "wsgi_server": "waitress",
     "waitress_threads": 4,

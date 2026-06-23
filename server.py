@@ -107,8 +107,8 @@ SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024, coerce=int)
 """Maximum SSML payload size in bytes. 50 KB default."""
 
-TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 900, coerce=int)
-"""Maximum wall-clock seconds for a single TTS generation. 900s default."""
+TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 0, coerce=int)
+"""Gunicorn worker timeout. 0 = no limit (stall detection handles timeouts)."""
 
 TTS_STALL_TIMEOUT: int = _cfg("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, coerce=int)
 """Seconds of silence (no data from edge-tts) before aborting. 0 = disable."""
@@ -424,7 +424,7 @@ async def generate_audio(req: TTSRequest) -> bytes:
 
     Raises:
         RuntimeError: If edge-tts fails (e.g. invalid voice name).
-        TimeoutError: If TTS generation exceeds TTS_TIMEOUT.
+        TimeoutError: If no data received from edge-tts for TTS_STALL_TIMEOUT seconds.
     """
     try:
         communicate = edge_tts.Communicate(
@@ -437,24 +437,18 @@ async def generate_audio(req: TTSRequest) -> bytes:
         raise RuntimeError(f"Failed to initialise edge-tts: {exc}") from exc
 
     buf = BytesIO()
-    try:
-        async with asyncio.timeout(TTS_TIMEOUT):
-            stream = communicate.stream()
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=TTS_STALL_TIMEOUT)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
-                    raise TimeoutError(
-                        f"No data from TTS service for {TTS_STALL_TIMEOUT}s (stall detected)"
-                    )
-                if chunk.get("type") == "audio":
-                    buf.write(chunk.get("data", b""))
-    except TimeoutError:
-        raise TimeoutError(
-            f"TTS generation timed out after {TTS_TIMEOUT}s"
-        )
+    stream = communicate.stream()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(stream.__anext__(), timeout=TTS_STALL_TIMEOUT)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"No data from TTS service for {TTS_STALL_TIMEOUT}s (stall detected)"
+            )
+        if chunk.get("type") == "audio":
+            buf.write(chunk.get("data", b""))
 
     if buf.tell() == 0:
         raise RuntimeError("edge-tts returned no audio data.")
@@ -578,15 +572,15 @@ def create_app() -> Flask:
             logger.warning("SSML parse error: %s", exc)
             return jsonify({"error": _error_message(exc, is_client_error=True)}), 400  # type: ignore[return-value]
 
-        # 2. Synthesise
+        # 2. Synthesise (stall timeout handled inside generate_audio)
         try:
             if _tts_semaphore is not None:
                 async with _tts_semaphore:
-                    audio = await asyncio.wait_for(generate_audio(tts_req), timeout=TTS_TIMEOUT)
+                    audio = await generate_audio(tts_req)
             else:
-                audio = await asyncio.wait_for(generate_audio(tts_req), timeout=TTS_TIMEOUT)
+                audio = await generate_audio(tts_req)
         except asyncio.TimeoutError as exc:
-            logger.error("TTS timeout after %ds", TTS_TIMEOUT)
+            logger.error("TTS stall detected after %ds", TTS_STALL_TIMEOUT)
             return jsonify({"error": _error_message(exc)}), 504  # type: ignore[return-value]
         except RuntimeError as exc:
             logger.error("TTS generation failed: %s", exc)
