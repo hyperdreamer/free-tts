@@ -70,8 +70,9 @@ async function stopPlayback() {
     try {
       await chrome.scripting.executeScript({
         target: { tabId: activePlayback.tabId },
-        func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } clearHighlight(); },
+        func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
       });
+      await cleanupPageHighlighting(activePlayback.tabId);
     } catch {}
   }
   clearPlayback();
@@ -84,34 +85,86 @@ function splitSentences(text) {
   return sentences.map(s => s.trim()).filter(s => s.length > 0);
 }
 
-// --- Highlight bar ---------------------------------------------------------
-async function showHighlight(tabId, sentence) {
+// --- In-page sentence wrapping + highlight + scroll -----------------------
+async function initPageHighlighting(tabId, sentences) {
+  // Inject a content script that wraps each sentence in a span for highlighting
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (s) => {
-        let bar = document.getElementById("free-tts-highlight");
-        if (!bar) {
-          bar = document.createElement("div");
-          bar.id = "free-tts-highlight";
-          bar.style.cssText = "position:fixed;bottom:0;left:0;right:0;background:#fff3cd;color:#333;padding:16px 24px;font-size:18px;line-height:1.5;z-index:999999;box-shadow:0 -2px 12px rgba(0,0,0,0.15);text-align:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif;";
-          document.body.appendChild(bar);
+      func: (sents) => {
+        // Remove any previous highlighting
+        document.querySelectorAll(".free-tts-sentence").forEach(el => {
+          el.replaceWith(el.textContent);
+        });
+        window.__freeTtsSentences = sents;
+        window.__freeTtsCurrentIdx = -1;
+
+        // Find and wrap sentences in the DOM
+        function wrapSentences(root, sentences) {
+          if (!root) return;
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+          const textNodes = [];
+          while (walker.nextNode()) textNodes.push(walker.currentNode);
+          
+          for (let si = 0; si < sentences.length; si++) {
+            const s = sentences[si];
+            for (const node of textNodes) {
+              const idx = node.textContent.indexOf(s);
+              if (idx >= 0 && node.parentElement) {
+                const span = document.createElement("span");
+                span.className = "free-tts-sentence";
+                span.dataset.idx = si;
+                span.textContent = s;
+                const after = node.splitText(idx);
+                after.textContent = after.textContent.slice(s.length);
+                node.parentElement.replaceChild(span, node);
+                break;
+              }
+            }
+          }
         }
-        bar.textContent = s;
-        if (typeof clearHighlight === "undefined") {
-          window.clearHighlight = () => { const b = document.getElementById("free-tts-highlight"); if (b) b.remove(); };
-        }
+        wrapSentences(document.body, sents);
       },
-      args: [sentence],
+      args: [sentences],
     });
   } catch {}
 }
 
-async function removeHighlight(tabId) {
+async function highlightCurrentSentence(tabId, idx) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => { const b = document.getElementById("free-tts-highlight"); if (b) b.remove(); },
+      func: (idx) => {
+        // Remove previous highlight
+        document.querySelectorAll(".free-tts-sentence.active").forEach(el => {
+          el.style.background = "";
+          el.classList.remove("active");
+        });
+        // Highlight current and scroll to it
+        const el = document.querySelector(`.free-tts-sentence[data-idx="${idx}"]`);
+        if (el) {
+          el.style.background = "#fff3cd";
+          el.style.transition = "background 0.3s";
+          el.classList.add("active");
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      },
+      args: [idx],
+    });
+  } catch {}
+}
+
+async function cleanupPageHighlighting(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        document.querySelectorAll(".free-tts-sentence").forEach(el => {
+          el.style.background = "";
+          el.replaceWith(el.textContent);
+        });
+        delete window.__freeTtsSentences;
+      },
     });
   } catch {}
 }
@@ -151,7 +204,7 @@ async function startSentenceTTS(tabId, text) {
   updateStopMenu();
 
   // Show first sentence immediately
-  await showHighlight(tabId, sentences[0]);
+  await initPageHighlighting(tabId, sentences);
 
   // Pre-fetch first few sentences
   const preloadCount = Math.min(PRELOAD_AHEAD, sentences.length);
@@ -169,7 +222,7 @@ async function playNextSentence() {
   if (!sentencePipeline) return;
   const { sentences, currentIdx, cache, tabId, voice, serverUrl } = sentencePipeline;
   if (currentIdx >= sentences.length) {
-    await removeHighlight(tabId);
+    await cleanupPageHighlighting(tabId);
     clearPlayback();
     return;
   }
@@ -199,8 +252,8 @@ async function playNextSentence() {
     }
   }
 
-  // Show highlight
-  await showHighlight(tabId, sentences[currentIdx]);
+  // Highlight current and scroll
+  await highlightCurrentSentence(tabId, currentIdx);
 
   // Play
   try {
