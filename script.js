@@ -66,7 +66,6 @@ const speedValue      = $("#speedValue");
 const pitchSlider     = $("#pitchSlider");
 const pitchValue      = $("#pitchValue");
 const previewBtn      = $("#previewBtn");
-const cancelGenBtn    = $("#cancelGenBtn");
 const stopBtn         = $("#stopBtn");
 const downloadTextBtn  = $("#downloadTextBtn");
 const ssmlPreview = $("#ssmlPreview");
@@ -345,6 +344,8 @@ function cancelGeneration() {
     activeAbortController.abort();
     activeAbortController = null;
   }
+  previewBtn.textContent = "▶ Preview Audio";
+  downloadTextBtn.textContent = "⬇ Download MP3";
 }
 
 function playBlob(blob) {
@@ -408,8 +409,14 @@ downloadSsmlBtn.addEventListener("click", async () => {
   const ssml = ssmlInput.value.trim();
   if (!ssml) return alert("Please enter SSML before downloading.");
 
-  cancelGenBtn.style.display = "inline-flex";
-  downloadSsmlBtn.style.display = "none";
+  // If already generating, cancel instead
+  if (activeAbortController) {
+    cancelGeneration();
+    return;
+  }
+
+  downloadSsmlBtn.textContent = "Cancel Download";
+  downloadSsmlBtn.classList.add("btn-stop-preview");
 
   try {
     const blob = await callTTS(ssml, 0);  // no timeout for downloads
@@ -417,8 +424,8 @@ downloadSsmlBtn.addEventListener("click", async () => {
   } catch (err) {
     if (err.name !== "AbortError") alert("Error: " + err.message);
   } finally {
-    cancelGenBtn.style.display = "none";
-    downloadSsmlBtn.style.display = "inline-flex";
+    downloadSsmlBtn.textContent = "Download MP3";
+    downloadSsmlBtn.classList.remove("btn-stop-preview");
   }
 });
 
@@ -429,14 +436,23 @@ async function handleTextGenerate(preview = false) {
   const text = textInputArea.value.trim();
   if (!text) return alert("Please enter text to synthesize.");
 
+  // If already generating, cancel instead
+  if (activeAbortController) {
+    cancelGeneration();
+    return;
+  }
+
   const rate = parseInt(speedSlider.value);
   const pitch = parseInt(pitchSlider.value);
   const ssml = buildSSML(selectedVoice, text, rate, pitch);
 
-  previewBtn.disabled = true;
-  downloadTextBtn.disabled = true;
-  cancelGenBtn.style.display = "inline-flex";
-  previewBtn.style.display = "none";
+  if (preview) {
+    previewBtn.textContent = "Cancel Preview";
+    previewBtn.classList.add("btn-stop-preview");
+  } else {
+    downloadTextBtn.textContent = "Cancel Download";
+    downloadTextBtn.classList.add("btn-stop-preview");
+  }
 
   try {
     const blob = await callTTS(ssml, preview ? 120000 : 0);  // preview: 2 min, download: unlimited
@@ -455,16 +471,15 @@ async function handleTextGenerate(preview = false) {
   } catch (err) {
     if (err.name !== "AbortError") alert("Error: " + err.message);
   } finally {
-    previewBtn.disabled = false;
-    downloadTextBtn.disabled = false;
-    cancelGenBtn.style.display = "none";
-    previewBtn.style.display = "inline-flex";
+    previewBtn.textContent = "▶ Preview Audio";
+    previewBtn.classList.remove("btn-stop-preview");
+    downloadTextBtn.textContent = "⬇ Download MP3";
+    downloadTextBtn.classList.remove("btn-stop-preview");
   }
 }
 
 previewBtn.addEventListener("click", () => handleTextGenerate(true));
 stopBtn.addEventListener("click", stopAudio);
-cancelGenBtn.addEventListener("click", cancelGeneration);
 downloadTextBtn.addEventListener("click", () => handleTextGenerate(false));
 
 // Selected voice preview button
