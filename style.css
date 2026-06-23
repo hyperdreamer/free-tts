@@ -284,8 +284,9 @@ body {
     display: grid;
     grid-template-columns: 1fr 1fr;
     border-top: 1px solid var(--border-light);
-    min-height: 200px;
-    max-height: 280px;
+    height: 230px;
+    min-height: 230px;
+    max-height: 230px;
 }
 
 .voice-column {
@@ -312,8 +313,28 @@ body {
 .voice-list {
     flex: 1;
     min-height: 0;
-    overflow-y: auto;
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
     padding: 4px 0;
+}
+
+.voice-list::-webkit-scrollbar {
+    width: 10px;
+}
+
+.voice-list::-webkit-scrollbar-track {
+    background: #f1f1f4;
+    border-left: 1px solid var(--border-light);
+}
+
+.voice-list::-webkit-scrollbar-thumb {
+    background: #b8b8c0;
+    border-radius: 8px;
+    border: 2px solid #f1f1f4;
+}
+
+.voice-list::-webkit-scrollbar-thumb:hover {
+    background: #8f8f99;
 }
 
 .voice-loading {
