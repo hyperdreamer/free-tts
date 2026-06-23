@@ -17,11 +17,16 @@ let serverUrl = DEFAULT_SERVER;
 let voices = [];
 let activeAudio = null;
 let activeDataUrl = null;
+let defaultVoice = DEFAULT_VOICE;
 
 // --- Init ------------------------------------------------------------------
 async function init() {
   const { serverUrl: stored } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
   serverUrl = stored;
+
+  // Load saved default voice
+  const { voice: savedVoice } = await chrome.storage.sync.get({ voice: DEFAULT_VOICE });
+  defaultVoice = savedVoice;
 
   // Auto-fill with selected text from the active tab
   try {
@@ -40,6 +45,15 @@ async function init() {
 
   await checkServer();
   await loadVoices();
+
+  // Save voice selection on change
+  voiceSelect.addEventListener("change", () => {
+    const v = voiceSelect.value;
+    if (v && v !== defaultVoice) {
+      defaultVoice = v;
+      chrome.storage.sync.set({ voice: v });
+    }
+  });
 
   speedSlider.addEventListener("input", () => {
     speedVal.textContent = speedSlider.value + "%";
@@ -99,7 +113,7 @@ function renderVoiceSelect() {
       const opt = document.createElement("option");
       opt.value = v.ShortName;
       opt.textContent = `${v.ShortName} (${v.Gender})`;
-      if (v.ShortName === DEFAULT_VOICE) opt.selected = true;
+      if (v.ShortName === defaultVoice) opt.selected = true;
       optgroup.appendChild(opt);
     }
     voiceSelect.appendChild(optgroup);
@@ -111,7 +125,12 @@ async function speak() {
   const text = textInput.value.trim();
   if (!text) return;
 
-  const voice = voiceSelect.value || DEFAULT_VOICE;
+  const voice = voiceSelect.value || defaultVoice;
+  // Persist as default voice for context-menu "Speak this"
+  if (voice !== defaultVoice) {
+    defaultVoice = voice;
+    chrome.storage.sync.set({ voice });
+  }
   const speed = parseInt(speedSlider.value);
   const rateAttr = (100 + speed) + "%";
 

@@ -39,8 +39,11 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 // --- Fetch audio and inject playback into the tab --------------------------
 async function speakInTab(tabId, text) {
-  const { serverUrl } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
-  const ssml = buildSSML(text);
+  const { serverUrl, voice } = await chrome.storage.sync.get({
+    serverUrl: DEFAULT_SERVER,
+    voice: "en-US-AvaMultilingualNeural",
+  });
+  const ssml = buildSSML(text, voice);
 
   try {
     const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
@@ -81,9 +84,9 @@ function escapeXML(str) {
     .replace(/'/g, "&apos;");
 }
 
-function buildSSML(text) {
+function buildSSML(text, voice) {
   return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xmlns:emo="http://www.w3.org/2009/10/emotionml" version="1.0" xml:lang="en-US">
-    <voice name="en-US-AvaMultilingualNeural">
+    <voice name="${escapeXML(voice)}">
         <prosody rate="100%" pitch="0%">
 ${escapeXML(text)}
         </prosody>
