@@ -84,6 +84,7 @@ function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
 
 function fillDefaultSSML() {
   ssmlInput.value = buildSSML(DEFAULT_VOICE, DEFAULT_TEXT, 0, 0);
+  textInputArea.value = DEFAULT_TEXT;
 }
 
 // ---------------------------------------------------------------------------

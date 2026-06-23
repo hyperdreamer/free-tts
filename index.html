@@ -10,22 +10,12 @@
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <div class="tab active-tab" data-tab="ssml">SSML</div>
-            <div class="tab" data-tab="text">Text Input</div>
-        </div>
-
-        <!-- SSML Tab -->
-        <div class="tab-content active" id="tab-ssml">
-            <div class="content-area">
-                <textarea id="ssmlInput" class="ssml-textarea" spellcheck="false"></textarea>
-            </div>
-            <div class="bottom-section">
-                <button id="downloadSsmlBtn" class="btn-primary">Download MP3</button>
-            </div>
+            <div class="tab active-tab" data-tab="text">Text Input</div>
+            <div class="tab" data-tab="ssml">SSML</div>
         </div>
 
         <!-- Text Input Tab -->
-        <div class="tab-content" id="tab-text">
+        <div class="tab-content active" id="tab-text">
             <div class="text-input-layout">
                 <!-- Left: input controls -->
                 <div class="text-controls">
@@ -124,6 +114,16 @@
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- SSML Tab -->
+        <div class="tab-content" id="tab-ssml">
+            <div class="content-area">
+                <textarea id="ssmlInput" class="ssml-textarea" spellcheck="false"></textarea>
+            </div>
+            <div class="bottom-section">
+                <button id="downloadSsmlBtn" class="btn-primary">Download MP3</button>
             </div>
         </div>
     </div>
