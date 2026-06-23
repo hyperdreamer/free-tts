@@ -16,6 +16,7 @@ const optionsLink  = document.getElementById("optionsLink");
 let serverUrl = DEFAULT_SERVER;
 let voices = [];
 let activeAudio = null;
+let activeDataUrl = null;
 
 // --- Init ------------------------------------------------------------------
 async function init() {
@@ -134,13 +135,13 @@ ${escapeXML(text)}
     if (!resp.ok) throw new Error(`Server error ${resp.status}`);
 
     const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
+    const url = await blobToDataUrl(blob);
 
     if (activeAudio) {
       activeAudio.pause();
-      URL.revokeObjectURL(activeAudio.src);
     }
 
+    activeDataUrl = url;
     audioPlayer.src = url;
     audioPlayer.play();
     activeAudio = audioPlayer;
@@ -149,8 +150,8 @@ ${escapeXML(text)}
 
     audioPlayer.onended = () => {
       stopBtn.disabled = true;
-      URL.revokeObjectURL(url);
       activeAudio = null;
+      activeDataUrl = null;
     };
   } catch (err) {
     console.error("free-tts:", err);
@@ -164,11 +165,20 @@ function stop() {
   if (activeAudio) {
     activeAudio.pause();
     activeAudio.currentTime = 0;
-    URL.revokeObjectURL(activeAudio.src);
     activeAudio = null;
   }
+  activeDataUrl = null;
   audioPlayer.src = "";
   stopBtn.disabled = true;
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 // --- XML escape -----------------------------------------------------------
