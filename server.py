@@ -108,7 +108,10 @@ MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024,
 """Maximum SSML payload size in bytes. 50 KB default."""
 
 TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 900, coerce=int)
-"""Maximum seconds for a single TTS generation request. 900s default handles ~15 min of speech."""
+"""Maximum wall-clock seconds for a single TTS generation. 900s default."""
+
+TTS_STALL_TIMEOUT: int = _cfg("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, coerce=int)
+"""Seconds of silence (no data from edge-tts) before aborting. 0 = disable."""
 
 TTS_MAX_CONCURRENT: int = _cfg("max_concurrent", "TTS_MAX_CONCURRENT", 2, coerce=int)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
@@ -435,8 +438,17 @@ async def generate_audio(req: TTSRequest) -> bytes:
 
     buf = BytesIO()
     try:
-        async with asyncio.timeout(TTS_TIMEOUT):  # type: ignore[attr-defined]
-            async for chunk in communicate.stream():
+        async with asyncio.timeout(TTS_TIMEOUT):
+            stream = communicate.stream()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=TTS_STALL_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        f"No data from TTS service for {TTS_STALL_TIMEOUT}s (stall detected)"
+                    )
                 if chunk.get("type") == "audio":
                     buf.write(chunk.get("data", b""))
     except TimeoutError:

@@ -313,9 +313,9 @@ textInputArea.addEventListener("input", updateSSMLPreview);
 // ---------------------------------------------------------------------------
 // TTS API call
 // ---------------------------------------------------------------------------
-async function callTTS(ssml) {
+async function callTTS(ssml, timeoutMs = 120000) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 900000);  // 15 min, matches server default
+  const timeout = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
       method: "POST",
@@ -331,7 +331,7 @@ async function callTTS(ssml) {
 
     return await resp.blob();
   } finally {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -389,7 +389,7 @@ downloadSsmlBtn.addEventListener("click", async () => {
   downloadSsmlBtn.disabled = true;
 
   try {
-    const blob = await callTTS(ssml);
+    const blob = await callTTS(ssml, 0);  // no timeout for downloads
     downloadBlob(blob);
   } catch (err) {
     alert("Error: " + err.message);
@@ -416,7 +416,7 @@ async function handleTextGenerate(preview = false) {
   downloadTextBtn.textContent = "Generating...";
 
   try {
-    const blob = await callTTS(ssml);
+    const blob = await callTTS(ssml, preview ? 120000 : 0);  // preview: 2 min, download: unlimited
 
     // Add to results
     const blobUrl = URL.createObjectURL(blob);
