@@ -1,0 +1,99 @@
+body {
+    font-family: Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    margin: 0;
+    background-color: #f0f0f0;
+    padding-top: 20px;
+}
+
+.container {
+    width: 600px;
+    border: 1px solid #ccc;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    background-color: white;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border-radius: 5px;
+}
+
+.header {
+    display: flex;
+    align-items: center;
+    background-color: white;
+    border-bottom: 1px solid #eee;
+    padding-left: 15px; /* Keep padding for aesthetic spacing */
+}
+
+/* Removed the .red-box CSS rule */
+
+.tab {
+    padding: 10px 15px;
+    cursor: pointer;
+    font-size: 14px;
+    color: #555;
+    border-bottom: 3px solid transparent;
+    transition: all 0.2s ease-in-out;
+}
+
+.active-tab {
+    color: #333;
+    font-weight: bold;
+    border-bottom-color: #007bff;
+}
+
+.content-area {
+    background-color: white;
+    padding: 15px;
+    flex-grow: 1;
+}
+
+.ssml-textarea {
+    width: calc(100% - 22px);
+    min-height: 300px;
+    border: 1px solid #ddd;
+    padding: 10px;
+    font-family: monospace;
+    font-size: 14px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.5;
+    border-radius: 3px;
+    white-space: pre-wrap;
+    overflow-x: auto;
+    box-sizing: border-box;
+}
+
+.bottom-section {
+    background-color: white; /* Changed from #8B0000 to white */
+    padding: 20px;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    min-height: 150px; /* Keep approximate height */
+    border-top: 1px solid #eee; /* Add a subtle top border for separation */
+}
+
+.download-button {
+    background-color: #007bff;
+    color: white;
+    padding: 12px 25px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 16px;
+    transition: background-color 0.2s ease-in-out;
+    margin-right: 20px;
+}
+
+.download-button:hover {
+    background-color: #0056b3;
+}
+
+.download-button:disabled {
+    background-color: #cccccc;
+    cursor: not-allowed;
+}
