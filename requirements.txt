@@ -1,5 +1,5 @@
 edge-tts>=7.2.8,<8
-Flask>=3.1,<4
-flask-cors>=6.0,<4
+Flask[async]>=3.1,<4
+flask-cors>=6.0,<7
 waitress>=3.0,<4
 gunicorn>=23.0,<24

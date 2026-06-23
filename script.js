@@ -24,9 +24,9 @@ const DEFAULT_TEXT =
 const SAMPLE_TEXT = "Hello, this is a sample of my voice.";
 
 // ---------------------------------------------------------------------------
-// Backend URL
+// Backend URL (relative path works behind proxies; change to absolute if needed)
 // ---------------------------------------------------------------------------
-const BACKEND_URL = "http://localhost:5000";
+const BACKEND_URL = "";
 
 // ---------------------------------------------------------------------------
 // State
@@ -67,6 +67,18 @@ const resultsList     = $("#resultsList");
 const audioPlayer     = $("#audioPlayer");
 
 // ---------------------------------------------------------------------------
+// XML escaping
+// ---------------------------------------------------------------------------
+function escapeXML(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// ---------------------------------------------------------------------------
 // SSML construction
 // ---------------------------------------------------------------------------
 function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
@@ -76,10 +88,10 @@ function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
     : (pitchSliderVal > 0 ? "+" : "") + pitchSliderVal + "Hz";
 
   return SSML_TEMPLATE
-    .replace("VOICE_NAME", voice)
+    .replace("VOICE_NAME", escapeXML(voice))
     .replace("RATE%", rateAttr)
     .replace("PITCH%", pitchAttr)
-    .replace("TEXT_CONTENT", text);
+    .replace("TEXT_CONTENT", escapeXML(text));
 }
 
 function fillDefaultSSML() {
@@ -112,6 +124,28 @@ $$(".panel-tab").forEach(tab => {
 });
 
 // ---------------------------------------------------------------------------
+// Safe DOM helpers (avoid innerHTML for XSS prevention)
+// ---------------------------------------------------------------------------
+function el(tag, attrs = {}, children = []) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "className") e.className = v;
+    else if (k === "textContent") e.textContent = v;
+    else if (k === "dataset") Object.assign(e.dataset, v);
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2).toLowerCase(), v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of children) {
+    e.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+function clearChildren(parent) {
+  while (parent.firstChild) parent.removeChild(parent.firstChild);
+}
+
+// ---------------------------------------------------------------------------
 // Voice data loading
 // ---------------------------------------------------------------------------
 async function loadVoices() {
@@ -124,18 +158,19 @@ async function loadVoices() {
     populateLanguageDropdown();
   } catch (err) {
     console.error("Voice load error:", err);
-    voiceList.innerHTML = '<div class="voice-loading">Failed to load voices</div>';
+    clearChildren(voiceList);
+    voiceList.appendChild(el("div", { className: "voice-loading", textContent: "Failed to load voices" }));
   }
 }
 
 function populateLanguageDropdown() {
-  languageSelect.innerHTML = '<option value="">All Languages</option>' +
-    languages.map(l => `<option value="${l.locale}">${l.name}</option>`).join("");
-
-  // Default to English
+  clearChildren(languageSelect);
+  languageSelect.appendChild(el("option", { value: "", textContent: "All Languages" }));
+  for (const l of languages) {
+    languageSelect.appendChild(el("option", { value: l.locale, textContent: l.name }));
+  }
   const enOption = languageSelect.querySelector('option[value="en-US"]');
   if (enOption) enOption.selected = true;
-
   renderVoiceList();
 }
 
@@ -157,34 +192,34 @@ function getFilteredVoices() {
 
 function renderVoiceList() {
   const filtered = getFilteredVoices();
+  clearChildren(voiceList);
 
   if (filtered.length === 0) {
-    voiceList.innerHTML = '<div class="voice-loading">No voices match</div>';
+    voiceList.appendChild(el("div", { className: "voice-loading", textContent: "No voices match" }));
     return;
   }
 
-  voiceList.innerHTML = filtered.map(v => {
-    const sel = v.ShortName === selectedVoice ? " selected" : "";
+  for (const v of filtered) {
+    const sel = v.ShortName === selectedVoice ? " voice-item selected" : "voice-item";
     const localePart = v.Locale.split("-")[1] || v.Locale;
-    return `<div class="voice-item${sel}" data-voice="${v.ShortName}" data-locale="${v.Locale}" data-gender="${v.Gender}">
-      <span class="voice-item-name">${v.ShortName}</span>
-      <span class="voice-item-locale">${localePart}</span>
-      <span class="voice-item-preview" data-action="preview" title="Preview voice">▶</span>
-    </div>`;
-  }).join("");
-
-  // Click handlers
-  voiceList.querySelectorAll(".voice-item").forEach(item => {
+    const item = el("div", {
+      className: sel,
+      dataset: { voice: v.ShortName, locale: v.Locale, gender: v.Gender },
+    }, [
+      el("span", { className: "voice-item-name", textContent: v.ShortName }),
+      el("span", { className: "voice-item-locale", textContent: localePart }),
+      el("span", { className: "voice-item-preview", dataset: { action: "preview" }, textContent: "▶", title: "Preview voice" }),
+    ]);
     item.addEventListener("click", (e) => {
-      // If clicked on the preview button, preview the voice
       if (e.target.dataset.action === "preview") {
         e.stopPropagation();
-        previewVoice(item.dataset.voice);
+        previewVoice(v.ShortName);
         return;
       }
-      selectVoice(item.dataset.voice, item.dataset.locale, item.dataset.gender);
+      selectVoice(v.ShortName, v.Locale, v.Gender);
     });
-  });
+    voiceList.appendChild(item);
+  }
 }
 
 function selectVoice(shortName, locale, gender) {
@@ -349,61 +384,57 @@ voicePreviewBtn.addEventListener("click", () => previewVoice(selectedVoice));
 // Results list
 // ---------------------------------------------------------------------------
 function renderResults() {
+  clearChildren(resultsList);
+
   if (results.length === 0) {
-    resultsList.innerHTML = '<div class="results-empty">No generated items yet</div>';
+    resultsList.appendChild(el("div", { className: "results-empty", textContent: "No generated items yet" }));
     return;
   }
 
-  resultsList.innerHTML = results.map((r, i) => {
-    const shortText = r.text.length > 40 ? r.text.slice(0, 40) + "…" : r.text;
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const shortText = r.text.length > 40 ? r.text.slice(0, 40) + "\u2026" : r.text;
     const voiceLabel = r.voice.replace("Neural", "").replace("Multilingual", "");
-    return `<div class="result-item" data-idx="${i}">
-      <div class="result-info">
-        <span class="result-text">${shortText}</span>
-        <span class="result-voice">${voiceLabel} · ${r.rate}% speed · ${r.pitch}% pitch</span>
-      </div>
-      <span class="result-play" data-idx="${i}">▶</span>
-    </div>`;
-  }).join("");
 
-  resultsList.querySelectorAll(".result-play").forEach(el => {
-    el.addEventListener("click", (e) => {
+    const item = el("div", { className: "result-item", dataset: { idx: String(i) } }, [
+      el("div", { className: "result-info" }, [
+        el("span", { className: "result-text", textContent: shortText }),
+        el("span", { className: "result-voice", textContent: `${voiceLabel} \u00b7 ${r.rate}% speed \u00b7 ${r.pitch}% pitch` }),
+      ]),
+      el("span", { className: "result-play", dataset: { idx: String(i) }, textContent: "\u25b6" }),
+    ]);
+
+    const playBtn = item.querySelector(".result-play");
+    playBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      audioPlayer.src = results[parseInt(el.dataset.idx)].blobUrl;
+      audioPlayer.src = r.blobUrl;
       audioPlayer.play();
     });
-  });
 
-  resultsList.querySelectorAll(".result-item").forEach(el => {
-    el.addEventListener("click", () => {
-      const r = results[parseInt(el.dataset.idx)];
+    item.addEventListener("click", () => {
       textInputArea.value = r.text;
-
-      // Look up full voice metadata
       const voiceInfo = allVoices.find(v => v.ShortName === r.voice);
       if (voiceInfo) {
         selectVoice(voiceInfo.ShortName, voiceInfo.Locale, voiceInfo.Gender);
-        // Also set the language dropdown
         languageSelect.value = voiceInfo.Locale;
       } else {
         selectedVoice = r.voice;
         voiceSelectedName.textContent = r.voice;
-        voiceSelectedMeta.textContent = "—";
+        voiceSelectedMeta.textContent = "\u2014";
       }
-
       speedSlider.value = r.rate;
       pitchSlider.value = r.pitch;
       updateSliderDisplay();
       updateSSMLPreview();
       renderVoiceList();
-
-      // Switch to Text Input tab
       $$(".tab").forEach(t => t.classList.remove("active-tab"));
       document.querySelector('[data-tab="text"]').classList.add("active-tab");
       $$(".tab-content").forEach(tc => tc.classList.remove("active"));
       $("#tab-text").classList.add("active");
     });
-  });
+
+    resultsList.appendChild(item);
+  }
 }
 
 // ---------------------------------------------------------------------------

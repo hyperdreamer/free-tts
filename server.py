@@ -347,9 +347,10 @@ def extract_tts_params(ssml: str) -> TTSRequest:
         ValueError: If the SSML is malformed or contains no speakable text.
     """
     # Size guard — reject before parsing to prevent XML bomb attacks
-    if len(ssml) > MAX_SSML_LENGTH:
+    ssml_bytes = len(ssml.encode("utf-8"))
+    if ssml_bytes > MAX_SSML_LENGTH:
         raise ValueError(
-            f"SSML too large ({len(ssml)} bytes). Maximum is {MAX_SSML_LENGTH} bytes."
+            f"SSML too large ({ssml_bytes} bytes). Maximum is {MAX_SSML_LENGTH} bytes."
         )
 
     try:
@@ -445,12 +446,14 @@ async def generate_audio(req: TTSRequest) -> bytes:
 # ---------------------------------------------------------------------------
 # Error message sanitisation
 # ---------------------------------------------------------------------------
-def _error_message(exc: Exception) -> str:
+def _error_message(exc: Exception, is_client_error: bool = False) -> str:
     """Return a safe error message for the client.
 
-    In production, internal details (stack traces, library internals) are
-    replaced with a generic message.  In debug mode the full error is exposed.
+    Client errors (400-level) always return the real message so users can
+    correct their input.  Server errors (500-level) are sanitised in production.
     """
+    if is_client_error:
+        return str(exc)
     if PRODUCTION:
         return "TTS request failed. Check server logs for details."
     return str(exc)
@@ -525,12 +528,14 @@ def create_app() -> Flask:
         Returns the MP3 file as an attachment on success, or a JSON error body.
         """
         body = request.get_json(silent=True)
-        if not body or "ssml" not in body:
+        if not body or not isinstance(body, dict) or "ssml" not in body:
             logger.warning("Request missing 'ssml' field.")
             return jsonify({"error": "Missing 'ssml' field in JSON body."}), 400  # type: ignore[return-value]
 
-        ssml = body["ssml"].strip()
-        if not ssml:
+        ssml = body["ssml"]
+        if not isinstance(ssml, str):
+            return jsonify({"error": "'ssml' must be a string."}), 400  # type: ignore[return-value]
+        if not ssml.strip():
             return jsonify({"error": "Empty SSML string."}), 400  # type: ignore[return-value]
 
         # 1. Parse
@@ -538,7 +543,7 @@ def create_app() -> Flask:
             tts_req = extract_tts_params(ssml)
         except ValueError as exc:
             logger.warning("SSML parse error: %s", exc)
-            return jsonify({"error": _error_message(exc)}), 400  # type: ignore[return-value]
+            return jsonify({"error": _error_message(exc, is_client_error=True)}), 400  # type: ignore[return-value]
 
         # 2. Synthesise
         try:
