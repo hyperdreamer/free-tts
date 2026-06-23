@@ -566,17 +566,13 @@ def create_app() -> Flask:
 
 
 # ---------------------------------------------------------------------------
-# Graceful shutdown
+# Signal handling
 # ---------------------------------------------------------------------------
-_shutdown_requested = False
-
-
 def _handle_shutdown(signum: int, frame: Any) -> None:
-    """Set the shutdown flag on SIGTERM/SIGINT."""
-    global _shutdown_requested
+    """Log the signal and exit cleanly."""
     sig_name = signal.Signals(signum).name
-    logger.info("Received %s — initiating graceful shutdown.", sig_name)
-    _shutdown_requested = True
+    logger.info("Received %s — shutting down.", sig_name)
+    sys.exit(0)
 
 
 signal.signal(signal.SIGTERM, _handle_shutdown)
