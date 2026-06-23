@@ -1,8 +1,17 @@
 // free-tts background service worker
-// Handles context menu clicks and keyboard shortcut.
+// Handles context menu clicks, keyboard shortcut, and popup stop requests.
 // Audio playback is injected into the active tab (service workers can't play audio).
 
 const DEFAULT_SERVER = "http://localhost:5000";
+
+// Track injected audio so the popup can stop it
+let activePlayback = { tabId: null, audioId: null };
+let playbackTimeout = null;
+
+function clearPlayback() {
+  activePlayback = { tabId: null, audioId: null };
+  if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
+}
 
 // --- Context menu ----------------------------------------------------------
 chrome.runtime.onInstalled.addListener(() => {
@@ -37,6 +46,33 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 });
 
+// --- Messages from popup ---------------------------------------------------
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "getPlaybackState") {
+    sendResponse({ playing: !!activePlayback.tabId, tabId: activePlayback.tabId });
+  } else if (msg.action === "stopPlayback") {
+    stopPlaybackInTab().then(() => sendResponse({ stopped: true }));
+    return true; // async response
+  }
+});
+
+async function stopPlaybackInTab() {
+  if (!activePlayback.tabId) return;
+  const tabId = activePlayback.tabId;
+  clearPlayback();
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const a = window.__freeTtsAudio;
+        if (a) { a.pause(); a.currentTime = 0; a.src = ""; delete window.__freeTtsAudio; }
+      },
+    });
+  } catch {
+    // tab may have closed
+  }
+}
+
 // --- Fetch audio and inject playback into the tab --------------------------
 async function speakInTab(tabId, text) {
   const { serverUrl, voice } = await chrome.storage.sync.get({
@@ -61,15 +97,31 @@ async function speakInTab(tabId, text) {
       reader.readAsDataURL(blob);
     });
 
-    // Inject audio playback into the tab (service workers can't play audio)
+    // Stop any previous playback
+    await stopPlaybackInTab();
+
+    // Inject audio playback into the tab with a known window-level reference
+    const audioId = Date.now();
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (url) => {
+      func: (url, id) => {
+        // Remove any previous audio element
+        if (window.__freeTtsAudio) {
+          window.__freeTtsAudio.pause();
+          window.__freeTtsAudio.src = "";
+        }
         const a = new Audio(url);
-        a.play();
+        a.id = `free-tts-${id}`;
+        a.play().catch(() => {});
+        a.onended = () => { delete window.__freeTtsAudio; };
+        window.__freeTtsAudio = a;
       },
-      args: [dataUrl],
+      args: [dataUrl, audioId],
     });
+
+    activePlayback = { tabId, audioId };
+    // Auto-clear after 30 seconds (audio should have ended by then)
+    playbackTimeout = setTimeout(clearPlayback, 30000);
   } catch (err) {
     console.error("free-tts:", err);
   }
