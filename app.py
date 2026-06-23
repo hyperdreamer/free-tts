@@ -1,147 +1,300 @@
-# app.py
-from flask import Flask, request, send_file, jsonify
-from flask_cors import CORS
-import edge_tts
-import asyncio
+"""
+edge-tts SSML Server
+====================
+A production-ready Flask server that accepts SSML input, extracts voice/rate/pitch
+parameters, generates speech via Microsoft Edge TTS, and returns the audio as MP3.
+
+Architecture:
+    - Configuration via environment variables with sensible defaults.
+    - Structured logging (no bare print statements).
+    - Type-annotated helpers for SSML parsing and parameter transformation.
+    - Flask application factory pattern for testability.
+    - Production WSGI server (Waitress) when run directly.
+    - CORS enabled for cross-origin frontend requests.
+    - Health-check endpoint for monitoring.
+
+Usage:
+    python app.py                 # production mode (Waitress, port 5000)
+    FLASK_DEBUG=1 python app.py   # development mode (Flask built-in, auto-reload)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from io import BytesIO
-import xml.etree.ElementTree as ET # Import the XML parser
+from typing import Optional
 
-app = Flask(__name__)
-CORS(app)
+import edge_tts
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
 
-# Define some reasonable defaults for TTS parameters
-# These use formats known to be accepted by edge-tts for "no change"
-#DEFAULT_VOICE = "en-US-JennyNeural" # A common and reliable default voice
-DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
-DEFAULT_RATE = "+0%"  # Relative change: no change to rate
-DEFAULT_PITCH = "+0Hz" # Relative change: no change to pitch
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.DEBUG if os.environ.get("FLASK_DEBUG") else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tts-server")
 
-@app.route('/generate-and-download-tts', methods=['POST'])
-async def generate_and_download_tts():
-    data = request.json
-    ssml_text = data.get('ssml', '').strip()
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_VOICE: str = os.environ.get("TTS_DEFAULT_VOICE", "en-US-AvaMultilingualNeural")
+"""Default voice name used when the SSML omits a <voice> element."""
 
-    if not ssml_text:
-        return jsonify({"error": "No SSML text provided"}), 400
+DEFAULT_RATE: str = os.environ.get("TTS_DEFAULT_RATE", "+0%")
+"""Default speaking rate (edge-tts format) when <prosody rate> is missing."""
 
-    output_filename = "abc.mp3"
+DEFAULT_PITCH: str = os.environ.get("TTS_DEFAULT_PITCH", "+0Hz")
+"""Default pitch (edge-tts format) when <prosody pitch> is missing."""
 
-    # Initialize extracted parameters with defaults
-    extracted_voice = DEFAULT_VOICE
-    extracted_rate = DEFAULT_RATE
-    extracted_pitch = DEFAULT_PITCH
-    extracted_content = "" # This will hold the text to be spoken
+SERVER_HOST: str = os.environ.get("TTS_HOST", "0.0.0.0")
+SERVER_PORT: int = int(os.environ.get("TTS_PORT", "5000"))
 
+SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
+"""XML namespace URI for the SSML <speak> element."""
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+@dataclass
+class TTSRequest:
+    """Normalised TTS parameters extracted from the incoming SSML."""
+
+    voice: str
+    rate: str
+    pitch: str
+    text: str
+
+
+# ---------------------------------------------------------------------------
+# SSML Parsing helpers
+# ---------------------------------------------------------------------------
+def _parse_rate(raw: Optional[str]) -> str:
+    """Transform an SSML ``rate`` attribute into an edge-tts-compatible value.
+
+    Rules (applied in order):
+        - ``None`` or empty  →  ``DEFAULT_RATE``
+        - ``"0%"``           →  ``"+0%"``   (safe no-change representation)
+        - ``"N%"`` where N < 100  →  ``"-{100-N}%"``   (slow-down relative to 100 %)
+        - ``"N%"`` where N ≥ 100  →  ``"+{N-100}%"``   (speed-up relative to 100 %)
+        - Everything else (e.g. ``"x-slow"``, ``"+20ms"``) → passed through as-is.
+    """
+    if not raw:
+        return DEFAULT_RATE
+
+    raw = raw.strip()
+    if raw.endswith("%"):
+        try:
+            val = float(raw[:-1])
+        except ValueError:
+            return raw  # non-numeric percentage – let edge-tts decide
+
+        if val == 0:
+            return "+0%"
+        if 0 < val < 100:
+            return f"-{100 - val}%"
+        return f"+{val - 100}%"
+
+    # Non-percentage values: "x-slow", "fast", "+20ms", ...
+    return raw
+
+
+def _parse_pitch(raw: Optional[str]) -> str:
+    """Transform an SSML ``pitch`` attribute into an edge-tts-compatible value.
+
+    Rules:
+        - ``None`` or empty  →  ``DEFAULT_PITCH``
+        - ``"0%"``           →  ``"+0Hz"``  (edge-tts no-change pitch)
+        - Everything else → passed through as-is (``"+20Hz"``, ``"x-low"``, …).
+    """
+    if not raw:
+        return DEFAULT_PITCH
+
+    raw = raw.strip()
+    if raw == "0%":
+        return "+0Hz"
+    return raw
+
+
+def extract_tts_params(ssml: str) -> TTSRequest:
+    """Parse an SSML string and return normalised TTS parameters.
+
+    Args:
+        ssml: A well-formed SSML document containing at minimum a ``<speak>``
+              root element.
+
+    Returns:
+        ``TTSRequest`` with voice, rate, pitch, and the plain-text content
+        to synthesise.
+
+    Raises:
+        ValueError: If the SSML is malformed or contains no speakable text.
+    """
     try:
-        # 1. Parse the SSML string
-        root = ET.fromstring(ssml_text)
-        
-        # Define the SSML namespace for robust parsing
-        ssml_namespace = "http://www.w3.org/2001/10/synthesis"
+        root = ET.fromstring(ssml)
+    except ET.ParseError as exc:
+        raise ValueError(f"Malformed SSML: {exc}") from exc
 
-        # 2. Extract Voice Information
-        # Use the namespace to find elements correctly
-        voice_element = root.find(f'{{{ssml_namespace}}}voice')
-        
-        if voice_element is not None:
-            voice_name_attribute = voice_element.get('name')
-            if voice_name_attribute:
-                extracted_voice = voice_name_attribute
-            
-            # 3. Extract Prosody and Content (assuming prosody is a child of voice)
-            prosody_element = voice_element.find(f'{{{ssml_namespace}}}prosody')
-            
-            if prosody_element is not None:
-                # Get raw attribute values from SSML
-                rate_attr_raw = prosody_element.get('rate')
-                pitch_attr_raw = prosody_element.get('pitch')
+    voice: str = DEFAULT_VOICE
+    rate: str = DEFAULT_RATE
+    pitch: str = DEFAULT_PITCH
+    text: str = ""
 
-                # --- Transformation Logic for Rate ---
-                if rate_attr_raw:
-                    try:
-                        rate_percentage_val = float(rate_attr_raw.strip('%'))
-                        if '%' in rate_attr_raw:
-                            if rate_percentage_val == 0:
-                                extracted_rate = "+0%" # Safely map "0%" to "+0%"
-                            elif rate_percentage_val > 0 and rate_percentage_val < 100:
-                                # Interpret as a slow-down relative to 100% normal.
-                                # e.g., 45% -> -55% (55% slower)
-                                extracted_rate = f"-{100 - rate_percentage_val}%"
-                            else: # e.g., 150% -> +50% (50% faster)
-                                extracted_rate = f"+{rate_percentage_val - 100}%"
-                        else: # Not a percentage (e.g., "medium", "+20ms")
-                            extracted_rate = rate_attr_raw
-                    except ValueError: # If value is like "x-slow", "fast" etc.
-                        extracted_rate = rate_attr_raw # Let edge-tts handle named rates
-                else:
-                    extracted_rate = DEFAULT_RATE # Use default if attribute not found
+    # --- <voice> -----------------------------------------------------------
+    voice_el = root.find(f"{{{SSML_NAMESPACE}}}voice")
+    if voice_el is not None:
+        voice_name = voice_el.get("name")
+        if voice_name:
+            voice = voice_name.strip()
 
-                # --- Transformation Logic for Pitch ---
-                if pitch_attr_raw:
-                    try:
-                        pitch_percentage_val = float(pitch_attr_raw.strip('%'))
-                        if '%' in pitch_attr_raw and pitch_percentage_val == 0:
-                            extracted_pitch = "+0Hz" # Safely map "0%" to "+0Hz"
-                        else: # Keep as is (e.g., "+20Hz", "x-low")
-                            extracted_pitch = pitch_attr_raw
-                    except ValueError: # If value is like "x-low", "high" etc.
-                        extracted_pitch = pitch_attr_raw # Let edge-tts handle named pitches
-                else:
-                    extracted_pitch = DEFAULT_PITCH # Use default if attribute not found
+        prosody_el = voice_el.find(f"{{{SSML_NAMESPACE}}}prosody")
+        if prosody_el is not None:
+            rate = _parse_rate(prosody_el.get("rate"))
+            pitch = _parse_pitch(prosody_el.get("pitch"))
+            text = (prosody_el.text or "").strip()
+        else:
+            text = (voice_el.text or "").strip()
+            logger.warning(
+                "No <prosody> inside <voice>; using default rate/pitch."
+            )
+    else:
+        text = (root.text or "").strip()
+        logger.warning(
+            "No <voice> element found; using default voice, rate, and pitch."
+        )
 
-                # Extract content from prosody tag
-                extracted_content = prosody_element.text.strip() if prosody_element.text else ""
-                
-            else: # If no <prosody> tag, try to get text directly from <voice> element
-                extracted_content = voice_element.text.strip() if voice_element.text else ""
-                print(f"Warning: No <prosody> tag found in SSML. Using text directly from <voice> element: '{extracted_content}' and default rate/pitch.")
-        else: # If no <voice> tag, try to get text directly from <speak> element
-            extracted_content = root.text.strip() if root.text else ""
-            print(f"Warning: No <voice> tag found in SSML. Using text directly from <speak> element: '{extracted_content}' and default voice/rate/pitch.")
+    if not text:
+        raise ValueError("No speakable text found in SSML.")
 
-        if not extracted_content:
-            return jsonify({"error": "No speech content found in SSML to synthesize"}), 400
+    logger.debug(
+        "Parsed SSML → voice=%r rate=%r pitch=%r text=%r",
+        voice,
+        rate,
+        pitch,
+        text[:80],
+    )
+    return TTSRequest(voice=voice, rate=rate, pitch=pitch, text=text)
 
-        print(f"DEBUG Extracted & Transformed Parameters: Voice='{extracted_voice}', Rate='{extracted_rate}', Pitch='{extracted_pitch}', Content='{extracted_content}'")
 
-    except ET.ParseError as e:
-        print(f"SSML parsing error: {e}. Ensure SSML is well-formed.")
-        return jsonify({"error": f"Invalid SSML format: {str(e)}"}), 400
-    except Exception as e:
-        print(f"An unexpected error occurred during SSML parsing or parameter extraction: {e}")
-        return jsonify({"error": f"Failed to parse SSML or extract content: {str(e)}"}), 500
+# ---------------------------------------------------------------------------
+# TTS generation
+# ---------------------------------------------------------------------------
+async def generate_audio(req: TTSRequest) -> bytes:
+    """Synthesise speech via edge-tts and return MP3 bytes.
 
+    Args:
+        req: Normalised TTS parameters.
+
+    Returns:
+        Raw MP3 audio bytes.
+
+    Raises:
+        RuntimeError: If edge-tts fails (e.g. invalid voice name).
+    """
     try:
-        # Use the extracted and transformed parameters to generate the TTS
-        # The first argument is the actual speech content, not the full SSML.
         communicate = edge_tts.Communicate(
-            extracted_content,
-            voice=extracted_voice,
-            rate=extracted_rate,
-            pitch=extracted_pitch
+            req.text,
+            voice=req.voice,
+            rate=req.rate,
+            pitch=req.pitch,
         )
-        
-        audio_stream = BytesIO()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_stream.write(chunk["data"])
-        
-        audio_stream.seek(0)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to initialise edge-tts: {exc}") from exc
 
-        return send_file(
-            audio_stream,
+    buf = BytesIO()
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            buf.write(chunk.get("data", b""))
+
+    if buf.tell() == 0:
+        raise RuntimeError("edge-tts returned no audio data.")
+
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+def create_app() -> Flask:
+    """Create and configure the Flask application."""
+    app = Flask(__name__)
+    CORS(app)
+
+    # -- Health check --------------------------------------------------------
+    @app.route("/health", methods=["GET"])
+    def health() -> Response:
+        return jsonify({"status": "ok"})
+
+    # -- TTS endpoint --------------------------------------------------------
+    @app.route("/generate-and-download-tts", methods=["POST"])
+    async def generate_and_download_tts() -> Response:
+        """Accept SSML, produce MP3.
+
+        Expects JSON: ``{"ssml": "<speak>...</speak>"}``.
+        Returns the MP3 file as an attachment on success, or a JSON error body.
+        """
+        body = request.get_json(silent=True)
+        if not body or "ssml" not in body:
+            logger.warning("Request missing 'ssml' field.")
+            return jsonify({"error": "Missing 'ssml' field in JSON body."}), 400  # type: ignore[return-value]
+
+        ssml = body["ssml"].strip()
+        if not ssml:
+            return jsonify({"error": "Empty SSML string."}), 400  # type: ignore[return-value]
+
+        # 1. Parse
+        try:
+            tts_req = extract_tts_params(ssml)
+        except ValueError as exc:
+            logger.warning("SSML parse error: %s", exc)
+            return jsonify({"error": str(exc)}), 400  # type: ignore[return-value]
+
+        # 2. Synthesise
+        try:
+            audio = await generate_audio(tts_req)
+        except RuntimeError as exc:
+            logger.error("TTS generation failed: %s", exc)
+            return jsonify({"error": str(exc)}), 500  # type: ignore[return-value]
+
+        # 3. Respond
+        return Response(
+            audio,
             mimetype="audio/mpeg",
-            as_attachment=True,
-            download_name=output_filename
+            headers={"Content-Disposition": 'attachment; filename="tts-output.mp3"'},
         )
 
-    except Exception as e:
-        print(f"Error generating TTS: {e}")
-        # Provide more specific error if voice selection was the issue
-        if "voice" in str(e).lower() and extracted_voice:
-             return jsonify({"error": f"Failed to generate TTS: The voice '{extracted_voice}' might not be valid or available. Error: {str(e)}"}), 500
-        return jsonify({"error": f"Failed to generate TTS: {str(e)}"}), 500
+    return app
 
-if __name__ == '__main__':
-    # Ensure asyncio is available for edge_tts.Communicate
-    app.run(debug=True, port=5000)
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    application = create_app()
+
+    if os.environ.get("FLASK_DEBUG"):
+        logger.info(
+            "Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT
+        )
+        application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
+    else:
+        try:
+            from waitress import serve  # type: ignore[import-untyped]
+        except ImportError:
+            logger.warning(
+                "Waitress not installed; falling back to Flask development server. "
+                "Install with: pip install waitress"
+            )
+            application.run(host=SERVER_HOST, port=SERVER_PORT)
+        else:
+            logger.info(
+                "Starting Waitress production server on %s:%d", SERVER_HOST, SERVER_PORT
+            )
+            serve(application, host=SERVER_HOST, port=SERVER_PORT)

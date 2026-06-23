@@ -8,18 +8,97 @@
 </head>
 <body>
     <div class="container">
+        <!-- Header -->
         <div class="header">
-            <!-- Removed the red-box div -->
-            <div class="tab active-tab">SSML</div>
-            <!-- If you had other tabs, they would go here -->
+            <div class="tab active-tab" data-tab="ssml">SSML</div>
+            <div class="tab" data-tab="test">Test Input</div>
         </div>
-        <div class="content-area">
-            <textarea id="ssmlInput" class="ssml-textarea" placeholder="Enter your SSML here..."></textarea>
+
+        <!-- SSML Tab -->
+        <div class="tab-content active" id="tab-ssml">
+            <div class="content-area">
+                <textarea id="ssmlInput" class="ssml-textarea" spellcheck="false"></textarea>
+            </div>
+            <div class="bottom-section">
+                <button id="downloadSsmlBtn" class="btn-primary">Download MP3</button>
+            </div>
         </div>
-        <div class="bottom-section">
-            <button id="downloadBtn" class="download-button">Download</button>
+
+        <!-- Test Input Tab -->
+        <div class="tab-content" id="tab-test">
+            <div class="test-input-layout">
+                <!-- Left: input controls -->
+                <div class="test-controls">
+                    <!-- Voice -->
+                    <div class="field-group">
+                        <label class="field-label">Voice</label>
+                        <div class="voice-search-wrapper">
+                            <input type="text" id="voiceSearch" class="voice-search-input"
+                                   placeholder="Search by voice name..." autocomplete="off">
+                            <div class="voice-dropdown" id="voiceDropdown"></div>
+                        </div>
+                        <div class="voice-selected" id="voiceSelected">
+                            <span class="voice-name">en-US-AvaMultilingualNeural</span>
+                            <span class="voice-locale">en-US</span>
+                        </div>
+                    </div>
+
+                    <!-- Text -->
+                    <div class="field-group">
+                        <label class="field-label">
+                            Input Text
+                            <span class="char-count" id="charCount">0 characters</span>
+                        </label>
+                        <textarea id="testTextInput" class="test-textarea"
+                                  placeholder="Enter text to synthesize..."></textarea>
+                    </div>
+
+                    <!-- Speed -->
+                    <div class="field-group">
+                        <label class="field-label">
+                            Speed
+                            <span class="slider-value" id="speedValue">0%</span>
+                        </label>
+                        <input type="range" id="speedSlider" class="slider" min="-50" max="200" value="0" step="1">
+                    </div>
+
+                    <!-- Pitch -->
+                    <div class="field-group">
+                        <label class="field-label">
+                            Pitch
+                            <span class="slider-value" id="pitchValue">0%</span>
+                        </label>
+                        <input type="range" id="pitchSlider" class="slider" min="-50" max="50" value="0" step="1">
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="test-actions">
+                        <button id="previewBtn" class="btn-primary">▶ Preview Audio</button>
+                        <button id="downloadTestBtn" class="btn-secondary">⬇ Download MP3</button>
+                    </div>
+                </div>
+
+                <!-- Right: generated SSML preview + results -->
+                <div class="test-results-panel">
+                    <div class="panel-tabs">
+                        <div class="panel-tab active" data-panel="ssml-preview">SSML Preview</div>
+                        <div class="panel-tab" data-panel="results">Results</div>
+                    </div>
+                    <div class="panel-content active" id="ssml-preview">
+                        <pre id="ssmlPreview" class="ssml-preview"></pre>
+                    </div>
+                    <div class="panel-content" id="results">
+                        <div id="resultsList" class="results-list">
+                            <div class="results-empty">No generated items yet</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
+
+    <!-- Hidden audio element for preview playback -->
+    <audio id="audioPlayer" class="hidden-audio"></audio>
 
     <script src="script.js"></script>
 </body>

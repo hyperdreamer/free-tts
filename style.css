@@ -1,99 +1,487 @@
-body {
-    font-family: Arial, sans-serif;
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
-    min-height: 100vh;
+/* =========================================================================
+   SSML TTS Generator — Stylesheet
+   ========================================================================= */
+
+:root {
+    --bg: #f5f5f7;
+    --surface: #ffffff;
+    --border: #e0e0e5;
+    --border-light: #eeeef2;
+    --text: #1d1d1f;
+    --text-secondary: #6e6e73;
+    --text-muted: #999;
+    --accent: #0071e3;
+    --accent-hover: #0077ed;
+    --accent-light: #e8f2fd;
+    --danger: #ff3b30;
+    --radius: 8px;
+    --radius-sm: 6px;
+    --shadow: 0 2px 12px rgba(0,0,0,0.06);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+* {
     margin: 0;
-    background-color: #f0f0f0;
-    padding-top: 20px;
-}
-
-.container {
-    width: 600px;
-    border: 1px solid #ccc;
-    box-shadow: 0 0 10px rgba(0,0,0,0.1);
-    background-color: white;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    border-radius: 5px;
-}
-
-.header {
-    display: flex;
-    align-items: center;
-    background-color: white;
-    border-bottom: 1px solid #eee;
-    padding-left: 15px; /* Keep padding for aesthetic spacing */
-}
-
-/* Removed the .red-box CSS rule */
-
-.tab {
-    padding: 10px 15px;
-    cursor: pointer;
-    font-size: 14px;
-    color: #555;
-    border-bottom: 3px solid transparent;
-    transition: all 0.2s ease-in-out;
-}
-
-.active-tab {
-    color: #333;
-    font-weight: bold;
-    border-bottom-color: #007bff;
-}
-
-.content-area {
-    background-color: white;
-    padding: 15px;
-    flex-grow: 1;
-}
-
-.ssml-textarea {
-    width: calc(100% - 22px);
-    min-height: 300px;
-    border: 1px solid #ddd;
-    padding: 10px;
-    font-family: monospace;
-    font-size: 14px;
-    resize: vertical;
-    outline: none;
-    line-height: 1.5;
-    border-radius: 3px;
-    white-space: pre-wrap;
-    overflow-x: auto;
+    padding: 0;
     box-sizing: border-box;
 }
 
-.bottom-section {
-    background-color: white; /* Changed from #8B0000 to white */
+body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 32px 16px;
+}
+
+/* ---- Container ---- */
+.container {
+    width: 100%;
+    max-width: 960px;
+    background: var(--surface);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+/* ---- Header / Tabs ---- */
+.header {
+    display: flex;
+    align-items: center;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border-light);
+    padding: 0 20px;
+}
+
+.tab {
+    padding: 14px 20px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+    user-select: none;
+}
+
+.tab:hover {
+    color: var(--text);
+}
+
+.tab.active-tab {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+/* ---- Tab Content ---- */
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+/* ---- SSML Tab ---- */
+.content-area {
     padding: 20px;
+}
+
+.ssml-textarea {
+    width: 100%;
+    min-height: 360px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+    resize: vertical;
+    outline: none;
+    background: #fafafa;
+    color: var(--text);
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.ssml-textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,113,227,0.12);
+    background: var(--surface);
+}
+
+.bottom-section {
+    padding: 16px 20px 20px;
     display: flex;
     justify-content: flex-end;
     align-items: center;
-    min-height: 150px; /* Keep approximate height */
-    border-top: 1px solid #eee; /* Add a subtle top border for separation */
+    border-top: 1px solid var(--border-light);
 }
 
-.download-button {
-    background-color: #007bff;
-    color: white;
-    padding: 12px 25px;
+/* ---- Buttons ---- */
+.btn-primary,
+.btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 22px;
     border: none;
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+    font-weight: 500;
     cursor: pointer;
-    font-size: 16px;
-    transition: background-color 0.2s ease-in-out;
-    margin-right: 20px;
+    transition: background 0.15s, transform 0.1s;
+    user-select: none;
 }
 
-.download-button:hover {
-    background-color: #0056b3;
+.btn-primary {
+    background: var(--accent);
+    color: #fff;
 }
 
-.download-button:disabled {
-    background-color: #cccccc;
+.btn-primary:hover {
+    background: var(--accent-hover);
+}
+
+.btn-primary:active {
+    transform: scale(0.98);
+}
+
+.btn-primary:disabled {
+    background: #ccc;
     cursor: not-allowed;
+    transform: none;
+}
+
+.btn-secondary {
+    background: var(--surface);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+}
+
+.btn-secondary:hover {
+    background: var(--accent-light);
+}
+
+.btn-secondary:disabled {
+    color: #ccc;
+    border-color: #ddd;
+    cursor: not-allowed;
+}
+
+/* =========================================================================
+   Test Input Tab
+   ========================================================================= */
+
+.test-input-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+    min-height: 520px;
+    border-top: 1px solid var(--border-light);
+}
+
+/* Left: controls */
+.test-controls {
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    border-right: 1px solid var(--border-light);
+}
+
+.field-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.field-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+
+.char-count {
+    font-weight: 400;
+    color: var(--text-muted);
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+/* Voice search */
+.voice-search-wrapper {
+    position: relative;
+}
+
+.voice-search-input {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: var(--font);
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.voice-search-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,113,227,0.10);
+}
+
+.voice-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.10);
+    z-index: 10;
+    display: none;
+}
+
+.voice-dropdown.open {
+    display: block;
+}
+
+.voice-option {
+    padding: 9px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: background 0.1s;
+}
+
+.voice-option:hover,
+.voice-option.active {
+    background: var(--accent-light);
+    color: var(--accent);
+}
+
+.voice-option-locale {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.voice-selected {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--accent-light);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+}
+
+.voice-name {
+    font-weight: 500;
+    color: var(--accent);
+}
+
+.voice-locale {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--surface);
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+/* Text input */
+.test-textarea {
+    width: 100%;
+    min-height: 100px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    font-family: var(--font);
+    font-size: 13px;
+    line-height: 1.5;
+    resize: vertical;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.test-textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,113,227,0.10);
+}
+
+/* Sliders */
+.slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    outline: none;
+    cursor: pointer;
+}
+
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+    transition: transform 0.1s;
+}
+
+.slider::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+}
+
+.slider-value {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent);
+}
+
+/* Test actions */
+.test-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+}
+
+/* ---- Right: SSML preview + results ---- */
+.test-results-panel {
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    background: #fafafa;
+}
+
+.panel-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border-light);
+    padding: 0 20px;
+    background: var(--surface);
+}
+
+.panel-tab {
+    padding: 10px 16px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+    user-select: none;
+}
+
+.panel-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.panel-content {
+    display: none;
+    flex: 1;
+    padding: 16px 20px;
+    overflow-y: auto;
+}
+
+.panel-content.active {
+    display: block;
+}
+
+.ssml-preview {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text-secondary);
+    margin: 0;
+}
+
+.results-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.results-empty {
+    color: var(--text-muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 40px 0;
+}
+
+.result-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+}
+
+.result-item:hover {
+    border-color: var(--accent);
+}
+
+.result-item .result-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.result-item .result-text {
+    color: var(--text);
+    font-weight: 500;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.result-item .result-voice {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.result-item .result-play {
+    color: var(--accent);
+    font-size: 18px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.hidden-audio {
+    display: none;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 720px) {
+    .test-input-layout {
+        grid-template-columns: 1fr;
+    }
+    .test-controls {
+        border-right: none;
+        border-bottom: 1px solid var(--border-light);
+    }
 }
