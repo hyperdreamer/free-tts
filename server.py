@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -34,6 +35,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional
 
 import edge_tts
@@ -58,34 +60,66 @@ logger = logging.getLogger("tts-server")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DEFAULT_VOICE: str = os.environ.get("TTS_DEFAULT_VOICE", "en-US-AvaMultilingualNeural")
+_CONFIG_PATH = Path(os.environ.get("TTS_CONFIG", Path(__file__).parent / "config.json"))
+
+
+def _load_config() -> dict[str, Any]:
+    """Load configuration from config.json, if it exists.
+
+    Environment variables take precedence over the config file.
+    Keys in config.json use snake_case and are mapped to TTS_* env vars.
+    """
+    cfg: dict[str, Any] = {}
+    if _CONFIG_PATH.is_file():
+        try:
+            cfg = json.loads(_CONFIG_PATH.read_text())
+            logger.info("Loaded config from %s", _CONFIG_PATH)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to load %s: %s", _CONFIG_PATH, exc)
+    return cfg
+
+
+def _cfg(key: str, env_var: str, default: Any, coerce: type = str) -> Any:
+    """Resolve a config value: env var > config.json > hardcoded default."""
+    env_val = os.environ.get(env_var)
+    if env_val is not None:
+        return coerce(env_val)
+    file_val = _CONFIG_CACHE.get(key)
+    if file_val is not None:
+        return coerce(file_val) if coerce is not str else str(file_val)
+    return default
+
+
+_CONFIG_CACHE = _load_config()
+
+DEFAULT_VOICE: str = _cfg("default_voice", "TTS_DEFAULT_VOICE", "en-US-AvaMultilingualNeural")
 """Default voice name used when the SSML omits a <voice> element."""
 
-DEFAULT_RATE: str = os.environ.get("TTS_DEFAULT_RATE", "+0%")
+DEFAULT_RATE: str = _cfg("default_rate", "TTS_DEFAULT_RATE", "+0%")
 """Default speaking rate (edge-tts format) when <prosody rate> is missing."""
 
-DEFAULT_PITCH: str = os.environ.get("TTS_DEFAULT_PITCH", "+0Hz")
+DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 """Default pitch (edge-tts format) when <prosody pitch> is missing."""
 
-SERVER_HOST: str = os.environ.get("TTS_HOST", "0.0.0.0")
-SERVER_PORT: int = int(os.environ.get("TTS_PORT", "5000"))
+SERVER_HOST: str = _cfg("host", "TTS_HOST", "0.0.0.0")
+SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 
-MAX_SSML_LENGTH: int = int(os.environ.get("TTS_MAX_SSML_LENGTH", str(50 * 1024)))
+MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024, coerce=int)
 """Maximum SSML payload size in bytes. 50 KB default."""
 
-TTS_TIMEOUT: int = int(os.environ.get("TTS_TIMEOUT", "60"))
+TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 60, coerce=int)
 """Maximum seconds for a single TTS generation request."""
 
-WAITRESS_THREADS: int = int(os.environ.get("TTS_WAITRESS_THREADS", "4"))
+WAITRESS_THREADS: int = _cfg("waitress_threads", "TTS_WAITRESS_THREADS", 4, coerce=int)
 """Number of Waitress worker threads."""
 
-GUNICORN_WORKERS: int = int(os.environ.get("TTS_GUNICORN_WORKERS", "2"))
+GUNICORN_WORKERS: int = _cfg("gunicorn_workers", "TTS_GUNICORN_WORKERS", 2, coerce=int)
 """Number of Gunicorn worker processes."""
 
-GUNICORN_THREADS: int = int(os.environ.get("TTS_GUNICORN_THREADS", "4"))
+GUNICORN_THREADS: int = _cfg("gunicorn_threads", "TTS_GUNICORN_THREADS", 4, coerce=int)
 """Threads per Gunicorn worker."""
 
-WSGI_SERVER: str = os.environ.get("TTS_SERVER", "waitress").lower()
+WSGI_SERVER: str = _cfg("wsgi_server", "TTS_SERVER", "waitress")
 """Which WSGI server to use: 'waitress' or 'gunicorn'."""
 
 SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"

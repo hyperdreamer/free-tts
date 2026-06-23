@@ -1,0 +1,11 @@
+{
+    "host": "0.0.0.0",
+    "port": 5000,
+    "default_voice": "en-US-AvaMultilingualNeural",
+    "max_ssml_length": 51200,
+    "tts_timeout": 60,
+    "wsgi_server": "waitress",
+    "waitress_threads": 4,
+    "gunicorn_workers": 2,
+    "gunicorn_threads": 4
+}
