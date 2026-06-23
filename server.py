@@ -503,19 +503,20 @@ def create_app() -> Flask:
     # -- Voices endpoint -----------------------------------------------------
     @app.route("/voices", methods=["GET"])
     def list_voices() -> Response:
-        """Return all available edge-tts voices and languages.
+        """Return all available edge-tts voices, languages, and server defaults.
 
         Response:
             {
                 "languages": [{"locale": "en-US", "name": "English (United States)"}, ...],
-                "voices": [{"ShortName": ..., "Gender": ..., "Locale": ..., ...}, ...]
+                "voices": [{"ShortName": ..., "Gender": ..., "Locale": ..., ...}, ...],
+                "default_voice": "en-US-EmmaMultilingualNeural"
             }
         """
-        g._status_code = 200  # type: ignore[attr-defined]
         return jsonify(
             {
                 "languages": _LANGUAGE_LIST,
                 "voices": _voice_cache,
+                "default_voice": DEFAULT_VOICE,
             }
         )
 

@@ -81,14 +81,19 @@ async function checkServer() {
 // --- Load voices ----------------------------------------------------------
 async function loadVoices() {
   try {
-    const resp = await fetch(`${serverUrl}/voices`, { signal: AbortSignal.timeout(5000) });
+    const resp = await fetch(`${serverUrl}/voices`, { signal: AbortSignal.timeout(3000) });
     if (!resp.ok) throw new Error("Failed");
     const data = await resp.json();
     voices = data.voices || [];
+    // Use the server's configured default voice if available
+    if (data.default_voice && defaultVoice === "en-US-AvaMultilingualNeural") {
+      defaultVoice = data.default_voice;
+      chrome.storage.sync.set({ voice: defaultVoice });
+    }
+    renderVoiceSelect();
   } catch {
-    voices = [];
+    if (voices.length === 0) renderVoiceSelect();
   }
-  renderVoiceSelect();
 }
 
 function renderVoiceSelect() {

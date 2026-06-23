@@ -18,7 +18,8 @@ TEXT_CONTENT
     </voice>
 </speak>`;
 
-const DEFAULT_VOICE = "en-US-AvaMultilingualNeural";
+const DEFAULT_VOICE_FALLBACK = "en-US-AvaMultilingualNeural";
+let configuredDefaultVoice = DEFAULT_VOICE_FALLBACK;
 const DEFAULT_TEXT =
   "Gaming is not just play anymore. It has become a nation. A culture. A career. A community.";
 const SAMPLE_TEXT = "Hello, this is a sample of my voice.";
@@ -35,7 +36,7 @@ const BACKEND_URL = window.location.protocol === "file:" ? "http://localhost:500
 // ---------------------------------------------------------------------------
 let allVoices = [];           // raw from server
 let languages = [];           // [{locale, name}]
-let selectedVoice = DEFAULT_VOICE;
+let selectedVoice = DEFAULT_VOICE_FALLBACK;
 let results = [];             // { text, voice, rate, pitch, blobUrl }
 let activeGender = "all";     // "all" | "Male" | "Female"
 
@@ -97,7 +98,7 @@ function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
 }
 
 function fillDefaultSSML() {
-  ssmlInput.value = buildSSML(DEFAULT_VOICE, DEFAULT_TEXT, 0, 0);
+  ssmlInput.value = buildSSML(configuredDefaultVoice, DEFAULT_TEXT, 0, 0);
   textInputArea.value = DEFAULT_TEXT;
 }
 
@@ -163,6 +164,9 @@ async function loadVoices() {
     const data = await resp.json();
     allVoices = data.voices || [];
     languages = data.languages || [];
+    // Respect the server's configured default voice
+    if (data.default_voice) configuredDefaultVoice = data.default_voice;
+    if (selectedVoice === DEFAULT_VOICE_FALLBACK) selectedVoice = configuredDefaultVoice;
     populateLanguageDropdown();
   } catch (err) {
     console.error("Voice load error:", err);
