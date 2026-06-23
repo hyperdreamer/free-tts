@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>free-tts</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup">
+    <!-- Header -->
+    <div class="header">
+      <span class="title">free-tts</span>
+      <span class="status-dot" id="statusDot" title="Server status"></span>
+      <a class="options-link" href="#" id="optionsLink" title="Settings">⚙</a>
+    </div>
+
+    <!-- Voice picker -->
+    <div class="voice-row">
+      <select id="voiceSelect" class="voice-select">
+        <option value="">Loading voices...</option>
+      </select>
+    </div>
+
+    <!-- Text -->
+    <textarea id="textInput" class="text-input" placeholder="Enter text or select text on any page and click the extension icon..."></textarea>
+
+    <!-- Speed -->
+    <div class="slider-row">
+      <label class="slider-label">Speed <span id="speedVal">0%</span></label>
+      <input type="range" id="speedSlider" min="-50" max="200" value="0" step="5">
+    </div>
+
+    <!-- Controls -->
+    <div class="controls">
+      <button id="speakBtn" class="btn btn-speak">▶ Speak</button>
+      <button id="stopBtn" class="btn btn-stop" disabled>■ Stop</button>
+    </div>
+  </div>
+  <audio id="audioPlayer"></audio>
+  <script src="popup.js"></script>
+</body>
+</html>
