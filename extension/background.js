@@ -1,16 +1,18 @@
 // free-tts background service worker
-// Handles context menu clicks, keyboard shortcut, and dynamic stop menu.
-// Audio playback is injected into the active tab (service workers can't play audio).
+// Sentence-by-sentence TTS with pre-caching and highlight bar.
 
 const DEFAULT_SERVER = "http://localhost:5000";
+const PRELOAD_AHEAD = 2;  // pre-fetch this many sentences ahead
 
-// Track injected audio
+// Pipeline state
 let activePlayback = { tabId: null };
 let playbackTimeout = null;
+let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl }
 
 function clearPlayback() {
   activePlayback = { tabId: null };
   if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
+  sentencePipeline = null;
   updateStopMenu();
 }
 
@@ -37,9 +39,9 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "speak-selection" && info.selectionText) {
-    await speakInTab(tab.id, info.selectionText);
+    await startSentenceTTS(tab.id, info.selectionText);
   } else if (info.menuItemId === "stop-speaking") {
-    await stopPlaybackInTab();
+    await stopPlayback();
   }
 });
 
@@ -54,90 +56,193 @@ chrome.commands.onCommand.addListener(async (command) => {
         func: () => window.getSelection()?.toString() || "",
       });
       const text = results?.[0]?.result;
-      if (text) await speakInTab(tab.id, text);
+      if (text) await startSentenceTTS(tab.id, text);
     } catch {
       // scripting permission may not be available on all URLs
     }
   }
 });
 
-// --- Stop playback in tab --------------------------------------------------
-async function stopPlaybackInTab() {
-  if (!activePlayback.tabId) return;
-  const tabId = activePlayback.tabId;
+// --- Stop playback ---------------------------------------------------------
+async function stopPlayback() {
+  sentencePipeline = null;
+  if (activePlayback.tabId) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: activePlayback.tabId },
+        func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } clearHighlight(); },
+      });
+    } catch {}
+  }
   clearPlayback();
+}
+
+// --- Sentence splitting ----------------------------------------------------
+function splitSentences(text) {
+  // Split on sentence-ending punctuation followed by space
+  const sentences = text.match(/[^.!?\n]+[.!?]+(\s|$)|[^.!?\n]+$/g) || [text];
+  return sentences.map(s => s.trim()).filter(s => s.length > 0);
+}
+
+// --- Highlight bar ---------------------------------------------------------
+async function showHighlight(tabId, sentence) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => {
-        const a = window.__freeTtsAudio;
-        if (a) { a.pause(); a.currentTime = 0; a.src = ""; delete window.__freeTtsAudio; }
+      func: (s) => {
+        let bar = document.getElementById("free-tts-highlight");
+        if (!bar) {
+          bar = document.createElement("div");
+          bar.id = "free-tts-highlight";
+          bar.style.cssText = "position:fixed;bottom:0;left:0;right:0;background:#fff3cd;color:#333;padding:16px 24px;font-size:18px;line-height:1.5;z-index:999999;box-shadow:0 -2px 12px rgba(0,0,0,0.15);text-align:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif;";
+          document.body.appendChild(bar);
+        }
+        bar.textContent = s;
+        if (typeof clearHighlight === "undefined") {
+          window.clearHighlight = () => { const b = document.getElementById("free-tts-highlight"); if (b) b.remove(); };
+        }
       },
+      args: [sentence],
     });
-  } catch {
-    // tab may have closed
-  }
+  } catch {}
 }
 
-// --- Fetch audio and inject playback into the tab --------------------------
-async function speakInTab(tabId, text) {
+async function removeHighlight(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => { const b = document.getElementById("free-tts-highlight"); if (b) b.remove(); },
+    });
+  } catch {}
+}
+
+// --- Fetch audio for one sentence ------------------------------------------
+async function fetchSentenceAudio(serverUrl, voice, sentence) {
+  const ssml = buildSSML(sentence, voice);
+  const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ssml }),
+  });
+  if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
+  const blob = await resp.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// --- Main sentence TTS pipeline --------------------------------------------
+async function startSentenceTTS(tabId, text) {
   const { serverUrl, voice } = await chrome.storage.sync.get({
     serverUrl: DEFAULT_SERVER,
     voice: "en-US-AvaMultilingualNeural",
   });
-  const ssml = buildSSML(text, voice);
 
+  const sentences = splitSentences(text);
+  if (sentences.length === 0) return;
+
+  await stopPlayback();
+  const cache = new Map();  // idx → dataUrl
+  sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl };
+  activePlayback = { tabId };
+  updateStopMenu();
+
+  // Show first sentence immediately
+  await showHighlight(tabId, sentences[0]);
+
+  // Pre-fetch first few sentences
+  const preloadCount = Math.min(PRELOAD_AHEAD, sentences.length);
+  for (let i = 0; i < preloadCount; i++) {
+    fetchSentenceAudio(serverUrl, voice, sentences[i])
+      .then(url => cache.set(i, url))
+      .catch(() => {});
+  }
+
+  // Wait a bit for first sentence to cache, then play
+  await playNextSentence();
+}
+
+async function playNextSentence() {
+  if (!sentencePipeline) return;
+  const { sentences, currentIdx, cache, tabId, voice, serverUrl } = sentencePipeline;
+  if (currentIdx >= sentences.length) {
+    await removeHighlight(tabId);
+    clearPlayback();
+    return;
+  }
+
+  // Wait for current sentence to be cached (with timeout)
+  let dataUrl = cache.get(currentIdx);
+  if (!dataUrl) {
+    const start = Date.now();
+    while (!dataUrl && Date.now() - start < 10000) {
+      await new Promise(r => setTimeout(r, 200));
+      dataUrl = cache.get(currentIdx);
+      if (!sentencePipeline) return;  // cancelled
+    }
+  }
+  if (!dataUrl) {
+    // Fallback: fetch directly
+    try { dataUrl = await fetchSentenceAudio(serverUrl, voice, sentences[currentIdx]); }
+    catch { clearPlayback(); return; }
+  }
+
+  // Pre-fetch upcoming sentences
+  for (let i = currentIdx + 1; i < currentIdx + 1 + PRELOAD_AHEAD && i < sentences.length; i++) {
+    if (!cache.has(i)) {
+      fetchSentenceAudio(serverUrl, voice, sentences[i])
+        .then(url => cache.set(i, url))
+        .catch(() => {});
+    }
+  }
+
+  // Show highlight
+  await showHighlight(tabId, sentences[currentIdx]);
+
+  // Play
   try {
-    const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ssml }),
-    });
-    if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
-
-    const blob = await resp.blob();
-    const reader = new FileReader();
-    const dataUrl = await new Promise((resolve, reject) => {
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-
-    // Stop any previous playback
-    await stopPlaybackInTab();
-
-    // Inject audio playback into the tab with a known window-level reference
-    const audioId = Date.now();
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (url, id) => {
-        if (window.__freeTtsAudio) {
-          window.__freeTtsAudio.pause();
-          window.__freeTtsAudio.src = "";
-        }
+      func: (url, callback) => {
+        if (window.__freeTtsAudio) { window.__freeTtsAudio.pause(); }
         const a = new Audio(url);
-        a.id = `free-tts-${id}`;
         a.play().catch(() => {});
-        a.onended = () => { delete window.__freeTtsAudio; };
+        a.onended = () => { if (typeof callback === "function") callback(); };
         window.__freeTtsAudio = a;
       },
-      args: [dataUrl, audioId],
+      args: [dataUrl, true],  // flag to indicate completion
     });
 
-    activePlayback = { tabId };
-    updateStopMenu();
-    // Auto-clear after 30 seconds
-    playbackTimeout = setTimeout(clearPlayback, 30000);
-  } catch (err) {
-    console.error("free-tts:", err);
+    // Wait for audio to end (polling approach)
+    await new Promise((resolve) => {
+      const check = setInterval(async () => {
+        if (!sentencePipeline) { clearInterval(check); resolve(); return; }
+        try {
+          const [result] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => window.__freeTtsAudio?.ended ?? true,
+          });
+          if (result?.result) { clearInterval(check); resolve(); }
+        } catch { clearInterval(check); resolve(); }
+      }, 500);
+    });
+
+    // Move to next sentence
+    if (sentencePipeline) {
+      sentencePipeline.currentIdx++;
+      await playNextSentence();
+    }
+  } catch {
+    clearPlayback();
   }
 }
 
+// --- XML helpers -----------------------------------------------------------
 function escapeXML(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function buildSSML(text, voice) {

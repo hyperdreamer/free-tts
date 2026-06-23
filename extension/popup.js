@@ -18,6 +18,7 @@ let voices = [];
 let activeAudio = null;
 let activeDataUrl = null;
 let defaultVoice = DEFAULT_VOICE;
+let previewTimeout = null;  // for 30s preview limit
 
 // --- Init ------------------------------------------------------------------
 async function init() {
@@ -171,11 +172,15 @@ ${escapeXML(text)}
     activeAudio = audioPlayer;
 
     stopBtn.disabled = false;
+    // Auto-stop preview after 30 seconds
+    if (previewTimeout) clearTimeout(previewTimeout);
+    previewTimeout = setTimeout(() => stop(), 30000);
 
     audioPlayer.onended = () => {
       stopBtn.disabled = true;
       activeAudio = null;
       activeDataUrl = null;
+      if (previewTimeout) { clearTimeout(previewTimeout); previewTimeout = null; }
     };
   } catch (err) {
     console.error("free-tts:", err);
@@ -194,6 +199,7 @@ function stop() {
   activeDataUrl = null;
   audioPlayer.src = "";
   stopBtn.disabled = true;
+  if (previewTimeout) { clearTimeout(previewTimeout); previewTimeout = null; }
 }
 
 function blobToDataUrl(blob) {
