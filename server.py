@@ -104,8 +104,8 @@ DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 SERVER_HOST: str = _cfg("host", "TTS_HOST", "127.0.0.1")
 SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 
-MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024, coerce=int)
-"""Maximum SSML payload size in bytes. 50 KB default."""
+MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 256 * 1024, coerce=int)
+"""Maximum SSML payload size in bytes. 256 KB default."""
 
 TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 0, coerce=int)
 """Gunicorn worker timeout. 0 = no limit (stall detection handles timeouts)."""
