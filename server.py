@@ -106,17 +106,75 @@ _LANGUAGE_MAP: dict[str, str] = {}
 _LANGUAGE_LIST: list[dict[str, str]] = []
 """Unique languages for the frontend dropdown, sorted by display name."""
 
+# ---------------------------------------------------------------------------
+# Locale → display name mapping (ISO 639-1 language + ISO 3166-1 region)
+# ---------------------------------------------------------------------------
+_LANG_NAMES: dict[str, str] = {
+    "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
+    "hy": "Armenian", "az": "Azerbaijani", "bn": "Bangla", "eu": "Basque",
+    "bs": "Bosnian", "bg": "Bulgarian", "my": "Burmese", "ca": "Catalan",
+    "yue": "Cantonese", "zh": "Chinese", "hr": "Croatian", "cs": "Czech",
+    "da": "Danish", "nl": "Dutch", "en": "English", "et": "Estonian",
+    "fil": "Filipino", "fi": "Finnish", "fr": "French", "gl": "Galician",
+    "ka": "Georgian", "de": "German", "el": "Greek", "gu": "Gujarati",
+    "he": "Hebrew", "hi": "Hindi", "hu": "Hungarian", "is": "Icelandic",
+    "id": "Indonesian", "ga": "Irish", "it": "Italian", "ja": "Japanese",
+    "jv": "Javanese", "kn": "Kannada", "kk": "Kazakh", "km": "Khmer",
+    "ko": "Korean", "lo": "Lao", "lv": "Latvian", "lt": "Lithuanian",
+    "mk": "Macedonian", "ms": "Malay", "ml": "Malayalam", "mt": "Maltese",
+    "mr": "Marathi", "mn": "Mongolian", "ne": "Nepali", "nb": "Norwegian",
+    "ps": "Pashto", "fa": "Persian", "pl": "Polish", "pt": "Portuguese",
+    "pa": "Punjabi", "ro": "Romanian", "ru": "Russian", "sr": "Serbian",
+    "si": "Sinhala", "sk": "Slovak", "sl": "Slovenian", "so": "Somali",
+    "es": "Spanish", "su": "Sundanese", "sw": "Swahili", "sv": "Swedish",
+    "ta": "Tamil", "te": "Telugu", "th": "Thai", "tr": "Turkish",
+    "uk": "Ukrainian", "ur": "Urdu", "uz": "Uzbek", "vi": "Vietnamese",
+    "cy": "Welsh", "zu": "Zulu",
+}
 
-def _derive_language_name(friendly_name: str, locale: str) -> str:
-    """Extract a clean language name from a FriendlyName or fall back to locale.
+_REGION_NAMES: dict[str, str] = {
+    "AE": "United Arab Emirates", "AR": "Argentina", "AT": "Austria",
+    "AU": "Australia", "BD": "Bangladesh", "BE": "Belgium", "BG": "Bulgaria",
+    "BH": "Bahrain", "BO": "Bolivia", "BR": "Brazil", "CA": "Canada",
+    "CH": "Switzerland", "CL": "Chile", "CN": "China", "CO": "Colombia",
+    "CR": "Costa Rica", "CU": "Cuba", "CY": "Cyprus", "CZ": "Czechia",
+    "DE": "Germany", "DK": "Denmark", "DO": "Dominican Republic",
+    "DZ": "Algeria", "EC": "Ecuador", "EE": "Estonia", "EG": "Egypt",
+    "ES": "Spain", "ET": "Ethiopia", "FI": "Finland", "FR": "France",
+    "GB": "United Kingdom", "GH": "Ghana", "GR": "Greece", "GT": "Guatemala",
+    "GQ": "Equatorial Guinea", "HK": "Hong Kong", "HN": "Honduras",
+    "HR": "Croatia", "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland",
+    "IL": "Israel", "IN": "India", "IQ": "Iraq", "IS": "Iceland",
+    "IT": "Italy", "JM": "Jamaica", "JO": "Jordan", "JP": "Japan",
+    "KE": "Kenya", "KH": "Cambodia", "KR": "South Korea", "KW": "Kuwait",
+    "LB": "Lebanon", "LK": "Sri Lanka", "LT": "Lithuania", "LV": "Latvia",
+    "LY": "Libya", "MA": "Morocco", "MK": "North Macedonia", "MN": "Mongolia",
+    "MT": "Malta", "MX": "Mexico", "MY": "Malaysia", "NG": "Nigeria",
+    "NI": "Nicaragua", "NL": "Netherlands", "NO": "Norway", "NP": "Nepal",
+    "NZ": "New Zealand", "OM": "Oman", "PA": "Panama", "PE": "Peru",
+    "PH": "Philippines", "PK": "Pakistan", "PL": "Poland", "PR": "Puerto Rico",
+    "PT": "Portugal", "PY": "Paraguay", "QA": "Qatar", "RO": "Romania",
+    "RS": "Serbia", "RU": "Russia", "SA": "Saudi Arabia", "SE": "Sweden",
+    "SG": "Singapore", "SI": "Slovenia", "SK": "Slovakia", "SN": "Senegal",
+    "SV": "El Salvador", "SY": "Syria", "TH": "Thailand", "TN": "Tunisia",
+    "TR": "Turkey", "TW": "Taiwan", "TZ": "Tanzania", "UA": "Ukraine",
+    "UG": "Uganda", "US": "United States", "UY": "Uruguay", "VE": "Venezuela",
+    "VN": "Vietnam", "YE": "Yemen", "ZA": "South Africa", "ZW": "Zimbabwe",
+}
 
-    edge-tts FriendlyNames look like:
-        "Microsoft Ava Online (Natural) - English (United States)"
-    We extract everything after the last ``" - "``.
+
+def _locale_display_name(locale: str) -> str:
+    """Build a human-readable display name from a locale code like 'es-ES'.
+
+    Uses ISO 639-1 language names and ISO 3166-1 region names.
+    Falls back to the raw locale string if either part is unknown.
     """
-    if " - " in friendly_name:
-        return friendly_name.rsplit(" - ", 1)[-1]
-    return locale
+    if "-" in locale:
+        lang_code, region = locale.split("-", 1)
+        lang = _LANG_NAMES.get(lang_code, lang_code)
+        region_name = _REGION_NAMES.get(region, region)
+        return f"{lang} ({region_name})"
+    return _LANG_NAMES.get(locale, locale)
 
 
 async def _refresh_voice_cache() -> None:
@@ -129,36 +187,43 @@ async def _refresh_voice_cache() -> None:
         logger.error("Failed to refresh voice cache: %s", exc)
         return
 
-    _voice_cache = []
+    new_voices: list[dict[str, Any]] = []
     seen_locales: dict[str, str] = {}
 
     for v in raw:
         locale = v.get("Locale", "")
         short = v.get("ShortName", "")
         gender = v.get("Gender", "")
-        friendly = v.get("FriendlyName", "")
 
-        lang_name = _derive_language_name(friendly, locale)
+        lang_name = _locale_display_name(locale)
         if locale not in seen_locales:
             seen_locales[locale] = lang_name
 
-        _voice_cache.append(
+        new_voices.append(
             {
                 "ShortName": short,
                 "Gender": gender,
                 "Locale": locale,
-                "FriendlyName": friendly,
                 "LanguageName": lang_name,
             }
         )
 
-    _LANGUAGE_MAP = seen_locales
-    _LANGUAGE_LIST = sorted(
-        [
-            {"locale": loc, "name": name}
-            for loc, name in seen_locales.items()
-        ],
-        key=lambda x: x["name"].lower(),
+    # Mutate in-place so imported references stay valid
+    _voice_cache.clear()
+    _voice_cache.extend(new_voices)
+
+    _LANGUAGE_MAP.clear()
+    _LANGUAGE_MAP.update(seen_locales)
+
+    _LANGUAGE_LIST.clear()
+    _LANGUAGE_LIST.extend(
+        sorted(
+            [
+                {"locale": loc, "name": name}
+                for loc, name in seen_locales.items()
+            ],
+            key=lambda x: x["name"].lower(),
+        )
     )
     _voice_cache_ready = True
 
