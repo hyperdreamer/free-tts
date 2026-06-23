@@ -81,6 +81,24 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
+// --- Messages from popup ---------------------------------------------------
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "speakSentences") {
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (tab?.id) {
+        startSentenceTTS(tab.id, msg.text).then(() => sendResponse({ ok: true }));
+      } else {
+        sendResponse({ ok: false, error: "No active tab" });
+      }
+    });
+    return true;  // async response
+  }
+  if (msg.action === "stopPlayback") {
+    stopPlayback().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+});
+
 // --- Keyboard shortcut -----------------------------------------------------
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === "speak-selection") {

@@ -9,16 +9,11 @@ const speedSlider  = document.getElementById("speedSlider");
 const speedVal     = document.getElementById("speedVal");
 const speakBtn     = document.getElementById("speakBtn");
 const stopBtn      = document.getElementById("stopBtn");
-const statusDot    = document.getElementById("statusDot");
-const audioPlayer  = document.getElementById("audioPlayer");
 const optionsLink  = document.getElementById("optionsLink");
 
 let serverUrl = DEFAULT_SERVER;
 let voices = [];
-let activeAudio = null;
-let activeDataUrl = null;
 let defaultVoice = DEFAULT_VOICE;
-let previewTimeout = null;  // for 30s preview limit
 
 // --- Init ------------------------------------------------------------------
 async function init() {
@@ -139,92 +134,25 @@ async function speak() {
   const text = textInput.value.trim();
   if (!text) return;
 
+  // Persist voice as default
   const voice = voiceSelect.value || defaultVoice;
-  // Persist as default voice for context-menu "Speak this"
   if (voice !== defaultVoice) {
     defaultVoice = voice;
     chrome.storage.sync.set({ voice });
   }
-  const speed = parseInt(speedSlider.value);
-  const rateAttr = (100 + speed) + "%";
-
-  const ssml = `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xmlns:emo="http://www.w3.org/2009/10/emotionml" version="1.0" xml:lang="en-US">
-    <voice name="${escapeXML(voice)}">
-        <prosody rate="${rateAttr}" pitch="0%">
-${escapeXML(text)}
-        </prosody>
-    </voice>
-</speak>`;
 
   speakBtn.disabled = true;
-  speakBtn.textContent = "Loading...";
+  speakBtn.textContent = "Speaking...";
+  stopBtn.disabled = false;
 
-  try {
-    const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ssml }),
-    });
-    if (!resp.ok) throw new Error(`Server error ${resp.status}`);
-
-    const blob = await resp.blob();
-    const url = await blobToDataUrl(blob);
-
-    if (activeAudio) {
-      activeAudio.pause();
-    }
-
-    activeDataUrl = url;
-    audioPlayer.src = url;
-    audioPlayer.play();
-    activeAudio = audioPlayer;
-
-    stopBtn.disabled = false;
-    // Auto-stop preview after 30 seconds
-    if (previewTimeout) clearTimeout(previewTimeout);
-    previewTimeout = setTimeout(() => stop(), 30000);
-
-    audioPlayer.onended = () => {
-      stopBtn.disabled = true;
-      activeAudio = null;
-      activeDataUrl = null;
-      if (previewTimeout) { clearTimeout(previewTimeout); previewTimeout = null; }
-    };
-  } catch (err) {
-    console.error("free-tts:", err);
-  } finally {
-    speakBtn.disabled = false;
-    speakBtn.textContent = "▶ Speak";
-  }
+  chrome.runtime.sendMessage({ action: "speakSentences", text });
 }
 
 function stop() {
-  if (activeAudio) {
-    activeAudio.pause();
-    activeAudio.currentTime = 0;
-    activeAudio = null;
-  }
-  activeDataUrl = null;
-  audioPlayer.src = "";
+  chrome.runtime.sendMessage({ action: "stopPlayback" });
+  speakBtn.disabled = false;
+  speakBtn.textContent = "▶ Speak";
   stopBtn.disabled = true;
-  if (previewTimeout) { clearTimeout(previewTimeout); previewTimeout = null; }
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
-// --- XML escape -----------------------------------------------------------
-function escapeXML(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
 
 // --- Start ----------------------------------------------------------------
