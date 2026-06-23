@@ -11,7 +11,7 @@
         <!-- Header -->
         <div class="header">
             <div class="tab active-tab" data-tab="ssml">SSML</div>
-            <div class="tab" data-tab="test">Test Input</div>
+            <div class="tab" data-tab="text">Text Input</div>
         </div>
 
         <!-- SSML Tab -->
@@ -24,62 +24,93 @@
             </div>
         </div>
 
-        <!-- Test Input Tab -->
-        <div class="tab-content" id="tab-test">
-            <div class="test-input-layout">
+        <!-- Text Input Tab -->
+        <div class="tab-content" id="tab-text">
+            <div class="text-input-layout">
                 <!-- Left: input controls -->
-                <div class="test-controls">
-                    <!-- Voice -->
-                    <div class="field-group">
-                        <label class="field-label">Voice</label>
+                <div class="text-controls">
+                    <!-- Voice Selection Panel -->
+                    <div class="voice-panel">
+                        <!-- Language + Gender row -->
+                        <div class="voice-panel-header">
+                            <div class="field-group" style="flex:1">
+                                <label class="field-label">Language</label>
+                                <select id="languageSelect" class="lang-select">
+                                    <option value="">Loading...</option>
+                                </select>
+                            </div>
+                            <div class="field-group" style="flex:1">
+                                <label class="field-label">Gender</label>
+                                <div class="gender-chips">
+                                    <button class="gender-chip active" data-gender="all">All</button>
+                                    <button class="gender-chip" data-gender="Male">Male</button>
+                                    <button class="gender-chip" data-gender="Female">Female</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Voice Search -->
                         <div class="voice-search-wrapper">
                             <input type="text" id="voiceSearch" class="voice-search-input"
                                    placeholder="Search by voice name..." autocomplete="off">
-                            <div class="voice-dropdown" id="voiceDropdown"></div>
                         </div>
-                        <div class="voice-selected" id="voiceSelected">
-                            <span class="voice-name">en-US-AvaMultilingualNeural</span>
-                            <span class="voice-locale">en-US</span>
+
+                        <!-- Voice list: Preview | Selected -->
+                        <div class="voice-columns">
+                            <div class="voice-column voice-column-preview">
+                                <div class="voice-column-header">Preview</div>
+                                <div class="voice-list" id="voiceList">
+                                    <div class="voice-loading">Loading voices...</div>
+                                </div>
+                            </div>
+                            <div class="voice-column voice-column-selected">
+                                <div class="voice-column-header">Selected</div>
+                                <div class="voice-selected-card" id="voiceSelectedCard">
+                                    <div class="voice-selected-name" id="voiceSelectedName">en-US-AvaMultilingualNeural</div>
+                                    <div class="voice-selected-meta" id="voiceSelectedMeta">English (United States) · Female</div>
+                                    <button class="voice-preview-btn" id="voicePreviewBtn">▶ Preview</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
-                    <!-- Text -->
+                    <!-- Text Input -->
                     <div class="field-group">
                         <label class="field-label">
                             Input Text
                             <span class="char-count" id="charCount">0 characters</span>
                         </label>
-                        <textarea id="testTextInput" class="test-textarea"
+                        <textarea id="textInputArea" class="text-input-area"
                                   placeholder="Enter text to synthesize..."></textarea>
                     </div>
 
-                    <!-- Speed -->
-                    <div class="field-group">
-                        <label class="field-label">
-                            Speed
-                            <span class="slider-value" id="speedValue">0%</span>
-                        </label>
-                        <input type="range" id="speedSlider" class="slider" min="-50" max="200" value="0" step="1">
-                    </div>
-
-                    <!-- Pitch -->
-                    <div class="field-group">
-                        <label class="field-label">
-                            Pitch
-                            <span class="slider-value" id="pitchValue">0%</span>
-                        </label>
-                        <input type="range" id="pitchSlider" class="slider" min="-50" max="50" value="0" step="1">
+                    <!-- Speed + Pitch row -->
+                    <div class="sliders-row">
+                        <div class="field-group slider-group">
+                            <label class="field-label">
+                                Speed
+                                <span class="slider-value" id="speedValue">0%</span>
+                            </label>
+                            <input type="range" id="speedSlider" class="slider" min="-50" max="200" value="0" step="1">
+                        </div>
+                        <div class="field-group slider-group">
+                            <label class="field-label">
+                                Pitch
+                                <span class="slider-value" id="pitchValue">0%</span>
+                            </label>
+                            <input type="range" id="pitchSlider" class="slider" min="-50" max="50" value="0" step="1">
+                        </div>
                     </div>
 
                     <!-- Actions -->
-                    <div class="test-actions">
+                    <div class="text-actions">
                         <button id="previewBtn" class="btn-primary">▶ Preview Audio</button>
-                        <button id="downloadTestBtn" class="btn-secondary">⬇ Download MP3</button>
+                        <button id="downloadTextBtn" class="btn-secondary">⬇ Download MP3</button>
                     </div>
                 </div>
 
                 <!-- Right: generated SSML preview + results -->
-                <div class="test-results-panel">
+                <div class="text-results-panel">
                     <div class="panel-tabs">
                         <div class="panel-tab active" data-panel="ssml-preview">SSML Preview</div>
                         <div class="panel-tab" data-panel="results">Results</div>

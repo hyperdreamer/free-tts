@@ -3,14 +3,12 @@
  *
  * Two modes:
  *   1. SSML tab — raw SSML editing with the default template.
- *   2. Test Input tab — user-friendly controls that build SSML behind the scenes.
- *
- * The Test Input always generates valid SSML using the required template
- * structure, substituting voice name, prosody rate/pitch, and text content.
+ *   2. Text Input tab — Language/Gender/Voice picker, text input,
+ *      speed/pitch sliders, SSML preview, results history.
  */
 
 // ---------------------------------------------------------------------------
-// Default SSML template (as specified by the user)
+// SSML Template
 // ---------------------------------------------------------------------------
 const SSML_TEMPLATE = `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xmlns:emo="http://www.w3.org/2009/10/emotionml" version="1.0" xml:lang="en-US">
     <voice name="VOICE_NAME">
@@ -23,100 +21,56 @@ TEXT_CONTENT
 const DEFAULT_VOICE = "en-US-AvaMultilingualNeural";
 const DEFAULT_TEXT =
   "Gaming is not just play anymore. It has become a nation. A culture. A career. A community.";
-
-// ---------------------------------------------------------------------------
-// Common edge-tts voices (English subset — expand as needed)
-// ---------------------------------------------------------------------------
-const VOICES = [
-  { name: "en-US-AvaMultilingualNeural", locale: "en-US", label: "Ava" },
-  { name: "en-US-AvaNeural",              locale: "en-US", label: "Ava" },
-  { name: "en-US-AndrewMultilingualNeural", locale: "en-US", label: "Andrew" },
-  { name: "en-US-AndrewNeural",           locale: "en-US", label: "Andrew" },
-  { name: "en-US-AnaNeural",             locale: "en-US", label: "Ana" },
-  { name: "en-US-AriaNeural",            locale: "en-US", label: "Aria" },
-  { name: "en-US-BrianMultilingualNeural", locale: "en-US", label: "Brian" },
-  { name: "en-US-BrianNeural",           locale: "en-US", label: "Brian" },
-  { name: "en-US-ChristopherNeural",     locale: "en-US", label: "Christopher" },
-  { name: "en-US-EmmaMultilingualNeural", locale: "en-US", label: "Emma" },
-  { name: "en-US-EmmaNeural",            locale: "en-US", label: "Emma" },
-  { name: "en-US-EricNeural",            locale: "en-US", label: "Eric" },
-  { name: "en-US-GuyNeural",             locale: "en-US", label: "Guy" },
-  { name: "en-US-JennyNeural",           locale: "en-US", label: "Jenny" },
-  { name: "en-US-MichelleNeural",        locale: "en-US", label: "Michelle" },
-  { name: "en-US-RogerNeural",           locale: "en-US", label: "Roger" },
-  { name: "en-US-SteffanNeural",         locale: "en-US", label: "Steffan" },
-  { name: "en-GB-SoniaNeural",           locale: "en-GB", label: "Sonia" },
-  { name: "en-GB-RyanNeural",            locale: "en-GB", label: "Ryan" },
-  { name: "en-GB-LibbyNeural",           locale: "en-GB", label: "Libby" },
-  { name: "en-GB-MaisieNeural",          locale: "en-GB", label: "Maisie" },
-  { name: "en-AU-NatashaNeural",         locale: "en-AU", label: "Natasha" },
-  { name: "en-AU-WilliamNeural",         locale: "en-AU", label: "William" },
-  { name: "en-CA-ClaraNeural",           locale: "en-CA", label: "Clara" },
-  { name: "en-CA-LiamNeural",            locale: "en-CA", label: "Liam" },
-  { name: "en-IN-NeerjaNeural",          locale: "en-IN", label: "Neerja" },
-  { name: "en-IN-PrabhatNeural",         locale: "en-IN", label: "Prabhat" },
-];
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-let selectedVoice = DEFAULT_VOICE;
-let results = []; // { text, voice, rate, pitch, blobUrl }
+const SAMPLE_TEXT = "Hello, this is a sample of my voice.";
 
 // ---------------------------------------------------------------------------
 // Backend URL
 // ---------------------------------------------------------------------------
-const BACKEND_URL = "http://localhost:5000/generate-and-download-tts";
+const BACKEND_URL = "http://localhost:5000";
 
 // ---------------------------------------------------------------------------
-// DOM references
+// State
+// ---------------------------------------------------------------------------
+let allVoices = [];           // raw from server
+let languages = [];           // [{locale, name}]
+let selectedVoice = DEFAULT_VOICE;
+let results = [];             // { text, voice, rate, pitch, blobUrl }
+let activeGender = "all";     // "all" | "Male" | "Female"
+
+// ---------------------------------------------------------------------------
+// DOM refs
 // ---------------------------------------------------------------------------
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
-// SSML tab
-const ssmlInput      = $("#ssmlInput");
-const downloadSsmlBtn = $("#downloadSsmlBtn");
-
 // Tabs
-const tabs           = $$(".tab");
-const tabContents    = $$(".tab-content");
+const ssmlInput       = $("#ssmlInput");
+const downloadSsmlBtn  = $("#downloadSsmlBtn");
 
-// Test Input
-const voiceSearch    = $("#voiceSearch");
-const voiceDropdown  = $("#voiceDropdown");
-const voiceSelected  = $("#voiceSelected");
-const testTextInput  = $("#testTextInput");
-const charCount      = $("#charCount");
-const speedSlider    = $("#speedSlider");
-const speedValue     = $("#speedValue");
-const pitchSlider    = $("#pitchSlider");
-const pitchValue     = $("#pitchValue");
-const previewBtn     = $("#previewBtn");
-const downloadTestBtn = $("#downloadTestBtn");
-
-// Right panel
-const panelTabs      = $$(".panel-tab");
-const panelContents  = $$(".panel-content");
-const ssmlPreview    = $("#ssmlPreview");
-const resultsList    = $("#resultsList");
-
-// Audio
-const audioPlayer    = $("#audioPlayer");
+// Text Input tab
+const languageSelect  = $("#languageSelect");
+const voiceList       = $("#voiceList");
+const voiceSearch     = $("#voiceSearch");
+const voiceSelectedName = $("#voiceSelectedName");
+const voiceSelectedMeta = $("#voiceSelectedMeta");
+const voicePreviewBtn = $("#voicePreviewBtn");
+const textInputArea   = $("#textInputArea");
+const charCount       = $("#charCount");
+const speedSlider     = $("#speedSlider");
+const speedValue      = $("#speedValue");
+const pitchSlider     = $("#pitchSlider");
+const pitchValue      = $("#pitchValue");
+const previewBtn      = $("#previewBtn");
+const downloadTextBtn  = $("#downloadTextBtn");
+const ssmlPreview     = $("#ssmlPreview");
+const resultsList     = $("#resultsList");
+const audioPlayer     = $("#audioPlayer");
 
 // ---------------------------------------------------------------------------
-// SSML construction (replaces template placeholders)
+// SSML construction
 // ---------------------------------------------------------------------------
 function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
-  // rate: slider -50..200 → SSML rate percentage
-  //   slider  0 → SSML rate="100%" → backend → +0%
-  //   slider +50 → SSML rate="150%" → backend → +50%
-  //   slider -20 → SSML rate="80%"  → backend → -20%
   const rateAttr = (100 + rateSliderVal) + "%";
-
-  // pitch: slider -50..50 → SSML pitch
-  //   0 → "0%" (backend converts to +0Hz)
-  //   ±N → "±NHz"
   const pitchAttr = pitchSliderVal === 0
     ? "0%"
     : (pitchSliderVal > 0 ? "+" : "") + pitchSliderVal + "Hz";
@@ -128,7 +82,6 @@ function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
     .replace("TEXT_CONTENT", text);
 }
 
-// Fill the SSML textarea with defaults
 function fillDefaultSSML() {
   ssmlInput.value = buildSSML(DEFAULT_VOICE, DEFAULT_TEXT, 0, 0);
 }
@@ -136,118 +89,142 @@ function fillDefaultSSML() {
 // ---------------------------------------------------------------------------
 // Tab switching
 // ---------------------------------------------------------------------------
-tabs.forEach(tab => {
+$$(".tab").forEach(tab => {
   tab.addEventListener("click", () => {
     const target = tab.dataset.tab;
-
-    tabs.forEach(t => t.classList.remove("active-tab"));
+    $$(".tab").forEach(t => t.classList.remove("active-tab"));
     tab.classList.add("active-tab");
-
-    tabContents.forEach(tc => tc.classList.remove("active"));
+    $$(".tab-content").forEach(tc => tc.classList.remove("active"));
     $(`#tab-${target}`).classList.add("active");
   });
 });
 
-// Panel tab switching
-panelTabs.forEach(tab => {
+// Panel tabs
+$$(".panel-tab").forEach(tab => {
   tab.addEventListener("click", () => {
     const target = tab.dataset.panel;
-
-    panelTabs.forEach(t => t.classList.remove("active"));
+    $$(".panel-tab").forEach(t => t.classList.remove("active"));
     tab.classList.add("active");
-
-    panelContents.forEach(pc => pc.classList.remove("active"));
+    $$(".panel-content").forEach(pc => pc.classList.remove("active"));
     $(`#${target}`).classList.add("active");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Voice search / dropdown
+// Voice data loading
 // ---------------------------------------------------------------------------
-function renderVoiceDropdown(filter = "") {
-  const lower = filter.toLowerCase();
-  const filtered = VOICES.filter(v =>
-    v.name.toLowerCase().includes(lower) ||
-    v.label.toLowerCase().includes(lower) ||
-    v.locale.toLowerCase().includes(lower)
-  );
+async function loadVoices() {
+  try {
+    const resp = await fetch(`${BACKEND_URL}/voices`);
+    if (!resp.ok) throw new Error("Failed to load voices");
+    const data = await resp.json();
+    allVoices = data.voices || [];
+    languages = data.languages || [];
+    populateLanguageDropdown();
+  } catch (err) {
+    console.error("Voice load error:", err);
+    voiceList.innerHTML = '<div class="voice-loading">Failed to load voices</div>';
+  }
+}
+
+function populateLanguageDropdown() {
+  languageSelect.innerHTML = '<option value="">All Languages</option>' +
+    languages.map(l => `<option value="${l.locale}">${l.name}</option>`).join("");
+
+  // Default to English
+  const enOption = languageSelect.querySelector('option[value="en-US"]');
+  if (enOption) enOption.selected = true;
+
+  renderVoiceList();
+}
+
+// ---------------------------------------------------------------------------
+// Filtering & rendering voice list
+// ---------------------------------------------------------------------------
+function getFilteredVoices() {
+  const langFilter = languageSelect.value;
+  const searchFilter = voiceSearch.value.toLowerCase().trim();
+
+  return allVoices.filter(v => {
+    if (langFilter && v.Locale !== langFilter) return false;
+    if (activeGender !== "all" && v.Gender !== activeGender) return false;
+    if (searchFilter && !v.ShortName.toLowerCase().includes(searchFilter)
+        && !v.LanguageName.toLowerCase().includes(searchFilter)) return false;
+    return true;
+  });
+}
+
+function renderVoiceList() {
+  const filtered = getFilteredVoices();
 
   if (filtered.length === 0) {
-    voiceDropdown.innerHTML = '<div class="voice-option" style="color:var(--text-muted)">No voices found</div>';
-    voiceDropdown.classList.add("open");
+    voiceList.innerHTML = '<div class="voice-loading">No voices match</div>';
     return;
   }
 
-  voiceDropdown.innerHTML = filtered.map(v => {
-    const active = v.name === selectedVoice ? " active" : "";
-    return `<div class="voice-option${active}" data-voice="${v.name}" data-locale="${v.locale}">
-      <span>${v.label}</span>
-      <span class="voice-option-locale">${v.locale}</span>
+  voiceList.innerHTML = filtered.map(v => {
+    const sel = v.ShortName === selectedVoice ? " selected" : "";
+    const localePart = v.Locale.split("-")[1] || v.Locale;
+    return `<div class="voice-item${sel}" data-voice="${v.ShortName}" data-locale="${v.Locale}" data-gender="${v.Gender}">
+      <span class="voice-item-name">${v.ShortName}</span>
+      <span class="voice-item-locale">${localePart}</span>
+      <span class="voice-item-preview" data-action="preview" title="Preview voice">▶</span>
     </div>`;
   }).join("");
 
-  voiceDropdown.classList.add("open");
+  // Click handlers
+  voiceList.querySelectorAll(".voice-item").forEach(item => {
+    item.addEventListener("click", (e) => {
+      // If clicked on the preview button, preview the voice
+      if (e.target.dataset.action === "preview") {
+        e.stopPropagation();
+        previewVoice(item.dataset.voice);
+        return;
+      }
+      selectVoice(item.dataset.voice, item.dataset.locale, item.dataset.gender);
+    });
+  });
 }
 
-function selectVoice(name, locale) {
-  selectedVoice = name;
-  voiceSelected.innerHTML = `
-    <span class="voice-name">${name}</span>
-    <span class="voice-locale">${locale}</span>
-  `;
-  voiceSearch.value = "";
-  voiceDropdown.classList.remove("open");
+function selectVoice(shortName, locale, gender) {
+  selectedVoice = shortName;
+  voiceSelectedName.textContent = shortName;
+  const langName = languages.find(l => l.locale === locale);
+  voiceSelectedMeta.textContent =
+    `${langName ? langName.name : locale} · ${gender}`;
   updateSSMLPreview();
+  renderVoiceList();
 }
 
-voiceSearch.addEventListener("focus", () => renderVoiceDropdown(voiceSearch.value));
-voiceSearch.addEventListener("input", () => renderVoiceDropdown(voiceSearch.value));
-
-voiceDropdown.addEventListener("click", (e) => {
-  const opt = e.target.closest(".voice-option");
-  if (!opt) return;
-  const name = opt.dataset.voice;
-  const locale = opt.dataset.locale;
-  if (name) selectVoice(name, locale);
-});
-
-// Close dropdown on outside click
-document.addEventListener("click", (e) => {
-  if (!voiceSearch.contains(e.target) && !voiceDropdown.contains(e.target)) {
-    voiceDropdown.classList.remove("open");
+async function previewVoice(shortName) {
+  // Generate a short sample using this voice
+  const ssml = buildSSML(shortName, SAMPLE_TEXT, 0, 0);
+  try {
+    const blob = await callTTS(ssml);
+    playBlob(blob);
+  } catch (err) {
+    console.error("Voice preview failed:", err);
   }
-});
-
-// Keyboard navigation in dropdown
-voiceSearch.addEventListener("keydown", (e) => {
-  const opts = voiceDropdown.querySelectorAll(".voice-option");
-  if (!opts.length) return;
-
-  const current = voiceDropdown.querySelector(".voice-option.active");
-  let idx = Array.from(opts).indexOf(current);
-
-  if (e.key === "ArrowDown") {
-    e.preventDefault();
-    idx = (idx + 1) % opts.length;
-  } else if (e.key === "ArrowUp") {
-    e.preventDefault();
-    idx = (idx - 1 + opts.length) % opts.length;
-  } else if (e.key === "Enter") {
-    e.preventDefault();
-    if (current) {
-      selectVoice(current.dataset.voice, current.dataset.locale);
-    }
-    return;
-  } else {
-    return;
-  }
-
-  opts.forEach(o => o.classList.remove("active"));
-  opts[idx].classList.add("active");
-});
+}
 
 // ---------------------------------------------------------------------------
-// Sliders → live value display + SSML preview
+// Filter events
+// ---------------------------------------------------------------------------
+languageSelect.addEventListener("change", renderVoiceList);
+
+$$(".gender-chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    $$(".gender-chip").forEach(c => c.classList.remove("active"));
+    chip.classList.add("active");
+    activeGender = chip.dataset.gender;
+    renderVoiceList();
+  });
+});
+
+voiceSearch.addEventListener("input", renderVoiceList);
+
+// ---------------------------------------------------------------------------
+// Sliders → live value + SSML preview
 // ---------------------------------------------------------------------------
 function updateSliderDisplay() {
   speedValue.textContent = speedSlider.value + "%";
@@ -255,23 +232,21 @@ function updateSliderDisplay() {
 }
 
 function updateSSMLPreview() {
-  const text = testTextInput.value || "[enter text]";
+  const text = textInputArea.value || "[enter text]";
   const ssml = buildSSML(selectedVoice, text, parseInt(speedSlider.value), parseInt(pitchSlider.value));
   ssmlPreview.textContent = ssml;
-
-  // Also update char count
-  charCount.textContent = testTextInput.value.length + " characters";
+  charCount.textContent = textInputArea.value.length + " characters";
 }
 
 speedSlider.addEventListener("input", () => { updateSliderDisplay(); updateSSMLPreview(); });
 pitchSlider.addEventListener("input", () => { updateSliderDisplay(); updateSSMLPreview(); });
-testTextInput.addEventListener("input", () => { updateSSMLPreview(); });
+textInputArea.addEventListener("input", updateSSMLPreview);
 
 // ---------------------------------------------------------------------------
 // TTS API call
 // ---------------------------------------------------------------------------
 async function callTTS(ssml) {
-  const resp = await fetch(BACKEND_URL, {
+  const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ssml }),
@@ -324,23 +299,20 @@ downloadSsmlBtn.addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test Input: preview & download
+// Text Input: preview & download
 // ---------------------------------------------------------------------------
-async function handleTestGenerate(preview = false) {
-  const text = testTextInput.value.trim();
+async function handleTextGenerate(preview = false) {
+  const text = textInputArea.value.trim();
   if (!text) return alert("Please enter text to synthesize.");
 
   const rate = parseInt(speedSlider.value);
   const pitch = parseInt(pitchSlider.value);
   const ssml = buildSSML(selectedVoice, text, rate, pitch);
 
-  // Disable buttons
   previewBtn.disabled = true;
-  downloadTestBtn.disabled = true;
-  const label = preview ? "Generating preview..." : "Generating MP3...";
-  const btn = preview ? previewBtn : downloadTestBtn;
-  const origText = btn.textContent;
-  btn.textContent = label;
+  downloadTextBtn.disabled = true;
+  previewBtn.textContent = "Generating...";
+  downloadTextBtn.textContent = "Generating...";
 
   try {
     const blob = await callTTS(ssml);
@@ -348,7 +320,7 @@ async function handleTestGenerate(preview = false) {
     // Add to results
     const blobUrl = URL.createObjectURL(blob);
     results.unshift({ text, voice: selectedVoice, rate, pitch, blobUrl });
-    if (results.length > 20) results.pop(); // cap
+    if (results.length > 20) results.pop();
     renderResults();
 
     if (preview) {
@@ -360,14 +332,17 @@ async function handleTestGenerate(preview = false) {
     alert("Error: " + err.message);
   } finally {
     previewBtn.disabled = false;
-    downloadTestBtn.disabled = false;
+    downloadTextBtn.disabled = false;
     previewBtn.textContent = "▶ Preview Audio";
-    downloadTestBtn.textContent = "⬇ Download MP3";
+    downloadTextBtn.textContent = "⬇ Download MP3";
   }
 }
 
-previewBtn.addEventListener("click", () => handleTestGenerate(true));
-downloadTestBtn.addEventListener("click", () => handleTestGenerate(false));
+previewBtn.addEventListener("click", () => handleTextGenerate(true));
+downloadTextBtn.addEventListener("click", () => handleTextGenerate(false));
+
+// Selected voice preview button
+voicePreviewBtn.addEventListener("click", () => previewVoice(selectedVoice));
 
 // ---------------------------------------------------------------------------
 // Results list
@@ -390,49 +365,48 @@ function renderResults() {
     </div>`;
   }).join("");
 
-  // Play on click
   resultsList.querySelectorAll(".result-play").forEach(el => {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
-      const idx = parseInt(el.dataset.idx);
-      audioPlayer.src = results[idx].blobUrl;
+      audioPlayer.src = results[parseInt(el.dataset.idx)].blobUrl;
       audioPlayer.play();
     });
   });
 
-  // Click row to re-fill inputs
   resultsList.querySelectorAll(".result-item").forEach(el => {
     el.addEventListener("click", () => {
-      const idx = parseInt(el.dataset.idx);
-      const r = results[idx];
-      testTextInput.value = r.text;
+      const r = results[parseInt(el.dataset.idx)];
+      textInputArea.value = r.text;
 
-      // Find and select the voice
-      const voiceObj = VOICES.find(v => v.name === r.voice);
-      if (voiceObj) selectVoice(voiceObj.name, voiceObj.locale);
-      else {
+      // Look up full voice metadata
+      const voiceInfo = allVoices.find(v => v.ShortName === r.voice);
+      if (voiceInfo) {
+        selectVoice(voiceInfo.ShortName, voiceInfo.Locale, voiceInfo.Gender);
+        // Also set the language dropdown
+        languageSelect.value = voiceInfo.Locale;
+      } else {
         selectedVoice = r.voice;
-        voiceSelected.innerHTML = `
-          <span class="voice-name">${r.voice}</span>
-          <span class="voice-locale">—</span>`;
+        voiceSelectedName.textContent = r.voice;
+        voiceSelectedMeta.textContent = "—";
       }
 
       speedSlider.value = r.rate;
       pitchSlider.value = r.pitch;
       updateSliderDisplay();
       updateSSMLPreview();
+      renderVoiceList();
 
-      // Switch to test tab
-      tabs.forEach(t => t.classList.remove("active-tab"));
-      document.querySelector('[data-tab="test"]').classList.add("active-tab");
-      tabContents.forEach(tc => tc.classList.remove("active"));
-      $("#tab-test").classList.add("active");
+      // Switch to Text Input tab
+      $$(".tab").forEach(t => t.classList.remove("active-tab"));
+      document.querySelector('[data-tab="text"]').classList.add("active-tab");
+      $$(".tab-content").forEach(tc => tc.classList.remove("active"));
+      $("#tab-text").classList.add("active");
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-// Keyboard shortcut: Ctrl+Enter in SSML textarea → download
+// Keyboard shortcut
 // ---------------------------------------------------------------------------
 ssmlInput.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -444,9 +418,10 @@ ssmlInput.addEventListener("keydown", (e) => {
 // ---------------------------------------------------------------------------
 // Initialisation
 // ---------------------------------------------------------------------------
-function init() {
+async function init() {
   fillDefaultSSML();
   updateSliderDisplay();
+  await loadVoices();
   updateSSMLPreview();
 }
 

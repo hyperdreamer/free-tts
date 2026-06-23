@@ -27,6 +27,9 @@ from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
 
+import asyncio
+from typing import Any
+
 import edge_tts
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
@@ -57,6 +60,74 @@ SERVER_PORT: int = int(os.environ.get("TTS_PORT", "5000"))
 
 SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
 """XML namespace URI for the SSML <speak> element."""
+
+# ---------------------------------------------------------------------------
+# Voice cache (populated at startup from edge-tts)
+# ---------------------------------------------------------------------------
+_voice_cache: list[dict[str, Any]] = []
+"""List of voice dicts from edge-tts.list_voices(), cached at startup."""
+
+_LANGUAGE_MAP: dict[str, str] = {}
+"""Locale → human-readable language name, derived from voice data."""
+
+_LANGUAGE_LIST: list[dict[str, str]] = []
+"""Unique languages for the frontend dropdown, sorted by display name."""
+
+
+def _derive_language_name(friendly_name: str, locale: str) -> str:
+    """Extract a clean language name from a FriendlyName or fall back to locale.
+
+    edge-tts FriendlyNames look like:
+        "Microsoft Ava Online (Natural) - English (United States)"
+    We extract everything after the last ``" - "``.
+    """
+    if " - " in friendly_name:
+        return friendly_name.rsplit(" - ", 1)[-1]
+    return locale
+
+
+async def _refresh_voice_cache() -> None:
+    """Fetch all available voices from edge-tts and rebuild the caches."""
+    global _voice_cache, _LANGUAGE_MAP, _LANGUAGE_LIST
+
+    raw = await edge_tts.list_voices()
+    _voice_cache = []
+    seen_locales: dict[str, str] = {}
+
+    for v in raw:
+        locale = v.get("Locale", "")
+        short = v.get("ShortName", "")
+        gender = v.get("Gender", "")
+        friendly = v.get("FriendlyName", "")
+
+        lang_name = _derive_language_name(friendly, locale)
+        if locale not in seen_locales:
+            seen_locales[locale] = lang_name
+
+        _voice_cache.append(
+            {
+                "ShortName": short,
+                "Gender": gender,
+                "Locale": locale,
+                "FriendlyName": friendly,
+                "LanguageName": lang_name,
+            }
+        )
+
+    _LANGUAGE_MAP = seen_locales
+    _LANGUAGE_LIST = sorted(
+        [
+            {"locale": loc, "name": name}
+            for loc, name in seen_locales.items()
+        ],
+        key=lambda x: x["name"].lower(),
+    )
+
+    logger.info(
+        "Voice cache refreshed: %d voices across %d languages.",
+        len(_voice_cache),
+        len(_LANGUAGE_LIST),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +166,12 @@ def _parse_rate(raw: Optional[str]) -> str:
         except ValueError:
             return raw  # non-numeric percentage – let edge-tts decide
 
-        if val == 0:
+        ival = round(val)
+        if ival == 0:
             return "+0%"
-        if 0 < val < 100:
-            return f"-{100 - val}%"
-        return f"+{val - 100}%"
+        if ival < 100:
+            return f"-{100 - ival}%"
+        return f"+{ival - 100}%"
 
     # Non-percentage values: "x-slow", "fast", "+20ms", ...
     return raw
@@ -232,6 +304,24 @@ def create_app() -> Flask:
     def health() -> Response:
         return jsonify({"status": "ok"})
 
+    # -- Voices endpoint -----------------------------------------------------
+    @app.route("/voices", methods=["GET"])
+    def list_voices() -> Response:
+        """Return all available edge-tts voices and languages.
+
+        Response:
+            {
+                "languages": [{"locale": "en-US", "name": "English (United States)"}, ...],
+                "voices": [{"ShortName": ..., "Gender": ..., "Locale": ..., ...}, ...]
+            }
+        """
+        return jsonify(
+            {
+                "languages": _LANGUAGE_LIST,
+                "voices": _voice_cache,
+            }
+        )
+
     # -- TTS endpoint --------------------------------------------------------
     @app.route("/generate-and-download-tts", methods=["POST"])
     async def generate_and_download_tts() -> Response:
@@ -278,6 +368,9 @@ def create_app() -> Flask:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     application = create_app()
+
+    # Populate voice cache from edge-tts on every reboot
+    asyncio.run(_refresh_voice_cache())
 
     if os.environ.get("FLASK_DEBUG"):
         logger.info(
