@@ -6,40 +6,52 @@ parameters, generates speech via Microsoft Edge TTS, and returns the audio as MP
 
 Architecture:
     - Configuration via environment variables with sensible defaults.
-    - Structured logging (no bare print statements).
+    - Structured logging with request IDs and duration tracking.
     - Type-annotated helpers for SSML parsing and parameter transformation.
     - Flask application factory pattern for testability.
-    - Production WSGI server (Waitress) when run directly.
+    - SSML size limit to prevent DoS via oversized payloads.
+    - TTS generation timeout to prevent hung connections.
+    - Graceful shutdown on SIGTERM/SIGINT.
+    - Production WSGI: Waitress (default) or Gunicorn (via TTS_SERVER=gunicorn).
     - CORS enabled for cross-origin frontend requests.
-    - Health-check endpoint for monitoring.
+    - Health-check endpoint with voice-cache readiness indicator.
+    - Error messages sanitised in production mode.
 
 Usage:
-    python server.py                 # production mode (Waitress, port 5000)
-    FLASK_DEBUG=1 python server.py   # development mode (Flask built-in, auto-reload)
+    python server.py                      # production (Waitress, port 5000)
+    FLASK_DEBUG=1 python server.py        # development (Flask built-in)
+    TTS_SERVER=gunicorn python server.py   # production (Gunicorn, port 5000)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import signal
+import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Optional
-
-import asyncio
-from typing import Any
+from typing import Any, Optional
 
 import edge_tts
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+PRODUCTION = not os.environ.get("FLASK_DEBUG")
+
 logging.basicConfig(
-    level=logging.DEBUG if os.environ.get("FLASK_DEBUG") else logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO if PRODUCTION else logging.DEBUG,
+    format=(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        if PRODUCTION
+        else "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ),
 )
 logger = logging.getLogger("tts-server")
 
@@ -58,6 +70,24 @@ DEFAULT_PITCH: str = os.environ.get("TTS_DEFAULT_PITCH", "+0Hz")
 SERVER_HOST: str = os.environ.get("TTS_HOST", "0.0.0.0")
 SERVER_PORT: int = int(os.environ.get("TTS_PORT", "5000"))
 
+MAX_SSML_LENGTH: int = int(os.environ.get("TTS_MAX_SSML_LENGTH", str(50 * 1024)))
+"""Maximum SSML payload size in bytes. 50 KB default."""
+
+TTS_TIMEOUT: int = int(os.environ.get("TTS_TIMEOUT", "60"))
+"""Maximum seconds for a single TTS generation request."""
+
+WAITRESS_THREADS: int = int(os.environ.get("TTS_WAITRESS_THREADS", "4"))
+"""Number of Waitress worker threads."""
+
+GUNICORN_WORKERS: int = int(os.environ.get("TTS_GUNICORN_WORKERS", "2"))
+"""Number of Gunicorn worker processes."""
+
+GUNICORN_THREADS: int = int(os.environ.get("TTS_GUNICORN_THREADS", "4"))
+"""Threads per Gunicorn worker."""
+
+WSGI_SERVER: str = os.environ.get("TTS_SERVER", "waitress").lower()
+"""Which WSGI server to use: 'waitress' or 'gunicorn'."""
+
 SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
 """XML namespace URI for the SSML <speak> element."""
 
@@ -66,6 +96,9 @@ SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
 # ---------------------------------------------------------------------------
 _voice_cache: list[dict[str, Any]] = []
 """List of voice dicts from edge-tts.list_voices(), cached at startup."""
+
+_voice_cache_ready: bool = False
+"""True once the voice cache has been successfully populated."""
 
 _LANGUAGE_MAP: dict[str, str] = {}
 """Locale → human-readable language name, derived from voice data."""
@@ -88,9 +121,14 @@ def _derive_language_name(friendly_name: str, locale: str) -> str:
 
 async def _refresh_voice_cache() -> None:
     """Fetch all available voices from edge-tts and rebuild the caches."""
-    global _voice_cache, _LANGUAGE_MAP, _LANGUAGE_LIST
+    global _voice_cache, _voice_cache_ready, _LANGUAGE_MAP, _LANGUAGE_LIST
 
-    raw = await edge_tts.list_voices()
+    try:
+        raw = await edge_tts.list_voices()
+    except Exception as exc:
+        logger.error("Failed to refresh voice cache: %s", exc)
+        return
+
     _voice_cache = []
     seen_locales: dict[str, str] = {}
 
@@ -122,6 +160,7 @@ async def _refresh_voice_cache() -> None:
         ],
         key=lambda x: x["name"].lower(),
     )
+    _voice_cache_ready = True
 
     logger.info(
         "Voice cache refreshed: %d voices across %d languages.",
@@ -208,6 +247,12 @@ def extract_tts_params(ssml: str) -> TTSRequest:
     Raises:
         ValueError: If the SSML is malformed or contains no speakable text.
     """
+    # Size guard — reject before parsing to prevent XML bomb attacks
+    if len(ssml) > MAX_SSML_LENGTH:
+        raise ValueError(
+            f"SSML too large ({len(ssml)} bytes). Maximum is {MAX_SSML_LENGTH} bytes."
+        )
+
     try:
         root = ET.fromstring(ssml)
     except ET.ParseError as exc:
@@ -268,6 +313,7 @@ async def generate_audio(req: TTSRequest) -> bytes:
 
     Raises:
         RuntimeError: If edge-tts fails (e.g. invalid voice name).
+        TimeoutError: If TTS generation exceeds TTS_TIMEOUT.
     """
     try:
         communicate = edge_tts.Communicate(
@@ -280,9 +326,15 @@ async def generate_audio(req: TTSRequest) -> bytes:
         raise RuntimeError(f"Failed to initialise edge-tts: {exc}") from exc
 
     buf = BytesIO()
-    async for chunk in communicate.stream():
-        if chunk.get("type") == "audio":
-            buf.write(chunk.get("data", b""))
+    try:
+        async with asyncio.timeout(TTS_TIMEOUT):  # type: ignore[attr-defined]
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio":
+                    buf.write(chunk.get("data", b""))
+    except TimeoutError:
+        raise TimeoutError(
+            f"TTS generation timed out after {TTS_TIMEOUT}s"
+        )
 
     if buf.tell() == 0:
         raise RuntimeError("edge-tts returned no audio data.")
@@ -292,17 +344,59 @@ async def generate_audio(req: TTSRequest) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Error message sanitisation
+# ---------------------------------------------------------------------------
+def _error_message(exc: Exception) -> str:
+    """Return a safe error message for the client.
+
+    In production, internal details (stack traces, library internals) are
+    replaced with a generic message.  In debug mode the full error is exposed.
+    """
+    if PRODUCTION:
+        return "TTS request failed. Check server logs for details."
+    return str(exc)
+
+
+# ---------------------------------------------------------------------------
 # Application factory
 # ---------------------------------------------------------------------------
 def create_app() -> Flask:
     """Create and configure the Flask application."""
     app = Flask(__name__)
+
+    # Don't serve static files or templates — API only
+    app.config["PROPAGATE_EXCEPTIONS"] = True  # let WSGI server handle errors
+
     CORS(app)
+
+    # -- Request logging -----------------------------------------------------
+    @app.before_request
+    def _before_request() -> None:
+        g.start_time = time.monotonic()
+        g.request_id = os.urandom(4).hex()
+
+    @app.after_request
+    def _after_request(response: Response) -> Response:
+        elapsed = time.monotonic() - g.get("start_time", time.monotonic())
+        logger.info(
+            "[%s] %s %s → %d (%.3fs)",
+            g.get("request_id", "????"),
+            request.method,
+            request.path,
+            response.status_code,
+            elapsed,
+        )
+        return response
 
     # -- Health check --------------------------------------------------------
     @app.route("/health", methods=["GET"])
     def health() -> Response:
-        return jsonify({"status": "ok"})
+        return jsonify(
+            {
+                "status": "ok",
+                "voice_cache_ready": _voice_cache_ready,
+            }
+        )
 
     # -- Voices endpoint -----------------------------------------------------
     @app.route("/voices", methods=["GET"])
@@ -315,6 +409,7 @@ def create_app() -> Flask:
                 "voices": [{"ShortName": ..., "Gender": ..., "Locale": ..., ...}, ...]
             }
         """
+        g._status_code = 200  # type: ignore[attr-defined]
         return jsonify(
             {
                 "languages": _LANGUAGE_LIST,
@@ -344,14 +439,17 @@ def create_app() -> Flask:
             tts_req = extract_tts_params(ssml)
         except ValueError as exc:
             logger.warning("SSML parse error: %s", exc)
-            return jsonify({"error": str(exc)}), 400  # type: ignore[return-value]
+            return jsonify({"error": _error_message(exc)}), 400  # type: ignore[return-value]
 
         # 2. Synthesise
         try:
             audio = await generate_audio(tts_req)
+        except TimeoutError as exc:
+            logger.error("TTS timeout: %s", exc)
+            return jsonify({"error": _error_message(exc)}), 504  # type: ignore[return-value]
         except RuntimeError as exc:
             logger.error("TTS generation failed: %s", exc)
-            return jsonify({"error": str(exc)}), 500  # type: ignore[return-value]
+            return jsonify({"error": _error_message(exc)}), 500  # type: ignore[return-value]
 
         # 3. Respond
         return Response(
@@ -364,6 +462,24 @@ def create_app() -> Flask:
 
 
 # ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+_shutdown_requested = False
+
+
+def _handle_shutdown(signum: int, frame: Any) -> None:
+    """Set the shutdown flag on SIGTERM/SIGINT."""
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name
+    logger.info("Received %s — initiating graceful shutdown.", sig_name)
+    _shutdown_requested = True
+
+
+signal.signal(signal.SIGTERM, _handle_shutdown)
+signal.signal(signal.SIGINT, _handle_shutdown)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -372,11 +488,60 @@ if __name__ == "__main__":
     # Populate voice cache from edge-tts on every reboot
     asyncio.run(_refresh_voice_cache())
 
+    if not _voice_cache_ready:
+        logger.critical(
+            "Voice cache failed to load. The /voices endpoint will return empty data. "
+            "Check network connectivity and edge-tts availability."
+        )
+
     if os.environ.get("FLASK_DEBUG"):
         logger.info(
             "Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT
         )
         application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
+    elif WSGI_SERVER == "gunicorn":
+        try:
+            from gunicorn.app.base import BaseApplication
+
+            class StandaloneApplication(BaseApplication):
+                def __init__(self, app: Flask, options: dict[str, Any]) -> None:
+                    self.application = app
+                    self.options = options
+                    super().__init__()
+
+                def load_config(self) -> None:
+                    for key, value in self.options.items():
+                        if key in self.cfg.settings and value is not None:
+                            self.cfg.set(key.lower(), value)
+
+                def load(self) -> Flask:
+                    return self.application  # type: ignore[return-value]
+
+            options = {
+                "bind": f"{SERVER_HOST}:{SERVER_PORT}",
+                "workers": GUNICORN_WORKERS,
+                "threads": GUNICORN_THREADS,
+                "worker_class": "gthread",
+                "graceful_timeout": 30,
+                "timeout": TTS_TIMEOUT + 10,
+                "accesslog": "-",
+                "errorlog": "-",
+                "loglevel": "info",
+                "preload_app": True,
+            }
+            logger.info(
+                "Starting Gunicorn on %s:%d (workers=%d, threads=%d)",
+                SERVER_HOST,
+                SERVER_PORT,
+                GUNICORN_WORKERS,
+                GUNICORN_THREADS,
+            )
+            StandaloneApplication(application, options).run()
+        except ImportError:
+            logger.critical(
+                "Gunicorn requested but not installed. Install with: pip install gunicorn"
+            )
+            sys.exit(1)
     else:
         try:
             from waitress import serve  # type: ignore[import-untyped]
@@ -388,6 +553,15 @@ if __name__ == "__main__":
             application.run(host=SERVER_HOST, port=SERVER_PORT)
         else:
             logger.info(
-                "Starting Waitress production server on %s:%d", SERVER_HOST, SERVER_PORT
+                "Starting Waitress on %s:%d (threads=%d)",
+                SERVER_HOST,
+                SERVER_PORT,
+                WAITRESS_THREADS,
             )
-            serve(application, host=SERVER_HOST, port=SERVER_PORT)
+            serve(
+                application,
+                host=SERVER_HOST,
+                port=SERVER_PORT,
+                threads=WAITRESS_THREADS,
+                _quiet=True,
+            )
