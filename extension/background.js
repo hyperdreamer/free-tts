@@ -216,8 +216,8 @@ function arrayBufferToDataUrl(buffer, mimeType = "audio/mpeg") {
   return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
-async function fetchSentenceAudio(serverUrl, voice, sentence) {
-  const ssml = buildSSML(sentence, voice);
+async function fetchSentenceAudio(serverUrl, voice, speed, sentence) {
+  const ssml = buildSSML(sentence, voice, speed);
   const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -233,9 +233,10 @@ async function fetchSentenceAudio(serverUrl, voice, sentence) {
 async function startSentenceTTS(tabId, text) {
   if (!tabId || !text?.trim()) return;
 
-  const { serverUrl, voice } = await chrome.storage.sync.get({
+  const { serverUrl, voice, speed } = await chrome.storage.sync.get({
     serverUrl: DEFAULT_SERVER,
     voice: "en-US-AvaMultilingualNeural",
+    speed: 0,
   });
 
   const sentences = splitSentences(text);
@@ -243,7 +244,7 @@ async function startSentenceTTS(tabId, text) {
 
   await stopPlayback();
   const cache = new Map();  // idx → dataUrl
-  sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl };
+  sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl, speed };
   activePlayback = { tabId };
   updateStopMenu();
 
@@ -253,7 +254,7 @@ async function startSentenceTTS(tabId, text) {
   // Pre-fetch first few sentences
   const preloadCount = Math.min(PRELOAD_AHEAD, sentences.length);
   for (let i = 0; i < preloadCount; i++) {
-    fetchSentenceAudio(serverUrl, voice, sentences[i])
+    fetchSentenceAudio(serverUrl, voice, speed, sentences[i])
       .then(url => cache.set(i, url))
       .catch((error) => logError(`preloading sentence ${i}`, error));
   }
@@ -264,7 +265,7 @@ async function startSentenceTTS(tabId, text) {
 
 async function playNextSentence() {
   if (!sentencePipeline) return;
-  const { sentences, currentIdx, cache, tabId, voice, serverUrl } = sentencePipeline;
+  const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = sentencePipeline;
   if (currentIdx >= sentences.length) {
     await cleanupPageHighlighting(tabId);
     clearPlayback();
@@ -284,7 +285,7 @@ async function playNextSentence() {
   if (!dataUrl) {
     // Fallback: fetch directly
     try {
-      dataUrl = await fetchSentenceAudio(serverUrl, voice, sentences[currentIdx]);
+      dataUrl = await fetchSentenceAudio(serverUrl, voice, speed, sentences[currentIdx]);
       cache.set(currentIdx, dataUrl);
     } catch (error) {
       logError(`fetching sentence ${currentIdx}`, error);
@@ -296,7 +297,7 @@ async function playNextSentence() {
   // Pre-fetch upcoming sentences
   for (let i = currentIdx + 1; i < currentIdx + 1 + PRELOAD_AHEAD && i < sentences.length; i++) {
     if (!cache.has(i)) {
-      fetchSentenceAudio(serverUrl, voice, sentences[i])
+      fetchSentenceAudio(serverUrl, voice, speed, sentences[i])
         .then(url => cache.set(i, url))
         .catch((error) => logError(`preloading sentence ${i}`, error));
     }
@@ -348,10 +349,11 @@ function escapeXML(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function buildSSML(text, voice) {
+function buildSSML(text, voice, speed = 0) {
+  const rateAttr = (100 + speed) + "%";
   return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xmlns:emo="http://www.w3.org/2009/10/emotionml" version="1.0" xml:lang="en-US">
     <voice name="${escapeXML(voice)}">
-        <prosody rate="100%" pitch="0%">
+        <prosody rate="${rateAttr}" pitch="0%">
 ${escapeXML(text)}
         </prosody>
     </voice>

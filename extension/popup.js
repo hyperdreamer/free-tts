@@ -56,8 +56,16 @@ async function init() {
     }
   });
 
+  // Load saved speed
+  const { speed } = await chrome.storage.sync.get({ speed: 0 });
+  speedSlider.value = speed;
+  speedVal.textContent = speed + "%";
+
+  // Save speed on change
   speedSlider.addEventListener("input", () => {
-    speedVal.textContent = speedSlider.value + "%";
+    const s = speedSlider.value;
+    speedVal.textContent = s + "%";
+    chrome.storage.sync.set({ speed: parseInt(s) });
   });
   speakBtn.addEventListener("click", () => speak());
   stopBtn.addEventListener("click", () => stop());
