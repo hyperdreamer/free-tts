@@ -64,6 +64,7 @@ const speedValue      = $("#speedValue");
 const pitchSlider     = $("#pitchSlider");
 const pitchValue      = $("#pitchValue");
 const previewBtn      = $("#previewBtn");
+const stopBtn         = $("#stopBtn");
 const downloadTextBtn  = $("#downloadTextBtn");
 const ssmlPreview     = $("#ssmlPreview");
 const resultsList     = $("#resultsList");
@@ -332,6 +333,8 @@ function playBlob(blob) {
   const url = URL.createObjectURL(blob);
   audioPlayer.src = url;
   audioPlayer.play();
+  showStopButton();
+  audioPlayer.onended = hideStopButton;
 }
 
 function downloadBlob(blob, filename = "tts-output.mp3") {
@@ -343,6 +346,23 @@ function downloadBlob(blob, filename = "tts-output.mp3") {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function stopAudio() {
+  audioPlayer.pause();
+  audioPlayer.currentTime = 0;
+  audioPlayer.src = "";
+  hideStopButton();
+}
+
+function showStopButton() {
+  previewBtn.style.display = "none";
+  stopBtn.style.display = "inline-flex";
+}
+
+function hideStopButton() {
+  previewBtn.style.display = "inline-flex";
+  stopBtn.style.display = "none";
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +427,7 @@ async function handleTextGenerate(preview = false) {
 }
 
 previewBtn.addEventListener("click", () => handleTextGenerate(true));
+stopBtn.addEventListener("click", stopAudio);
 downloadTextBtn.addEventListener("click", () => handleTextGenerate(false));
 
 // Selected voice preview button
