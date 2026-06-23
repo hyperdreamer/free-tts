@@ -315,7 +315,7 @@ textInputArea.addEventListener("input", updateSSMLPreview);
 // ---------------------------------------------------------------------------
 async function callTTS(ssml) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeout = setTimeout(() => controller.abort(), 900000);  // 15 min, matches server default
   try {
     const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
       method: "POST",

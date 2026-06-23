@@ -107,8 +107,8 @@ SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 50 * 1024, coerce=int)
 """Maximum SSML payload size in bytes. 50 KB default."""
 
-TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 60, coerce=int)
-"""Maximum seconds for a single TTS generation request."""
+TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 900, coerce=int)
+"""Maximum seconds for a single TTS generation request. 900s default handles ~15 min of speech."""
 
 TTS_MAX_CONCURRENT: int = _cfg("max_concurrent", "TTS_MAX_CONCURRENT", 2, coerce=int)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
