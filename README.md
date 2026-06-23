@@ -43,11 +43,11 @@ All settings via `config.json` or environment variables. Env vars take precedenc
 
 | Variable | Default | Description |
 |---|---|---|
-| `TTS_HOST` | `0.0.0.0` | Listen address |
+| `TTS_HOST` | `127.0.0.1` | Listen address |
 | `TTS_PORT` | `5000` | Listen port |
 | `TTS_DEFAULT_VOICE` | `en-US-AvaMultilingualNeural` | Fallback voice |
-| `TTS_MAX_SSML_LENGTH` | `51200` | Max SSML payload (bytes) |
-| `TTS_TIMEOUT` | `60` | TTS generation timeout (seconds) |
+| `TTS_MAX_SSML_LENGTH` | `0` (unlimited) | Max SSML payload (bytes) |
+| `TTS_STALL_TIMEOUT` | `60` | Seconds of silence before aborting |
 | `TTS_SERVER` | `waitress` | WSGI server: `waitress` or `gunicorn` |
 | `TTS_WAITRESS_THREADS` | `4` | Waitress worker threads |
 | `TTS_GUNICORN_WORKERS` | `2` | Gunicorn worker processes |

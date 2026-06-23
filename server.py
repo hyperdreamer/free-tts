@@ -107,9 +107,6 @@ SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
 MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 0, coerce=int)
 """Maximum SSML payload size in bytes. 0 = unlimited."""
 
-TTS_TIMEOUT: int = _cfg("tts_timeout", "TTS_TIMEOUT", 0, coerce=int)
-"""Gunicorn worker timeout. 0 = no limit (stall detection handles timeouts)."""
-
 TTS_STALL_TIMEOUT: int = _cfg("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, coerce=int)
 """Seconds of silence (no data from edge-tts) before aborting. 0 = disable."""
 
@@ -655,7 +652,7 @@ if __name__ == "__main__":
                 "threads": GUNICORN_THREADS,
                 "worker_class": "gthread",
                 "graceful_timeout": 30,
-                "timeout": TTS_TIMEOUT + 10,
+                "timeout": 0,  # no limit — stall detection handles timeouts
                 "accesslog": "-",
                 "errorlog": "-",
                 "loglevel": "info",
