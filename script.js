@@ -39,6 +39,8 @@ let languages = [];           // [{locale, name}]
 let selectedVoice = DEFAULT_VOICE_FALLBACK;
 let results = [];             // { text, voice, rate, pitch, blobUrl }
 let activeGender = "all";     // "all" | "Male" | "Female"
+let activeAbortController = null;  // for cancelling in-flight TTS requests
+let previewTimeout = null;         // for 30s preview limit
 
 // ---------------------------------------------------------------------------
 // DOM refs
@@ -64,6 +66,7 @@ const speedValue      = $("#speedValue");
 const pitchSlider     = $("#pitchSlider");
 const pitchValue      = $("#pitchValue");
 const previewBtn      = $("#previewBtn");
+const cancelGenBtn    = $("#cancelGenBtn");
 const stopBtn         = $("#stopBtn");
 const downloadTextBtn  = $("#downloadTextBtn");
 const ssmlPreview = $("#ssmlPreview");
@@ -314,7 +317,10 @@ textInputArea.addEventListener("input", updateSSMLPreview);
 // TTS API call
 // ---------------------------------------------------------------------------
 async function callTTS(ssml, timeoutMs = 120000) {
+  // Abort any previous request
+  if (activeAbortController) activeAbortController.abort();
   const controller = new AbortController();
+  activeAbortController = controller;
   const timeout = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
@@ -323,15 +329,21 @@ async function callTTS(ssml, timeoutMs = 120000) {
       body: JSON.stringify({ ssml }),
       signal: controller.signal,
     });
-
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ error: resp.statusText }));
       throw new Error(err.error || "TTS request failed");
     }
-
     return await resp.blob();
   } finally {
     if (timeout) clearTimeout(timeout);
+    activeAbortController = null;
+  }
+}
+
+function cancelGeneration() {
+  if (activeAbortController) {
+    activeAbortController.abort();
+    activeAbortController = null;
   }
 }
 
@@ -340,11 +352,17 @@ function playBlob(blob) {
   if (audioPlayer.src && audioPlayer.src.startsWith("blob:")) {
     URL.revokeObjectURL(audioPlayer.src);
   }
+  // Clear any previous preview timeout
+  if (previewTimeout) clearTimeout(previewTimeout);
   const url = URL.createObjectURL(blob);
   audioPlayer.src = url;
   audioPlayer.play();
   showStopButton();
-  audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); };
+  // Auto-stop preview after 30 seconds
+  previewTimeout = setTimeout(() => {
+    stopAudio();
+  }, 30000);
+  audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); clearPreview(); };
 }
 
 function stopAudio() {
@@ -355,6 +373,11 @@ function stopAudio() {
   }
   audioPlayer.src = "";
   hideStopButton();
+  clearPreview();
+}
+
+function clearPreview() {
+  if (previewTimeout) { clearTimeout(previewTimeout); previewTimeout = null; }
 }
 
 function downloadBlob(blob, filename = "tts-output.mp3") {
@@ -385,17 +408,17 @@ downloadSsmlBtn.addEventListener("click", async () => {
   const ssml = ssmlInput.value.trim();
   if (!ssml) return alert("Please enter SSML before downloading.");
 
-  downloadSsmlBtn.textContent = "Generating...";
-  downloadSsmlBtn.disabled = true;
+  cancelGenBtn.style.display = "inline-flex";
+  downloadSsmlBtn.style.display = "none";
 
   try {
     const blob = await callTTS(ssml, 0);  // no timeout for downloads
     downloadBlob(blob);
   } catch (err) {
-    alert("Error: " + err.message);
+    if (err.name !== "AbortError") alert("Error: " + err.message);
   } finally {
-    downloadSsmlBtn.textContent = "Download MP3";
-    downloadSsmlBtn.disabled = false;
+    cancelGenBtn.style.display = "none";
+    downloadSsmlBtn.style.display = "inline-flex";
   }
 });
 
@@ -412,8 +435,8 @@ async function handleTextGenerate(preview = false) {
 
   previewBtn.disabled = true;
   downloadTextBtn.disabled = true;
-  previewBtn.textContent = "Generating...";
-  downloadTextBtn.textContent = "Generating...";
+  cancelGenBtn.style.display = "inline-flex";
+  previewBtn.style.display = "none";
 
   try {
     const blob = await callTTS(ssml, preview ? 120000 : 0);  // preview: 2 min, download: unlimited
@@ -430,17 +453,18 @@ async function handleTextGenerate(preview = false) {
       downloadBlob(blob);
     }
   } catch (err) {
-    alert("Error: " + err.message);
+    if (err.name !== "AbortError") alert("Error: " + err.message);
   } finally {
     previewBtn.disabled = false;
     downloadTextBtn.disabled = false;
-    previewBtn.textContent = "▶ Preview Audio";
-    downloadTextBtn.textContent = "⬇ Download MP3";
+    cancelGenBtn.style.display = "none";
+    previewBtn.style.display = "inline-flex";
   }
 }
 
 previewBtn.addEventListener("click", () => handleTextGenerate(true));
 stopBtn.addEventListener("click", stopAudio);
+cancelGenBtn.addEventListener("click", cancelGeneration);
 downloadTextBtn.addEventListener("click", () => handleTextGenerate(false));
 
 // Selected voice preview button
