@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="24" fill="#0071e3"/>
+  <g transform="translate(32,28)" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Speaker body -->
+    <polygon points="0,24 20,24 40,8 40,64 20,48 0,48" fill="#fff" stroke="none"/>
+    <polygon points="0,24 20,24 40,8 40,64 20,48 0,48" fill="none" stroke="#fff"/>
+    <!-- Sound waves -->
+    <path d="M50,16 Q62,36 50,56" stroke="#fff" fill="none"/>
+    <path d="M60,6 Q76,36 60,66" stroke="#fff" fill="none" opacity="0.6"/>
+    <path d="M70,-4 Q90,36 70,76" stroke="#fff" fill="none" opacity="0.3"/>
+  </g>
+</svg>

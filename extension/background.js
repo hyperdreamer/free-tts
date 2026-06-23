@@ -1,5 +1,6 @@
 // free-tts background service worker
 // Handles context menu clicks and keyboard shortcut.
+// Audio playback is injected into the active tab (service workers can't play audio).
 
 const DEFAULT_SERVER = "http://localhost:5000";
 
@@ -14,7 +15,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "speak-selection" && info.selectionText) {
-    await speakText(info.selectionText);
+    await speakInTab(tab.id, info.selectionText);
   }
 });
 
@@ -29,15 +30,15 @@ chrome.commands.onCommand.addListener(async (command) => {
         func: () => window.getSelection()?.toString() || "",
       });
       const text = results?.[0]?.result;
-      if (text) await speakText(text);
+      if (text) await speakInTab(tab.id, text);
     } catch {
       // scripting permission may not be available on all URLs
     }
   }
 });
 
-// --- Speak ----------------------------------------------------------------
-async function speakText(text) {
+// --- Fetch audio and inject playback into the tab --------------------------
+async function speakInTab(tabId, text) {
   const { serverUrl } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
   const ssml = buildSSML(text);
 
@@ -50,10 +51,22 @@ async function speakText(text) {
     if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
 
     const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    audio.play();
-    audio.onended = () => URL.revokeObjectURL(url);
+    const reader = new FileReader();
+    const dataUrl = await new Promise((resolve, reject) => {
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+
+    // Inject audio playback into the tab (service workers can't play audio)
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (url) => {
+        const a = new Audio(url);
+        a.play();
+      },
+      args: [dataUrl],
+    });
   } catch (err) {
     console.error("free-tts:", err);
   }
