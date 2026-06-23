@@ -92,61 +92,8 @@ async function initPageHighlighting(tabId, sentences) {
     await chrome.scripting.executeScript({
       target: { tabId },
       func: (sents, color) => {
-        // Remove any previous highlighting
-        document.querySelectorAll(".free-tts-sentence").forEach(el => {
-          el.replaceWith(el.textContent);
-        });
         window.__freeTtsSentences = sents;
         window.__freeTtsColor = color;
-
-        // Normalize whitespace for fuzzy matching across paragraph breaks
-        const norm = (s) => s.replace(/\s+/g, " ").trim();
-
-        function wrapSentences(root, sentences) {
-          if (!root) return;
-
-          for (let si = 0; si < sentences.length; si++) {
-            const s = norm(sentences[si]);
-            if (!s) continue;
-
-            // Re-scan text nodes on every iteration — wrapping modifies the DOM
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-            const textNodes = [];
-            while (walker.nextNode()) textNodes.push(walker.currentNode);
-
-            for (const node of textNodes) {
-              if (!node.parentElement || node.parentElement.closest(".free-tts-sentence")) continue;
-              const nodeText = norm(node.textContent);
-              const idx = nodeText.indexOf(s);
-              if (idx < 0) continue;
-
-              // Find exact position in original (non-normalized) text
-              const origText = node.textContent;
-              let origIdx = 0, normPos = 0;
-              const normPrefix = nodeText.substring(0, idx);
-              while (normPos < normPrefix.length && origIdx < origText.length) {
-                if (origText[origIdx] && origText[origIdx].match(/\s/)) {
-                  while (origIdx < origText.length && origText[origIdx].match(/\s/)) origIdx++;
-                } else {
-                  origIdx++;
-                }
-                normPos++;
-              }
-
-              const span = document.createElement("span");
-              span.className = "free-tts-sentence";
-              span.dataset.idx = si;
-
-              const endIdx = Math.min(origIdx + sentences[si].length, origText.length);
-              span.textContent = origText.substring(origIdx, endIdx);
-              const after = node.splitText(origIdx);
-              after.textContent = after.textContent.slice(endIdx - origIdx);
-              node.parentElement.replaceChild(span, node);
-              break;  // matched this sentence, move to next
-            }
-          }
-        }
-        wrapSentences(document.body, sents);
       },
       args: [sentences, highlightColor],
     });
@@ -159,18 +106,60 @@ async function highlightCurrentSentence(tabId, idx) {
       target: { tabId },
       func: (idx) => {
         const color = window.__freeTtsColor || "#fff3cd";
-        // Remove previous highlight
-        document.querySelectorAll(".free-tts-sentence.active").forEach(el => {
-          el.style.background = "";
-          el.classList.remove("active");
-        });
-        // Highlight current and scroll to it
-        const el = document.querySelector(`.free-tts-sentence[data-idx="${idx}"]`);
-        if (el) {
-          el.style.background = color;
-          el.style.transition = "background 0.3s";
-          el.classList.add("active");
-          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        const sentence = window.__freeTtsSentences[idx];
+        if (!sentence) return;
+
+        // Remove previous highlight overlay
+        document.querySelectorAll(".free-tts-highlight-overlay").forEach(el => el.remove());
+
+        // Find text in page using TreeWalker, then create a Range overlay
+        const norm = (s) => s.replace(/\s+/g, " ").trim();
+        const target = norm(sentence);
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        const textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+
+        for (const node of textNodes) {
+          const nodeText = norm(node.textContent);
+          const idx = nodeText.indexOf(target);
+          if (idx < 0) continue;
+
+          // Find exact positions in original text
+          const origText = node.textContent;
+          let origStart = 0, normPos = 0;
+          while (normPos < idx && origStart < origText.length) {
+            if (origText[origStart] && origText[origStart].match(/\s/)) {
+              while (origStart < origText.length && origText[origStart].match(/\s/)) origStart++;
+            } else {
+              origStart++;
+            }
+            normPos++;
+          }
+          // Find end by consuming characters up to the sentence length in normalized form
+          let origEnd = origStart;
+          let consumed = 0;
+          while (consumed < sentence.length && origEnd < origText.length) {
+            if (origText[origEnd].match(/\s/)) {
+              origEnd++;
+            } else {
+              origEnd++;
+              consumed++;
+            }
+          }
+
+          const range = document.createRange();
+          range.setStart(node, origStart);
+          range.setEnd(node, origEnd);
+          const rects = range.getClientRects();
+
+          // Create highlight overlays for each line
+          for (const rect of rects) {
+            const overlay = document.createElement("div");
+            overlay.className = "free-tts-highlight-overlay";
+            overlay.style.cssText = `position:absolute;left:${rect.left + window.scrollX}px;top:${rect.top + window.scrollY}px;width:${rect.width}px;height:${rect.height}px;background:${color};opacity:0.5;pointer-events:none;z-index:999998;transition:background 0.3s;`;
+            document.body.appendChild(overlay);
+          }
+          break;
         }
       },
       args: [idx],
@@ -183,10 +172,7 @@ async function cleanupPageHighlighting(tabId) {
     await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
-        document.querySelectorAll(".free-tts-sentence").forEach(el => {
-          el.style.background = "";
-          el.replaceWith(el.textContent);
-        });
+        document.querySelectorAll(".free-tts-highlight-overlay").forEach(el => el.remove());
         delete window.__freeTtsSentences;
         delete window.__freeTtsColor;
       },
