@@ -24,9 +24,11 @@ const DEFAULT_TEXT =
 const SAMPLE_TEXT = "Hello, this is a sample of my voice.";
 
 // ---------------------------------------------------------------------------
-// Backend URL (relative path works behind proxies; change to absolute if needed)
+// Backend URL
+// - file:// frontend: talk to the local daemon directly
+// - http(s) frontend: same-origin/proxy path by default
 // ---------------------------------------------------------------------------
-const BACKEND_URL = "";
+const BACKEND_URL = window.location.protocol === "file:" ? "http://localhost:5000" : "";
 
 // ---------------------------------------------------------------------------
 // State
@@ -149,17 +151,38 @@ function clearChildren(parent) {
 // Voice data loading
 // ---------------------------------------------------------------------------
 async function loadVoices() {
+  // Render cached voices immediately so the UI is usable while /voices refreshes.
+  const cached = localStorage.getItem("freeTtsVoices");
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached);
+      allVoices = parsed.voices || [];
+      languages = parsed.languages || [];
+      if (allVoices.length && languages.length) populateLanguageDropdown();
+    } catch {
+      localStorage.removeItem("freeTtsVoices");
+    }
+  }
+
   try {
-    const resp = await fetch(`${BACKEND_URL}/voices`);
-    if (!resp.ok) throw new Error("Failed to load voices");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(`${BACKEND_URL}/voices`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) throw new Error(`Failed to load voices (${resp.status})`);
     const data = await resp.json();
     allVoices = data.voices || [];
     languages = data.languages || [];
+    localStorage.setItem("freeTtsVoices", JSON.stringify({ voices: allVoices, languages }));
     populateLanguageDropdown();
   } catch (err) {
     console.error("Voice load error:", err);
-    clearChildren(voiceList);
-    voiceList.appendChild(el("div", { className: "voice-loading", textContent: "Failed to load voices" }));
+    if (allVoices.length === 0) {
+      clearChildren(languageSelect);
+      languageSelect.appendChild(el("option", { value: "", textContent: "Server offline / cannot load voices" }));
+      clearChildren(voiceList);
+      voiceList.appendChild(el("div", { className: "voice-loading", textContent: "Failed to load voices. Is python server.py running?" }));
+    }
   }
 }
 
