@@ -112,53 +112,25 @@ async function highlightCurrentSentence(tabId, idx) {
         // Remove previous highlight overlay
         document.querySelectorAll(".free-tts-highlight-overlay").forEach(el => el.remove());
 
-        // Find ALL occurrences of this sentence in the page — not just the first
-        const norm = (s) => s.replace(/\s+/g, " ").trim();
-        const target = norm(sentence);
-        if (!target) return;
-
         const allRects = [];
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         let node;
         while ((node = walker.nextNode())) {
-          const nodeText = norm(node.textContent);
           let searchFrom = 0;
           while (true) {
-            const idx = nodeText.indexOf(target, searchFrom);
-            if (idx < 0) break;
-
-            // Find exact positions in original text
-            const origText = node.textContent;
-            let origStart = 0, normPos = 0;
-            while (normPos < idx && origStart < origText.length) {
-              if (origText[origStart] && origText[origStart].match(/\s/)) {
-                while (origStart < origText.length && origText[origStart].match(/\s/)) origStart++;
-              } else {
-                origStart++;
-              }
-              normPos++;
-            }
-            let origEnd = origStart;
-            let consumed = 0;
-            while (consumed < sentence.length && origEnd < origText.length) {
-              if (origText[origEnd].match(/\s/)) {
-                origEnd++;
-              } else {
-                origEnd++;
-                consumed++;
-              }
-            }
+            const pos = node.textContent.indexOf(sentence, searchFrom);
+            if (pos < 0) break;
 
             try {
               const range = document.createRange();
-              range.setStart(node, origStart);
-              range.setEnd(node, origEnd);
+              range.setStart(node, pos);
+              range.setEnd(node, pos + sentence.length);
               for (const rect of range.getClientRects()) {
                 allRects.push(rect);
               }
             } catch (e) { /* invalid range, skip */ }
 
-            searchFrom = idx + 1;
+            searchFrom = pos + 1;
           }
         }
 
