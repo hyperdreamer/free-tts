@@ -151,20 +151,10 @@ function clearChildren(parent) {
 // Voice data loading
 // ---------------------------------------------------------------------------
 async function loadVoices() {
-  // Render cached voices immediately so the UI is usable while /voices refreshes.
-  const cached = localStorage.getItem("freeTtsVoices");
-  if (cached) {
-    try {
-      const parsed = JSON.parse(cached);
-      allVoices = parsed.voices || [];
-      languages = parsed.languages || [];
-      if (allVoices.length && languages.length) populateLanguageDropdown();
-    } catch {
-      localStorage.removeItem("freeTtsVoices");
-    }
-  }
-
   try {
+    // Remove any stale cached voice data from older builds.
+    localStorage.removeItem("freeTtsVoices");
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
     const resp = await fetch(`${BACKEND_URL}/voices`, { signal: controller.signal });
@@ -173,16 +163,13 @@ async function loadVoices() {
     const data = await resp.json();
     allVoices = data.voices || [];
     languages = data.languages || [];
-    localStorage.setItem("freeTtsVoices", JSON.stringify({ voices: allVoices, languages }));
     populateLanguageDropdown();
   } catch (err) {
     console.error("Voice load error:", err);
-    if (allVoices.length === 0) {
-      clearChildren(languageSelect);
-      languageSelect.appendChild(el("option", { value: "", textContent: "Server offline / cannot load voices" }));
-      clearChildren(voiceList);
-      voiceList.appendChild(el("div", { className: "voice-loading", textContent: "Failed to load voices. Is python server.py running?" }));
-    }
+    clearChildren(languageSelect);
+    languageSelect.appendChild(el("option", { value: "", textContent: "Server offline / cannot load voices" }));
+    clearChildren(voiceList);
+    voiceList.appendChild(el("div", { className: "voice-loading", textContent: "Failed to load voices. Is python server.py running?" }));
   }
 }
 
