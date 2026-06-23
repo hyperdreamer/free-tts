@@ -1,16 +1,23 @@
 // free-tts background service worker
-// Handles context menu clicks, keyboard shortcut, and popup stop requests.
+// Handles context menu clicks, keyboard shortcut, and dynamic stop menu.
 // Audio playback is injected into the active tab (service workers can't play audio).
 
 const DEFAULT_SERVER = "http://localhost:5000";
 
-// Track injected audio so the popup can stop it
-let activePlayback = { tabId: null, audioId: null };
+// Track injected audio
+let activePlayback = { tabId: null };
 let playbackTimeout = null;
 
 function clearPlayback() {
-  activePlayback = { tabId: null, audioId: null };
+  activePlayback = { tabId: null };
   if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
+  updateStopMenu();
+}
+
+function updateStopMenu() {
+  chrome.contextMenus.update("stop-speaking", {
+    visible: !!activePlayback.tabId,
+  });
 }
 
 // --- Context menu ----------------------------------------------------------
@@ -20,11 +27,19 @@ chrome.runtime.onInstalled.addListener(() => {
     title: "Speak this",
     contexts: ["selection"],
   });
+  chrome.contextMenus.create({
+    id: "stop-speaking",
+    title: "Stop speaking",
+    contexts: ["page"],
+    visible: false,
+  });
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "speak-selection" && info.selectionText) {
     await speakInTab(tab.id, info.selectionText);
+  } else if (info.menuItemId === "stop-speaking") {
+    await stopPlaybackInTab();
   }
 });
 
@@ -46,16 +61,7 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 });
 
-// --- Messages from popup ---------------------------------------------------
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === "getPlaybackState") {
-    sendResponse({ playing: !!activePlayback.tabId, tabId: activePlayback.tabId });
-  } else if (msg.action === "stopPlayback") {
-    stopPlaybackInTab().then(() => sendResponse({ stopped: true }));
-    return true; // async response
-  }
-});
-
+// --- Stop playback in tab --------------------------------------------------
 async function stopPlaybackInTab() {
   if (!activePlayback.tabId) return;
   const tabId = activePlayback.tabId;
@@ -105,7 +111,6 @@ async function speakInTab(tabId, text) {
     await chrome.scripting.executeScript({
       target: { tabId },
       func: (url, id) => {
-        // Remove any previous audio element
         if (window.__freeTtsAudio) {
           window.__freeTtsAudio.pause();
           window.__freeTtsAudio.src = "";
@@ -119,8 +124,9 @@ async function speakInTab(tabId, text) {
       args: [dataUrl, audioId],
     });
 
-    activePlayback = { tabId, audioId };
-    // Auto-clear after 30 seconds (audio should have ended by then)
+    activePlayback = { tabId };
+    updateStopMenu();
+    // Auto-clear after 30 seconds
     playbackTimeout = setTimeout(clearPlayback, 30000);
   } catch (err) {
     console.error("free-tts:", err);

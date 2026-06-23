@@ -18,7 +18,6 @@ let voices = [];
 let activeAudio = null;
 let activeDataUrl = null;
 let defaultVoice = DEFAULT_VOICE;
-let isBackgroundPlayback = false;  // true when audio was started by context menu
 
 // --- Init ------------------------------------------------------------------
 async function init() {
@@ -46,9 +45,6 @@ async function init() {
 
   await checkServer();
   await loadVoices();
-
-  // Check if audio was started by context menu — enable stop button
-  await checkBackgroundPlayback();
 
   // Save voice selection on change
   voiceSelect.addEventListener("change", () => {
@@ -129,30 +125,8 @@ function renderVoiceSelect() {
   }
 }
 
-// --- Background playback check ---------------------------------------------
-async function checkBackgroundPlayback() {
-  try {
-    const resp = await chrome.runtime.sendMessage({ action: "getPlaybackState" });
-    if (resp?.playing) {
-      isBackgroundPlayback = true;
-      stopBtn.disabled = false;
-      speakBtn.textContent = "▶ Speak (overrides)";
-    }
-  } catch {
-    // background may not be ready
-  }
-}
-
 // --- Speak -----------------------------------------------------------------
 async function speak() {
-  // Stop any background playback first
-  if (isBackgroundPlayback) {
-    await chrome.runtime.sendMessage({ action: "stopPlayback" });
-    isBackgroundPlayback = false;
-    stopBtn.disabled = true;
-    speakBtn.textContent = "▶ Speak";
-    return; // first click stops background audio, second click speaks
-  }
   const text = textInput.value.trim();
   if (!text) return;
 
@@ -197,7 +171,6 @@ ${escapeXML(text)}
     activeAudio = audioPlayer;
 
     stopBtn.disabled = false;
-    isBackgroundPlayback = false;  // popup is now the source
 
     audioPlayer.onended = () => {
       stopBtn.disabled = true;
@@ -213,13 +186,6 @@ ${escapeXML(text)}
 }
 
 function stop() {
-  if (isBackgroundPlayback) {
-    chrome.runtime.sendMessage({ action: "stopPlayback" });
-    isBackgroundPlayback = false;
-    stopBtn.disabled = true;
-    speakBtn.textContent = "▶ Speak";
-    return;
-  }
   if (activeAudio) {
     activeAudio.pause();
     activeAudio.currentTime = 0;
