@@ -112,54 +112,62 @@ async function highlightCurrentSentence(tabId, idx) {
         // Remove previous highlight overlay
         document.querySelectorAll(".free-tts-highlight-overlay").forEach(el => el.remove());
 
-        // Find text in page using TreeWalker, then create a Range overlay
+        // Find ALL occurrences of this sentence in the page — not just the first
         const norm = (s) => s.replace(/\s+/g, " ").trim();
         const target = norm(sentence);
+        if (!target) return;
+
+        const allRects = [];
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-        const textNodes = [];
-        while (walker.nextNode()) textNodes.push(walker.currentNode);
-
-        for (const node of textNodes) {
+        let node;
+        while ((node = walker.nextNode())) {
           const nodeText = norm(node.textContent);
-          const idx = nodeText.indexOf(target);
-          if (idx < 0) continue;
+          let searchFrom = 0;
+          while (true) {
+            const idx = nodeText.indexOf(target, searchFrom);
+            if (idx < 0) break;
 
-          // Find exact positions in original text
-          const origText = node.textContent;
-          let origStart = 0, normPos = 0;
-          while (normPos < idx && origStart < origText.length) {
-            if (origText[origStart] && origText[origStart].match(/\s/)) {
-              while (origStart < origText.length && origText[origStart].match(/\s/)) origStart++;
-            } else {
-              origStart++;
+            // Find exact positions in original text
+            const origText = node.textContent;
+            let origStart = 0, normPos = 0;
+            while (normPos < idx && origStart < origText.length) {
+              if (origText[origStart] && origText[origStart].match(/\s/)) {
+                while (origStart < origText.length && origText[origStart].match(/\s/)) origStart++;
+              } else {
+                origStart++;
+              }
+              normPos++;
             }
-            normPos++;
-          }
-          // Find end by consuming characters up to the sentence length in normalized form
-          let origEnd = origStart;
-          let consumed = 0;
-          while (consumed < sentence.length && origEnd < origText.length) {
-            if (origText[origEnd].match(/\s/)) {
-              origEnd++;
-            } else {
-              origEnd++;
-              consumed++;
+            let origEnd = origStart;
+            let consumed = 0;
+            while (consumed < sentence.length && origEnd < origText.length) {
+              if (origText[origEnd].match(/\s/)) {
+                origEnd++;
+              } else {
+                origEnd++;
+                consumed++;
+              }
             }
-          }
 
-          const range = document.createRange();
-          range.setStart(node, origStart);
-          range.setEnd(node, origEnd);
-          const rects = range.getClientRects();
+            try {
+              const range = document.createRange();
+              range.setStart(node, origStart);
+              range.setEnd(node, origEnd);
+              for (const rect of range.getClientRects()) {
+                allRects.push(rect);
+              }
+            } catch (e) { /* invalid range, skip */ }
 
-          // Create highlight overlays for each line
-          for (const rect of rects) {
-            const overlay = document.createElement("div");
-            overlay.className = "free-tts-highlight-overlay";
-            overlay.style.cssText = `position:absolute;left:${rect.left + window.scrollX}px;top:${rect.top + window.scrollY}px;width:${rect.width}px;height:${rect.height}px;background:${color};opacity:0.5;pointer-events:none;z-index:999998;transition:background 0.3s;`;
-            document.body.appendChild(overlay);
+            searchFrom = idx + 1;
           }
-          break;
+        }
+
+        // Create highlight overlays for all found rects
+        for (const rect of allRects) {
+          const overlay = document.createElement("div");
+          overlay.className = "free-tts-highlight-overlay";
+          overlay.style.cssText = `position:absolute;left:${rect.left + window.scrollX}px;top:${rect.top + window.scrollY}px;width:${rect.width}px;height:${rect.height}px;background:${color};opacity:0.5;pointer-events:none;z-index:999998;transition:background 0.3s;`;
+          document.body.appendChild(overlay);
         }
       },
       args: [idx],
