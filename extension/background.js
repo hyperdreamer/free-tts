@@ -87,36 +87,55 @@ function splitSentences(text) {
 
 // --- In-page sentence wrapping + highlight + scroll -----------------------
 async function initPageHighlighting(tabId, sentences) {
-  // Inject a content script that wraps each sentence in a span for highlighting
+  const { highlightColor } = await chrome.storage.sync.get({ highlightColor: "#fff3cd" });
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (sents) => {
+      func: (sents, color) => {
         // Remove any previous highlighting
         document.querySelectorAll(".free-tts-sentence").forEach(el => {
           el.replaceWith(el.textContent);
         });
         window.__freeTtsSentences = sents;
-        window.__freeTtsCurrentIdx = -1;
+        window.__freeTtsColor = color;
 
-        // Find and wrap sentences in the DOM
+        // Normalize whitespace for fuzzy matching across paragraph breaks
+        const norm = (s) => s.replace(/\s+/g, " ").trim();
+
         function wrapSentences(root, sentences) {
           if (!root) return;
           const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
           const textNodes = [];
           while (walker.nextNode()) textNodes.push(walker.currentNode);
-          
+
           for (let si = 0; si < sentences.length; si++) {
-            const s = sentences[si];
+            const s = norm(sentences[si]);
+            if (!s) continue;
             for (const node of textNodes) {
-              const idx = node.textContent.indexOf(s);
+              // Check if node still exists (may have been replaced)
+              if (!node.parentElement) continue;
+              const nodeText = norm(node.textContent);
+              const idx = nodeText.indexOf(s);
               if (idx >= 0 && node.parentElement) {
+                // Find the exact position in the original text
+                const origText = node.textContent;
+                const normPrefix = nodeText.substring(0, idx);
+                let origIdx = 0, normPos = 0;
+                while (normPos < normPrefix.length) {
+                  if (origText[origIdx].match(/\s/)) {
+                    while (origText[origIdx] && origText[origIdx].match(/\s/)) origIdx++;
+                  } else {
+                    origIdx++;
+                  }
+                  normPos++;
+                }
                 const span = document.createElement("span");
                 span.className = "free-tts-sentence";
                 span.dataset.idx = si;
-                span.textContent = s;
-                const after = node.splitText(idx);
-                after.textContent = after.textContent.slice(s.length);
+                const endIdx = origIdx + sentences[si].length;
+                span.textContent = origText.substring(origIdx, Math.min(endIdx, origText.length));
+                const after = node.splitText(origIdx);
+                after.textContent = after.textContent.slice(Math.min(endIdx, origText.length) - origIdx);
                 node.parentElement.replaceChild(span, node);
                 break;
               }
@@ -125,7 +144,7 @@ async function initPageHighlighting(tabId, sentences) {
         }
         wrapSentences(document.body, sents);
       },
-      args: [sentences],
+      args: [sentences, highlightColor],
     });
   } catch {}
 }
@@ -135,6 +154,7 @@ async function highlightCurrentSentence(tabId, idx) {
     await chrome.scripting.executeScript({
       target: { tabId },
       func: (idx) => {
+        const color = window.__freeTtsColor || "#fff3cd";
         // Remove previous highlight
         document.querySelectorAll(".free-tts-sentence.active").forEach(el => {
           el.style.background = "";
@@ -143,7 +163,7 @@ async function highlightCurrentSentence(tabId, idx) {
         // Highlight current and scroll to it
         const el = document.querySelector(`.free-tts-sentence[data-idx="${idx}"]`);
         if (el) {
-          el.style.background = "#fff3cd";
+          el.style.background = color;
           el.style.transition = "background 0.3s";
           el.classList.add("active");
           el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -164,6 +184,7 @@ async function cleanupPageHighlighting(tabId) {
           el.replaceWith(el.textContent);
         });
         delete window.__freeTtsSentences;
+        delete window.__freeTtsColor;
       },
     });
   } catch {}

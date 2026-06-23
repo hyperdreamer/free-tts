@@ -1,14 +1,16 @@
 // Options page
-const DEFAULT_SERVER = "http://localhost:5000";
+const DEFAULTS = { serverUrl: "http://localhost:5000", highlightColor: "#fff3cd" };
 
 document.addEventListener("DOMContentLoaded", async () => {
-  const { serverUrl } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
-  document.getElementById("serverUrl").value = serverUrl;
+  const cfg = await chrome.storage.sync.get(DEFAULTS);
+  document.getElementById("serverUrl").value = cfg.serverUrl;
+  document.getElementById("highlightColor").value = cfg.highlightColor;
 });
 
 document.getElementById("saveBtn").addEventListener("click", async () => {
   const serverUrl = document.getElementById("serverUrl").value.trim();
-  await chrome.storage.sync.set({ serverUrl });
+  const highlightColor = document.getElementById("highlightColor").value;
+  await chrome.storage.sync.set({ serverUrl, highlightColor });
   document.getElementById("status").textContent = "Saved.";
   setTimeout(() => { document.getElementById("status").textContent = ""; }, 2000);
 });
