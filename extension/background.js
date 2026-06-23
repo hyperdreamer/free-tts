@@ -80,8 +80,8 @@ async function stopPlayback() {
 
 // --- Sentence splitting ----------------------------------------------------
 function splitSentences(text) {
-  // Split on sentence-ending punctuation followed by space
-  const sentences = text.match(/[^.!?\n]+[.!?]+(\s|$)|[^.!?\n]+$/g) || [text];
+  // Split on sentence-ending punctuation: Latin (.!?) and CJK (。！？．｡)
+  const sentences = text.match(/[^.!?\n。！？．｡]+[.!?。！？．｡]+(\s|$)|[^.!?\n。！？．｡]+$/g) || [text];
   return sentences.map(s => s.trim()).filter(s => s.length > 0);
 }
 
