@@ -183,9 +183,22 @@ function populateLanguageDropdown() {
   for (const l of languages) {
     languageSelect.appendChild(el("option", { value: l.locale, textContent: l.name }));
   }
-  const enOption = languageSelect.querySelector('option[value="en-US"]');
-  if (enOption) enOption.selected = true;
+
+  // Select the language containing the configured default voice.
+  const defaultVoiceInfo = allVoices.find(v => v.ShortName === selectedVoice);
+  if (defaultVoiceInfo) {
+    languageSelect.value = defaultVoiceInfo.Locale;
+    voiceSelectedName.textContent = defaultVoiceInfo.ShortName;
+    const langName = languages.find(l => l.locale === defaultVoiceInfo.Locale);
+    voiceSelectedMeta.textContent =
+      `${langName ? langName.name : defaultVoiceInfo.Locale} · ${defaultVoiceInfo.Gender}`;
+  } else {
+    const enOption = languageSelect.querySelector('option[value="en-US"]');
+    if (enOption) enOption.selected = true;
+  }
+
   renderVoiceList();
+  updateSSMLPreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +246,11 @@ function renderVoiceList() {
       selectVoice(v.ShortName, v.Locale, v.Gender);
     });
     voiceList.appendChild(item);
+  }
+
+  const selectedItem = voiceList.querySelector(".voice-item.selected");
+  if (selectedItem) {
+    selectedItem.scrollIntoView({ block: "nearest" });
   }
 }
 
