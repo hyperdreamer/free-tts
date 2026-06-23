@@ -104,41 +104,45 @@ async function initPageHighlighting(tabId, sentences) {
 
         function wrapSentences(root, sentences) {
           if (!root) return;
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-          const textNodes = [];
-          while (walker.nextNode()) textNodes.push(walker.currentNode);
 
           for (let si = 0; si < sentences.length; si++) {
             const s = norm(sentences[si]);
             if (!s) continue;
+
+            // Re-scan text nodes on every iteration — wrapping modifies the DOM
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            const textNodes = [];
+            while (walker.nextNode()) textNodes.push(walker.currentNode);
+
             for (const node of textNodes) {
-              // Check if node still exists (may have been replaced)
-              if (!node.parentElement) continue;
+              if (!node.parentElement || node.parentElement.closest(".free-tts-sentence")) continue;
               const nodeText = norm(node.textContent);
               const idx = nodeText.indexOf(s);
-              if (idx >= 0 && node.parentElement) {
-                // Find the exact position in the original text
-                const origText = node.textContent;
-                const normPrefix = nodeText.substring(0, idx);
-                let origIdx = 0, normPos = 0;
-                while (normPos < normPrefix.length) {
-                  if (origText[origIdx].match(/\s/)) {
-                    while (origText[origIdx] && origText[origIdx].match(/\s/)) origIdx++;
-                  } else {
-                    origIdx++;
-                  }
-                  normPos++;
+              if (idx < 0) continue;
+
+              // Find exact position in original (non-normalized) text
+              const origText = node.textContent;
+              let origIdx = 0, normPos = 0;
+              const normPrefix = nodeText.substring(0, idx);
+              while (normPos < normPrefix.length && origIdx < origText.length) {
+                if (origText[origIdx] && origText[origIdx].match(/\s/)) {
+                  while (origIdx < origText.length && origText[origIdx].match(/\s/)) origIdx++;
+                } else {
+                  origIdx++;
                 }
-                const span = document.createElement("span");
-                span.className = "free-tts-sentence";
-                span.dataset.idx = si;
-                const endIdx = origIdx + sentences[si].length;
-                span.textContent = origText.substring(origIdx, Math.min(endIdx, origText.length));
-                const after = node.splitText(origIdx);
-                after.textContent = after.textContent.slice(Math.min(endIdx, origText.length) - origIdx);
-                node.parentElement.replaceChild(span, node);
-                break;
+                normPos++;
               }
+
+              const span = document.createElement("span");
+              span.className = "free-tts-sentence";
+              span.dataset.idx = si;
+
+              const endIdx = Math.min(origIdx + sentences[si].length, origText.length);
+              span.textContent = origText.substring(origIdx, endIdx);
+              const after = node.splitText(origIdx);
+              after.textContent = after.textContent.slice(endIdx - origIdx);
+              node.parentElement.replaceChild(span, node);
+              break;  // matched this sentence, move to next
             }
           }
         }
