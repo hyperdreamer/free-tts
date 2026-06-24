@@ -217,9 +217,9 @@ async function showControlBar(tabId, isPaused) {
           <button id="free-tts-next" title="Next">⏭</button>
           <button id="free-tts-close" title="Stop">✕</button>
         `;
-        bar.style.cssText = "position:fixed;top:16px;right:16px;background:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:6px 10px;z-index:999999;display:flex;gap:2px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;";
+        bar.style.cssText = "position:fixed;top:56px;right:16px;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.12);padding:4px 6px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;";
         bar.querySelectorAll("button").forEach(b => {
-          b.style.cssText = "border:none;background:none;font-size:18px;cursor:pointer;padding:6px 8px;border-radius:6px;color:#333;transition:background 0.15s;";
+          b.style.cssText = "border:none;background:none;font-size:16px;cursor:pointer;padding:4px 6px;border-radius:5px;color:#555;transition:background 0.15s;line-height:1;";
           b.addEventListener("mouseenter", () => b.style.background = "#f0f0f0");
           b.addEventListener("mouseleave", () => b.style.background = "none");
         });
@@ -282,6 +282,7 @@ async function prevSentence() {
 async function nextSentence() {
   if (!sentencePipeline) return;
   sentencePipeline.isPaused = false;
+  sentencePipeline.currentIdx++;  // skip to next
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
