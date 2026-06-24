@@ -446,7 +446,12 @@ async def generate_audio(req: TTSRequest) -> bytes:
     stream = communicate.stream()
     while True:
         try:
-            chunk = await asyncio.wait_for(stream.__anext__(), timeout=TTS_STALL_TIMEOUT)
+            if TTS_STALL_TIMEOUT > 0:
+                chunk = await asyncio.wait_for(
+                    stream.__anext__(), timeout=TTS_STALL_TIMEOUT
+                )
+            else:
+                chunk = await stream.__anext__()
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError:

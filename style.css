@@ -207,8 +207,10 @@ body {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 0;
+    height: min(720px, calc(100vh - 120px));
     min-height: 640px;
     border-top: 1px solid var(--border-light);
+    overflow: hidden;
 }
 
 /* Left: controls */
@@ -218,7 +220,9 @@ body {
     flex-direction: column;
     gap: 16px;
     border-right: 1px solid var(--border-light);
+    min-height: 0;
     overflow-y: auto;
+    scrollbar-gutter: stable;
 }
 
 /* ---- Voice Panel ---- */
@@ -563,6 +567,8 @@ body {
     display: flex;
     flex-direction: column;
     background: #fafafa;
+    min-height: 0;
+    overflow: hidden;
 }
 
 .panel-tabs {
@@ -591,12 +597,38 @@ body {
 .panel-content {
     display: none;
     flex: 1;
+    min-height: 0;
     padding: 16px 20px;
-    overflow-y: auto;
+    overflow-y: scroll;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
 }
 
 .panel-content.active {
     display: block;
+}
+
+.panel-content::-webkit-scrollbar,
+.text-controls::-webkit-scrollbar {
+    width: 10px;
+}
+
+.panel-content::-webkit-scrollbar-track,
+.text-controls::-webkit-scrollbar-track {
+    background: #f1f1f4;
+    border-left: 1px solid var(--border-light);
+}
+
+.panel-content::-webkit-scrollbar-thumb,
+.text-controls::-webkit-scrollbar-thumb {
+    background: #b8b8c0;
+    border-radius: 8px;
+    border: 2px solid #f1f1f4;
+}
+
+.panel-content::-webkit-scrollbar-thumb:hover,
+.text-controls::-webkit-scrollbar-thumb:hover {
+    background: #8f8f99;
 }
 
 .ssml-preview {
