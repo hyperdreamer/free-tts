@@ -217,7 +217,7 @@ async function showControlBar(tabId, isPaused) {
           <button id="free-tts-next" title="Next">⏭</button>
           <button id="free-tts-close" title="Stop">✕</button>
         `;
-        bar.style.cssText = "position:fixed;top:56px;right:16px;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.12);padding:4px 6px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;";
+        bar.style.cssText = "position:fixed;top:56px;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.12);padding:4px 6px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
         bar.querySelectorAll("button").forEach(b => {
           b.style.cssText = "border:none;background:none;font-size:16px;cursor:pointer;padding:4px 6px;border-radius:5px;color:#555;transition:background 0.15s;line-height:1;";
           b.addEventListener("mouseenter", () => b.style.background = "#f0f0f0");
@@ -225,7 +225,25 @@ async function showControlBar(tabId, isPaused) {
         });
         document.body.appendChild(bar);
 
-        bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
+        // --- Drag to move ---
+        let drag = false, startX, startY, startLeft, startTop;
+        bar.addEventListener("mousedown", (e) => {
+          if (e.target.tagName === "BUTTON") return;  // don't drag when clicking buttons
+          drag = true;
+          startX = e.clientX; startY = e.clientY;
+          const rect = bar.getBoundingClientRect();
+          startLeft = rect.left; startTop = rect.top;
+          e.preventDefault();
+        });
+        document.addEventListener("mousemove", (e) => {
+          if (!drag) return;
+          bar.style.transform = "none";
+          bar.style.left = (startLeft + e.clientX - startX) + "px";
+          bar.style.top = (startTop + e.clientY - startY) + "px";
+        });
+        document.addEventListener("mouseup", () => { drag = false; });
+
+        // --- Button handlers ---
         bar.querySelector("#free-tts-next").addEventListener("click", () => chrome.runtime.sendMessage({ action: "nextSentence" }));
         bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
           const btn = document.getElementById("free-tts-toggle");
