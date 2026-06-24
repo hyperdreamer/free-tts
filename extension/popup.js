@@ -14,6 +14,7 @@ const optionsLink  = document.getElementById("optionsLink");
 let serverUrl = DEFAULT_SERVER;
 let voices = [];
 let defaultVoice = DEFAULT_VOICE;
+let popupState = "idle";  // idle | playing | paused
 
 // --- Init ------------------------------------------------------------------
 async function init() {
@@ -23,6 +24,11 @@ async function init() {
   // Load saved default voice
   const { voice: savedVoice } = await chrome.storage.sync.get({ voice: DEFAULT_VOICE });
   defaultVoice = savedVoice;
+
+  // Check current playback state from background
+  const { state } = await chrome.runtime.sendMessage({ action: "getPlaybackState" });
+  popupState = state || "idle";
+  updateButtons();
 
   // Auto-fill with selected text from the active tab
   try {
@@ -129,8 +135,40 @@ function renderVoiceSelect() {
   }
 }
 
-// --- Speak -----------------------------------------------------------------
+// --- Speak / Pause / Resume -------------------------------------------------
+function updateButtons() {
+  if (popupState === "playing") {
+    speakBtn.textContent = "⏸ Pause";
+    speakBtn.disabled = false;
+    stopBtn.disabled = false;
+  } else if (popupState === "paused") {
+    speakBtn.textContent = "▶ Resume";
+    speakBtn.disabled = false;
+    stopBtn.disabled = false;
+  } else {
+    speakBtn.textContent = "▶ Speak";
+    speakBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+}
+
 async function speak() {
+  if (popupState === "playing") {
+    // Pause
+    await chrome.runtime.sendMessage({ action: "pausePlayback" });
+    popupState = "paused";
+    updateButtons();
+    return;
+  }
+  if (popupState === "paused") {
+    // Resume
+    await chrome.runtime.sendMessage({ action: "resumePlayback" });
+    popupState = "playing";
+    updateButtons();
+    return;
+  }
+
+  // Start new playback
   const text = textInput.value.trim();
   if (!text) return;
 
@@ -141,18 +179,15 @@ async function speak() {
     chrome.storage.sync.set({ voice });
   }
 
-  speakBtn.disabled = true;
-  speakBtn.textContent = "Speaking...";
-  stopBtn.disabled = false;
-
   chrome.runtime.sendMessage({ action: "speakSentences", text });
+  popupState = "playing";
+  updateButtons();
 }
 
 function stop() {
   chrome.runtime.sendMessage({ action: "stopPlayback" });
-  speakBtn.disabled = false;
-  speakBtn.textContent = "▶ Speak";
-  stopBtn.disabled = true;
+  popupState = "idle";
+  updateButtons();
 }
 
 // --- Start ----------------------------------------------------------------

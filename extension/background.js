@@ -117,6 +117,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     stopPlayback().then(() => sendResponse({ ok: true }));
     return true;
   }
+  if (msg.action === "getPlaybackState") {
+    if (sentencePipeline?.isPaused) sendResponse({ state: "paused" });
+    else if (sentencePipeline) sendResponse({ state: "playing" });
+    else sendResponse({ state: "idle" });
+    return false;
+  }
+  if (msg.action === "pausePlayback") {
+    pausePlayback().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.action === "resumePlayback") {
+    resumePlayback().then(() => sendResponse({ ok: true }));
+    return true;
+  }
 });
 
 // --- Keyboard shortcut -----------------------------------------------------
