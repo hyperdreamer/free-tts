@@ -38,22 +38,45 @@ Copy `config.example.json` to `config.json` and edit:
 cp config.example.json config.json
 ```
 
-All settings via `config.json` or environment variables. Env vars take precedence.
+All settings can be set via `config.json` or environment variables. Env vars take precedence.
 
-| Variable | Default | Description |
-|---|---|---|
-| `TTS_HOST` | `127.0.0.1` | Listen address |
-| `TTS_PORT` | `5000` | Listen port |
-| `TTS_DEFAULT_VOICE` | `en-US-AvaMultilingualNeural` | Fallback voice |
-| `TTS_MAX_SSML_LENGTH` | `200000` | Max SSML payload (bytes); set `0` to disable |
-| `TTS_STALL_TIMEOUT` | `60` | Seconds of silence before aborting |
-| `TTS_MAX_CONCURRENT` | `2` | Concurrent TTS generations; `0` disables the limit |
-| `TTS_CORS_ORIGINS` | local file + loopback origins | Comma-separated allowed browser origins. Use regular expressions starting with `^` for patterns. |
-| `TTS_SERVER` | `waitress` | WSGI server: `waitress` or `gunicorn` |
-| `TTS_WAITRESS_THREADS` | `4` | Waitress worker threads |
-| `TTS_GUNICORN_WORKERS` | `2` | Gunicorn worker processes |
-| `TTS_GUNICORN_THREADS` | `4` | Gunicorn threads per worker |
-| `FLASK_DEBUG` | (unset) | Set to `1` for dev mode (auto-reload, verbose errors) |
+### Network
+
+| config.json | Env var | Default | Description |
+|---|---|---|---|
+| `host` | `TTS_HOST` | `127.0.0.1` | Listen address. `0.0.0.0` for all interfaces, `127.0.0.1` for local only. |
+| `port` | `TTS_PORT` | `5000` | Listen port. |
+
+### TTS
+
+| config.json | Env var | Default | Description |
+|---|---|---|---|
+| `default_voice` | `TTS_DEFAULT_VOICE` | `en-US-AvaMultilingualNeural` | Fallback voice when SSML omits `<voice name>`. See `GET /voices` for available names. |
+| `max_ssml_length` | `TTS_MAX_SSML_LENGTH` | `200000` | Max SSML payload in bytes. Set `0` to disable the limit. |
+| `tts_stall_timeout` | `TTS_STALL_TIMEOUT` | `60` | Seconds of silence from Microsoft before aborting. `0` = disable stall detection. |
+| `max_concurrent` | `TTS_MAX_CONCURRENT` | `2` | Max concurrent TTS generation requests. `0` = unlimited. |
+
+### CORS
+
+| config.json | Env var | Default | Description |
+|---|---|---|---|
+| `cors_origins` | `TTS_CORS_ORIGINS` | local + LAN | Allowed browser origins. Array of strings — plain matches (`"https://example.com"`) or regex patterns (`"^https?://192\\.168\\..*$"`). `"null"` allows `file://` pages. Env var uses comma-separated values. |
+
+### WSGI server
+
+| config.json | Env var | Default | Description |
+|---|---|---|---|
+| `wsgi_server` | `TTS_SERVER` | `waitress` | WSGI server: `waitress` or `gunicorn`. |
+| `waitress_threads` | `TTS_WAITRESS_THREADS` | `4` | Waitress worker threads. |
+| `gunicorn_workers` | `TTS_GUNICORN_WORKERS` | `2` | Gunicorn worker processes. |
+| `gunicorn_threads` | `TTS_GUNICORN_THREADS` | `4` | Threads per Gunicorn worker. |
+
+### Development
+
+| Env var | Description |
+|---|---|
+| `FLASK_DEBUG=1` | Dev mode: auto-reload, verbose error pages, Flask built-in server. |
+| `TTS_CONFIG` | Path to a custom config.json file. |
 
 ## API
 
