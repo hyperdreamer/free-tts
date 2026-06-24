@@ -37,12 +37,9 @@ const BACKEND_URL = window.location.protocol === "file:" ? "http://localhost:500
 let allVoices = [];           // raw from server
 let languages = [];           // [{locale, name}]
 let selectedVoice = DEFAULT_VOICE_FALLBACK;
-let results = [];             // { text, voice, rate, pitch, blobUrl }
 let activeGender = "all";     // "all" | "Male" | "Female"
 let activeAbortController = null;  // for cancelling in-flight TTS requests
 let sentencePipeline = null;      // { sentences, idx, cache, voice, rate, pitch }
-let previewTimeout = null;
-
 function splitSentences(text) {
   const sentences = text.match(/[^.!?\n。！？．｡]+[.!?。！？．｡]+(\s|$)|[^.!?\n。！？．｡]+$/g) || [text];
   return sentences.map(s => s.trim()).filter(s => s.length > 0);
@@ -75,7 +72,6 @@ const previewBtn      = $("#previewBtn");
 const stopBtn         = $("#stopBtn");
 const downloadTextBtn  = $("#downloadTextBtn");
 const ssmlPreview = $("#ssmlPreview");
-const resultsList     = $("#resultsList");
 const audioPlayer     = $("#audioPlayer");
 const errorMsg        = $("#errorMsg");
 
@@ -123,16 +119,7 @@ $$(".tab").forEach(tab => {
   });
 });
 
-// Panel tabs
-$$(".panel-tab").forEach(tab => {
-  tab.addEventListener("click", () => {
-    const target = tab.dataset.panel;
-    $$(".panel-tab").forEach(t => t.classList.remove("active"));
-    tab.classList.add("active");
-    $$(".panel-content").forEach(pc => pc.classList.remove("active"));
-    $(`#${target}`).classList.add("active");
-  });
-});
+// Panel tabs are removed — only SSML Preview remains
 
 // ---------------------------------------------------------------------------
 // Safe DOM helpers (avoid innerHTML for XSS prevention)
@@ -355,29 +342,14 @@ function cancelGeneration() {
 }
 
 function playBlob(blob) {
-  // Revoke previous blob URL to prevent memory leaks
   if (audioPlayer.src && audioPlayer.src.startsWith("blob:")) {
     URL.revokeObjectURL(audioPlayer.src);
   }
-  // Clear any previous preview timeout
-  if (previewTimeout) clearTimeout(previewTimeout);
   const url = URL.createObjectURL(blob);
   audioPlayer.src = url;
   audioPlayer.play();
-  playingFromResults = false;
   showStopButton();
   audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); };
-}
-
-function playResultUrl(blobUrl) {
-  if (audioPlayer.src && audioPlayer.src.startsWith("blob:")) {
-    URL.revokeObjectURL(audioPlayer.src);
-  }
-  audioPlayer.src = blobUrl;
-  audioPlayer.play();
-  playingFromResults = true;
-  showStopButton();
-  audioPlayer.onended = () => { hideStopButton(); playingFromResults = false; };
 }
 
 function stopAudio() {
@@ -388,7 +360,6 @@ function stopAudio() {
   }
   audioPlayer.src = "";
   hideStopButton();
-  playingFromResults = false;
 }
 
 function downloadBlob(blob, filename = "tts-output.mp3") {
@@ -552,13 +523,6 @@ async function handleTextGenerate(preview = false) {
 
   try {
     const blob = await callTTS(ssml, 0);  // no timeout for downloads
-
-    // Add to results
-    const blobUrl = URL.createObjectURL(blob);
-    results.unshift({ text, voice: selectedVoice, rate, pitch, blobUrl });
-    if (results.length > 20) results.pop();
-    renderResults();
-
     downloadBlob(blob);
   } catch (err) {
     if (err.name !== "AbortError") alert("Error: " + err.message);
@@ -577,80 +541,6 @@ downloadTextBtn.addEventListener("click", () => handleTextGenerate(false));
 
 // Selected voice preview button
 voicePreviewBtn.addEventListener("click", () => previewVoice(selectedVoice));
-
-// ---------------------------------------------------------------------------
-// Results list
-// ---------------------------------------------------------------------------
-function deleteResult(idx) {
-  // Revoke blob URL to prevent memory leak
-  URL.revokeObjectURL(results[idx].blobUrl);
-  results.splice(idx, 1);
-  renderResults();
-}
-
-function renderResults() {
-  clearChildren(resultsList);
-
-  if (results.length === 0) {
-    resultsList.appendChild(el("div", { className: "results-empty", textContent: "No generated items yet" }));
-    return;
-  }
-
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    const shortText = r.text.length > 40 ? r.text.slice(0, 40) + "\u2026" : r.text;
-    const voiceLabel = r.voice.replace("Neural", "").replace("Multilingual", "");
-
-    const item = el("div", { className: "result-item", dataset: { idx: String(i) } }, [
-      el("div", { className: "result-info" }, [
-        el("span", { className: "result-text", textContent: shortText }),
-        el("span", { className: "result-voice", textContent: `${voiceLabel} \u00b7 ${r.rate}% speed \u00b7 ${r.pitch}% pitch` }),
-      ]),
-      el("span", { className: "result-play", dataset: { idx: String(i) }, textContent: "\u25b6" }),
-      el("span", { className: "result-delete", dataset: { idx: String(i) }, textContent: "\u00d7", title: "Delete" }),
-    ]);
-
-    const playBtn = item.querySelector(".result-play");
-    playBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (playingFromResults) {
-        stopAudio();
-        return;
-      }
-      playResultUrl(r.blobUrl);
-    });
-
-    const delBtn = item.querySelector(".result-delete");
-    delBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      deleteResult(i);
-    });
-
-    item.addEventListener("click", () => {
-      textInputArea.value = r.text;
-      const voiceInfo = allVoices.find(v => v.ShortName === r.voice);
-      if (voiceInfo) {
-        selectVoice(voiceInfo.ShortName, voiceInfo.Locale, voiceInfo.Gender);
-        languageSelect.value = voiceInfo.Locale;
-      } else {
-        selectedVoice = r.voice;
-        voiceSelectedName.textContent = r.voice;
-        voiceSelectedMeta.textContent = "\u2014";
-      }
-      speedSlider.value = r.rate;
-      pitchSlider.value = r.pitch;
-      updateSliderDisplay();
-      updateSSMLPreview();
-      renderVoiceList();
-      $$(".tab").forEach(t => t.classList.remove("active-tab"));
-      document.querySelector('[data-tab="text"]').classList.add("active-tab");
-      $$(".tab-content").forEach(tc => tc.classList.remove("active"));
-      $("#tab-text").classList.add("active");
-    });
-
-    resultsList.appendChild(item);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Keyboard shortcut
