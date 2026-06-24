@@ -32,6 +32,12 @@ function normalizeColor(value) {
   return /^#[0-9a-fA-F]{6}$/.test(value) ? value : "#fff3cd";
 }
 
+function normalizeSpeed(value) {
+  const speed = Number.parseInt(value, 10);
+  if (!Number.isFinite(speed)) return 0;
+  return Math.min(200, Math.max(-50, speed));
+}
+
 function sendAsyncResponse(sendResponse, promise) {
   promise
     .then((result = { ok: true }) => sendResponse(result))
@@ -243,6 +249,9 @@ async function showControlBar(tabId, isPaused) {
       target: { tabId },
       func: (paused) => {
         // Remove existing bar
+        if (typeof window.__freeTtsCleanupControlBar === "function") {
+          window.__freeTtsCleanupControlBar();
+        }
         document.getElementById("free-tts-bar")?.remove();
         const bar = document.createElement("div");
         bar.id = "free-tts-bar";
@@ -270,13 +279,15 @@ async function showControlBar(tabId, isPaused) {
           startLeft = rect.left; startTop = rect.top;
           e.preventDefault();
         });
-        document.addEventListener("mousemove", (e) => {
+        const onMouseMove = (e) => {
           if (!drag) return;
           bar.style.transform = "none";
           bar.style.left = (startLeft + e.clientX - startX) + "px";
           bar.style.top = (startTop + e.clientY - startY) + "px";
-        });
-        document.addEventListener("mouseup", () => { drag = false; });
+        };
+        const onDragMouseUp = () => { drag = false; };
+        document.addEventListener("mousemove", onMouseMove);
+        document.addEventListener("mouseup", onDragMouseUp);
 
         // --- Button handlers ---
         bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
@@ -289,7 +300,7 @@ async function showControlBar(tabId, isPaused) {
         bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
 
         // --- Double-click to jump to sentence ---
-        document.addEventListener("dblclick", () => {
+        const onDoubleClick = () => {
           const sel = window.getSelection();
           if (!sel || !sel.toString().trim()) return;
           const word = sel.toString().trim();
@@ -301,10 +312,11 @@ async function showControlBar(tabId, isPaused) {
               return;
             }
           }
-        });
+        };
+        document.addEventListener("dblclick", onDoubleClick);
 
         // --- Drag-select to jump to sentence ---
-        document.addEventListener("mouseup", () => {
+        const onSelectionMouseUp = () => {
           setTimeout(() => {
             const sel = window.getSelection();
             if (!sel || sel.isCollapsed) return;
@@ -319,7 +331,17 @@ async function showControlBar(tabId, isPaused) {
               }
             }
           }, 100);
-        });
+        };
+        document.addEventListener("mouseup", onSelectionMouseUp);
+
+        window.__freeTtsCleanupControlBar = () => {
+          document.removeEventListener("mousemove", onMouseMove);
+          document.removeEventListener("mouseup", onDragMouseUp);
+          document.removeEventListener("dblclick", onDoubleClick);
+          document.removeEventListener("mouseup", onSelectionMouseUp);
+          document.getElementById("free-tts-bar")?.remove();
+          delete window.__freeTtsCleanupControlBar;
+        };
       },
       args: [isPaused],
     });
@@ -343,7 +365,13 @@ async function hideControlBar(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => { const b = document.getElementById("free-tts-bar"); if (b) b.remove(); },
+      func: () => {
+        if (typeof window.__freeTtsCleanupControlBar === "function") {
+          window.__freeTtsCleanupControlBar();
+        } else {
+          document.getElementById("free-tts-bar")?.remove();
+        }
+      },
     });
   } catch {}
 }
@@ -548,7 +576,7 @@ async function startSentenceTTS(tabId, text) {
     tabId,
     voice,
     serverUrl: normalizeServerUrl(serverUrl),
-    speed,
+    speed: normalizeSpeed(speed),
     isPaused: false,
   };
   activePlayback = { tabId };

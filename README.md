@@ -45,10 +45,10 @@ All settings via `config.json` or environment variables. Env vars take precedenc
 | `TTS_HOST` | `127.0.0.1` | Listen address |
 | `TTS_PORT` | `5000` | Listen port |
 | `TTS_DEFAULT_VOICE` | `en-US-AvaMultilingualNeural` | Fallback voice |
-| `TTS_MAX_SSML_LENGTH` | `0` (unlimited) | Max SSML payload (bytes) |
+| `TTS_MAX_SSML_LENGTH` | `200000` | Max SSML payload (bytes); set `0` to disable |
 | `TTS_STALL_TIMEOUT` | `60` | Seconds of silence before aborting |
 | `TTS_MAX_CONCURRENT` | `2` | Concurrent TTS generations; `0` disables the limit |
-| `TTS_CORS_ORIGINS` | local file + loopback + Chrome extension origins | Comma-separated allowed origins. Use regular expressions starting with `^` for patterns. |
+| `TTS_CORS_ORIGINS` | local file + loopback origins | Comma-separated allowed browser origins. Use regular expressions starting with `^` for patterns. |
 | `TTS_SERVER` | `waitress` | WSGI server: `waitress` or `gunicorn` |
 | `TTS_WAITRESS_THREADS` | `4` | Waitress worker threads |
 | `TTS_GUNICORN_WORKERS` | `2` | Gunicorn worker processes |

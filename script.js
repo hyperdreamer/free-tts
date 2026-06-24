@@ -40,6 +40,13 @@ let selectedVoice = DEFAULT_VOICE_FALLBACK;
 let activeGender = "all";     // "all" | "Male" | "Female"
 const activeAbortControllers = new Set();  // for cancelling in-flight TTS requests
 let sentencePipeline = null;      // { sentences, idx, cache, voice, rate, pitch }
+
+function clampNumber(value, min, max, fallback = 0) {
+  const num = Number.parseInt(value, 10);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, num));
+}
+
 function splitSentences(text) {
   const sentences = text.match(/[^.!?\n。！？．｡]+[.!?。！？．｡]+(\s|$)|[^.!?\n。！？．｡]+$/g) || [text];
   return sentences.map(s => s.trim()).filter(s => s.length > 0);
@@ -94,10 +101,12 @@ function escapeXMLAttribute(str) {
 // SSML construction
 // ---------------------------------------------------------------------------
 function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
-  const rateAttr = (100 + rateSliderVal) + "%";
-  const pitchAttr = pitchSliderVal === 0
+  const rate = clampNumber(rateSliderVal, -50, 200);
+  const pitch = clampNumber(pitchSliderVal, -50, 50);
+  const rateAttr = (100 + rate) + "%";
+  const pitchAttr = pitch === 0
     ? "0%"
-    : (pitchSliderVal > 0 ? "+" : "") + pitchSliderVal + "Hz";
+    : (pitch > 0 ? "+" : "") + pitch + "Hz";
 
   return SSML_TEMPLATE
     .replace("VOICE_NAME", escapeXMLAttribute(voice))
@@ -301,7 +310,7 @@ function updateSliderDisplay() {
 
 function updateSSMLPreview() {
   const text = textInputArea.value || "[enter text]";
-  const ssml = buildSSML(selectedVoice, text, parseInt(speedSlider.value), parseInt(pitchSlider.value));
+  const ssml = buildSSML(selectedVoice, text, speedSlider.value, pitchSlider.value);
   ssmlPreview.textContent = ssml;
   charCount.textContent = textInputArea.value.length + " characters";
 }
@@ -339,9 +348,18 @@ async function callTTS(ssml, timeoutMs = 120000, { cancelExisting = false } = {}
 function cancelGeneration() {
   activeAbortControllers.forEach(controller => controller.abort());
   activeAbortControllers.clear();
+  revokeSentenceCache(sentencePipeline?.cache);
   sentencePipeline = null;
   previewBtn.textContent = "▶ Preview Audio";
   downloadTextBtn.textContent = "⬇ Download MP3";
+}
+
+function revokeSentenceCache(cache) {
+  if (!cache) return;
+  for (const url of cache.values()) {
+    if (typeof url === "string" && url.startsWith("blob:")) URL.revokeObjectURL(url);
+  }
+  cache.clear();
 }
 
 function playBlob(blob) {
@@ -443,6 +461,7 @@ async function startSentencePreview(text, voice, rate, pitch) {
 }
 
 function stopSentencePreview() {
+  revokeSentenceCache(sentencePipeline?.cache);
   sentencePipeline = null;
   stopAudio();
 }
@@ -456,6 +475,7 @@ async function playNextPreviewSentence() {
   if (!sentencePipeline) return;
   const { sentences, idx, cache, voice, rate, pitch } = sentencePipeline;
   if (idx >= sentences.length) {
+    revokeSentenceCache(cache);
     sentencePipeline = null;
     hideStopButton();
     return;
@@ -477,6 +497,7 @@ async function playNextPreviewSentence() {
       url = URL.createObjectURL(blob);
       cache.set(idx, url);
     } catch {
+      revokeSentenceCache(cache);
       sentencePipeline = null;
       hideStopButton();
       return;
@@ -496,12 +517,17 @@ async function playNextPreviewSentence() {
   audioPlayer.src = url;
   audioPlayer.play().catch((err) => {
     console.error("Audio playback failed:", err);
+    revokeSentenceCache(cache);
     sentencePipeline = null;
     hideStopButton();
   });
 
   audioPlayer.onended = () => {
-    if (!sentencePipeline) { hideStopButton(); return; }
+    if (!sentencePipeline) {
+      revokeSentenceCache(cache);
+      hideStopButton();
+      return;
+    }
     sentencePipeline.idx++;
     playNextPreviewSentence();
   };
@@ -517,8 +543,8 @@ async function handleTextGenerate(preview = false) {
     return;
   }
 
-  const rate = parseInt(speedSlider.value);
-  const pitch = parseInt(pitchSlider.value);
+  const rate = clampNumber(speedSlider.value, -50, 200);
+  const pitch = clampNumber(pitchSlider.value, -50, 50);
   const ssml = buildSSML(selectedVoice, text, rate, pitch);
 
   if (preview) {

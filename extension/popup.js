@@ -31,6 +31,12 @@ function normalizeServerUrl(value) {
   }
 }
 
+function normalizeSpeed(value) {
+  const speed = Number.parseInt(value, 10);
+  if (!Number.isFinite(speed)) return 0;
+  return Math.min(200, Math.max(-50, speed));
+}
+
 // --- Init ------------------------------------------------------------------
 async function init() {
   const { serverUrl: stored } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
@@ -74,14 +80,15 @@ async function init() {
 
   // Load saved speed
   const { speed } = await chrome.storage.sync.get({ speed: 0 });
-  speedSlider.value = speed;
-  speedVal.textContent = speed + "%";
+  const safeSpeed = normalizeSpeed(speed);
+  speedSlider.value = safeSpeed;
+  speedVal.textContent = safeSpeed + "%";
 
   // Save speed on change
   speedSlider.addEventListener("input", () => {
     const s = speedSlider.value;
     speedVal.textContent = s + "%";
-    chrome.storage.sync.set({ speed: parseInt(s, 10) }).catch(() => {});
+    chrome.storage.sync.set({ speed: normalizeSpeed(s) }).catch(() => {});
   });
   speakBtn.addEventListener("click", () => speak().catch(() => {
     popupState = "idle";

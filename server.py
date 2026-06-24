@@ -150,7 +150,7 @@ DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 SERVER_HOST: str = _cfg("host", "TTS_HOST", "127.0.0.1")
 SERVER_PORT: int = _cfg_int("port", "TTS_PORT", 5000, minimum=1, maximum=65535)
 
-MAX_SSML_LENGTH: int = _cfg_int("max_ssml_length", "TTS_MAX_SSML_LENGTH", 0, minimum=0)
+MAX_SSML_LENGTH: int = _cfg_int("max_ssml_length", "TTS_MAX_SSML_LENGTH", 200_000, minimum=0)
 """Maximum SSML payload size in bytes. 0 = unlimited."""
 
 TTS_STALL_TIMEOUT: int = _cfg_int("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, minimum=0)
@@ -185,10 +185,9 @@ CORS_ORIGINS: list[str] = _cfg_list(
         "null",
         r"^https?://localhost(?::\d+)?$",
         r"^https?://127\.0\.0\.1(?::\d+)?$",
-        r"^chrome-extension://[a-z]{32}$",
     ],
 )
-"""Allowed browser origins. Defaults to local files, loopback, and Chrome extensions."""
+"""Allowed browser origins. Defaults to local files and loopback web pages."""
 
 SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
 """XML namespace URI for the SSML <speak> element."""
@@ -290,6 +289,13 @@ def _find_first(element: ET.Element, tag_name: str) -> ET.Element | None:
         if _local_name(child) == tag_name:
             return child
     return None
+
+
+def _is_known_voice(voice: str) -> bool:
+    """Return whether a voice exists in the cache, if the cache is available."""
+    if not _voice_cache_ready or not _voice_cache:
+        return True
+    return any(item.get("ShortName") == voice for item in _voice_cache)
 
 
 async def _refresh_voice_cache() -> None:
@@ -672,6 +678,9 @@ def create_app() -> Flask:
         except ValueError as exc:
             logger.warning("SSML parse error: %s", exc)
             return jsonify({"error": _error_message(exc, is_client_error=True)}), 400  # type: ignore[return-value]
+        if not _is_known_voice(tts_req.voice):
+            logger.warning("Unknown voice requested: %s", tts_req.voice)
+            return jsonify({"error": f"Unknown voice: {tts_req.voice}"}), 400  # type: ignore[return-value]
 
         # 2. Synthesise (stall timeout handled inside generate_audio)
         try:
