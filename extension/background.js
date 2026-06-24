@@ -180,9 +180,9 @@ chrome.commands.onCommand.addListener(async (command) => {
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: () => window.getSelection()?.toString() || "",
+        func: () => window.getSelection()?.toString() || document.body.innerText || "",
       });
-      const text = results?.[0]?.result;
+      const text = results?.[0]?.result?.trim();
       if (text) await startSentenceTTS(tab.id, text);
     } catch (error) {
       // scripting permission may not be available on all URLs
