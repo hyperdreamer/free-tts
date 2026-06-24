@@ -13,9 +13,8 @@ paste SSML or use the visual **Text Input** builder to pick a voice, set speed/p
   - Speed slider (−50% to +200%)
   - Pitch slider (−50% to +50%)
   - Live SSML preview
-  - Results history with replay
 - **Server** — Flask + Waitress/Gunicorn, `/voices` endpoint auto-populated from edge-tts on startup
-- **Production-ready** — SSML size limits, TTS timeout, request logging, graceful shutdown
+- **Production-ready** — local-only CORS defaults, SSML size limits, TTS timeout, request logging, graceful shutdown
 
 ## Quick Start
 
@@ -48,6 +47,8 @@ All settings via `config.json` or environment variables. Env vars take precedenc
 | `TTS_DEFAULT_VOICE` | `en-US-AvaMultilingualNeural` | Fallback voice |
 | `TTS_MAX_SSML_LENGTH` | `0` (unlimited) | Max SSML payload (bytes) |
 | `TTS_STALL_TIMEOUT` | `60` | Seconds of silence before aborting |
+| `TTS_MAX_CONCURRENT` | `2` | Concurrent TTS generations; `0` disables the limit |
+| `TTS_CORS_ORIGINS` | local file + loopback + Chrome extension origins | Comma-separated allowed origins. Use regular expressions starting with `^` for patterns. |
 | `TTS_SERVER` | `waitress` | WSGI server: `waitress` or `gunicorn` |
 | `TTS_WAITRESS_THREADS` | `4` | Waitress worker threads |
 | `TTS_GUNICORN_WORKERS` | `2` | Gunicorn worker processes |

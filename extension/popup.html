@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>free-tts</title>
@@ -11,17 +11,19 @@
     <div class="header">
       <span class="title">free-tts</span>
       <span class="status-dot" id="statusDot" title="Server status"></span>
-      <a class="options-link" href="#" id="optionsLink" title="Settings">⚙</a>
+      <a class="options-link" href="#" id="optionsLink" title="Settings" aria-label="Settings">⚙</a>
     </div>
 
     <!-- Voice picker -->
     <div class="voice-row">
+      <label class="sr-only" for="voiceSelect">Voice</label>
       <select id="voiceSelect" class="voice-select">
         <option value="">Loading voices...</option>
       </select>
     </div>
 
     <!-- Text -->
+    <label class="sr-only" for="textInput">Text to speak</label>
     <textarea id="textInput" class="text-input" placeholder="Enter text or select text on any page and click the extension icon..."></textarea>
 
     <!-- Speed -->

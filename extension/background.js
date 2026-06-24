@@ -3,6 +3,7 @@
 
 const DEFAULT_SERVER = "http://localhost:5000";
 const PRELOAD_AHEAD = 2;  // pre-fetch this many sentences ahead
+const FETCH_TIMEOUT_MS = 120000;
 
 // Pipeline state
 let activePlayback = { tabId: null };
@@ -11,6 +12,34 @@ let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, s
 
 function logError(context, error) {
   console.error(`free-tts background: ${context}`, error);
+}
+
+function normalizeServerUrl(value) {
+  try {
+    const url = new URL(value || DEFAULT_SERVER);
+    if (!["http:", "https:"].includes(url.protocol)) return DEFAULT_SERVER;
+    if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) return DEFAULT_SERVER;
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return DEFAULT_SERVER;
+  }
+}
+
+function normalizeColor(value) {
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : "#fff3cd";
+}
+
+function sendAsyncResponse(sendResponse, promise) {
+  promise
+    .then((result = { ok: true }) => sendResponse(result))
+    .catch((error) => {
+      logError("handling runtime message", error);
+      sendResponse({ ok: false, error: error.message || "Operation failed" });
+    });
+  return true;
 }
 
 function callContextMenuApi(method, ...args) {
@@ -104,18 +133,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 // --- Messages from popup ---------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "speakSentences") {
-    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+    return sendAsyncResponse(sendResponse, chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
       if (tab?.id) {
-        startSentenceTTS(tab.id, msg.text).then(() => sendResponse({ ok: true }));
-      } else {
-        sendResponse({ ok: false, error: "No active tab" });
+        return startSentenceTTS(tab.id, msg.text).then(() => ({ ok: true }));
       }
-    });
-    return true;  // async response
+      return { ok: false, error: "No active tab" };
+    }));
   }
   if (msg.action === "stopPlayback") {
-    stopPlayback().then(() => sendResponse({ ok: true }));
-    return true;
+    return sendAsyncResponse(sendResponse, stopPlayback().then(() => ({ ok: true })));
   }
   if (msg.action === "getPlaybackState") {
     if (sentencePipeline?.isPaused) sendResponse({ state: "paused" });
@@ -124,24 +150,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.action === "pausePlayback") {
-    pausePlayback().then(() => sendResponse({ ok: true }));
-    return true;
+    return sendAsyncResponse(sendResponse, pausePlayback().then(() => ({ ok: true })));
   }
   if (msg.action === "resumePlayback") {
-    resumePlayback().then(() => sendResponse({ ok: true }));
-    return true;
+    return sendAsyncResponse(sendResponse, resumePlayback().then(() => ({ ok: true })));
   }
   if (msg.action === "prevSentence") {
-    prevSentence().then(() => sendResponse({ ok: true }));
-    return true;
+    return sendAsyncResponse(sendResponse, prevSentence().then(() => ({ ok: true })));
   }
   if (msg.action === "nextSentence") {
-    nextSentence().then(() => sendResponse({ ok: true }));
-    return true;
+    return sendAsyncResponse(sendResponse, nextSentence().then(() => ({ ok: true })));
   }
   if (msg.action === "jumpToSentence") {
-    jumpToSentence(msg.idx).then(() => sendResponse({ ok: true }));
-    return true;
+    return sendAsyncResponse(sendResponse, jumpToSentence(msg.idx).then(() => ({ ok: true })));
   }
 });
 
@@ -202,7 +223,17 @@ async function resumePlayback() {
   sentencePipeline.isPaused = false;
   updateStopMenu();
   await updateControlBar(sentencePipeline.tabId, false);
-  await playNextSentence();
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: sentencePipeline.tabId },
+      func: () => {
+        const audio = window.__freeTtsAudio;
+        if (audio && !audio.ended) audio.play().catch(() => {});
+      },
+    });
+  } catch (error) {
+    logError("resuming playback in page", error);
+  }
 }
 
 // --- Control bar -----------------------------------------------------------
@@ -248,6 +279,7 @@ async function showControlBar(tabId, isPaused) {
         document.addEventListener("mouseup", () => { drag = false; });
 
         // --- Button handlers ---
+        bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
         bar.querySelector("#free-tts-next").addEventListener("click", () => chrome.runtime.sendMessage({ action: "nextSentence" }));
         bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
           const btn = document.getElementById("free-tts-toggle");
@@ -376,6 +408,7 @@ function splitSentences(text) {
 // --- In-page sentence wrapping + highlight + scroll -----------------------
 async function initPageHighlighting(tabId, sentences) {
   const { highlightColor } = await chrome.storage.sync.get({ highlightColor: "#fff3cd" });
+  const safeHighlightColor = normalizeColor(highlightColor);
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -383,7 +416,7 @@ async function initPageHighlighting(tabId, sentences) {
         window.__freeTtsSentences = sents;
         window.__freeTtsColor = color;
       },
-      args: [sentences, highlightColor],
+      args: [sentences, safeHighlightColor],
     });
   } catch (error) {
     logError("initializing page highlighting", error);
@@ -472,15 +505,25 @@ function arrayBufferToDataUrl(buffer, mimeType = "audio/mpeg") {
 
 async function fetchSentenceAudio(serverUrl, voice, speed, sentence) {
   const ssml = buildSSML(sentence, voice, speed);
-  const resp = await fetch(`${serverUrl}/generate-and-download-tts`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ssml }),
-  });
-  if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
-  const buffer = await resp.arrayBuffer();
-  const contentType = resp.headers.get("content-type") || "audio/mpeg";
-  return arrayBufferToDataUrl(buffer, contentType);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(`${normalizeServerUrl(serverUrl)}/generate-and-download-tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssml }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: `Server returned ${resp.status}` }));
+      throw new Error(err.error || `Server returned ${resp.status}`);
+    }
+    const buffer = await resp.arrayBuffer();
+    const contentType = resp.headers.get("content-type") || "audio/mpeg";
+    return arrayBufferToDataUrl(buffer, contentType);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // --- Main sentence TTS pipeline --------------------------------------------
@@ -498,7 +541,16 @@ async function startSentenceTTS(tabId, text) {
 
   await stopPlayback();
   const cache = new Map();  // idx → dataUrl
-  sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl, speed, isPaused: false };
+  sentencePipeline = {
+    sentences,
+    currentIdx: 0,
+    cache,
+    tabId,
+    voice,
+    serverUrl: normalizeServerUrl(serverUrl),
+    speed,
+    isPaused: false,
+  };
   activePlayback = { tabId };
   updateStopMenu();
   await showControlBar(tabId, false);
@@ -610,13 +662,17 @@ async function playNextSentence() {
 
 // --- XML helpers -----------------------------------------------------------
 function escapeXML(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeXMLAttribute(str) {
+  return escapeXML(str).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
 function buildSSML(text, voice, speed = 0) {
   const rateAttr = (100 + speed) + "%";
   return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xmlns:emo="http://www.w3.org/2009/10/emotionml" version="1.0" xml:lang="en-US">
-    <voice name="${escapeXML(voice)}">
+    <voice name="${escapeXMLAttribute(voice)}">
         <prosody rate="${rateAttr}" pitch="0%">
 ${escapeXML(text)}
         </prosody>

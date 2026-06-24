@@ -10,16 +10,31 @@ const speedVal     = document.getElementById("speedVal");
 const speakBtn     = document.getElementById("speakBtn");
 const stopBtn      = document.getElementById("stopBtn");
 const optionsLink  = document.getElementById("optionsLink");
+const statusDot    = document.getElementById("statusDot");
 
 let serverUrl = DEFAULT_SERVER;
 let voices = [];
 let defaultVoice = DEFAULT_VOICE;
 let popupState = "idle";  // idle | playing | paused
 
+function normalizeServerUrl(value) {
+  try {
+    const url = new URL(value || DEFAULT_SERVER);
+    if (!["http:", "https:"].includes(url.protocol)) return DEFAULT_SERVER;
+    if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) return DEFAULT_SERVER;
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return DEFAULT_SERVER;
+  }
+}
+
 // --- Init ------------------------------------------------------------------
 async function init() {
   const { serverUrl: stored } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
-  serverUrl = stored;
+  serverUrl = normalizeServerUrl(stored);
 
   // Load saved default voice
   const { voice: savedVoice } = await chrome.storage.sync.get({ voice: DEFAULT_VOICE });
@@ -53,7 +68,7 @@ async function init() {
     const v = voiceSelect.value;
     if (v && v !== defaultVoice) {
       defaultVoice = v;
-      chrome.storage.sync.set({ voice: v });
+      chrome.storage.sync.set({ voice: v }).catch(() => {});
     }
   });
 
@@ -66,11 +81,17 @@ async function init() {
   speedSlider.addEventListener("input", () => {
     const s = speedSlider.value;
     speedVal.textContent = s + "%";
-    chrome.storage.sync.set({ speed: parseInt(s) });
+    chrome.storage.sync.set({ speed: parseInt(s, 10) }).catch(() => {});
   });
-  speakBtn.addEventListener("click", () => speak());
+  speakBtn.addEventListener("click", () => speak().catch(() => {
+    popupState = "idle";
+    updateButtons();
+  }));
   stopBtn.addEventListener("click", () => stop());
-  optionsLink.addEventListener("click", () => chrome.runtime.openOptionsPage());
+  optionsLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    chrome.runtime.openOptionsPage();
+  });
 }
 
 // --- Server check ---------------------------------------------------------
@@ -98,7 +119,7 @@ async function loadVoices() {
     // Use the server's configured default voice if available
     if (data.default_voice && defaultVoice === "en-US-AvaMultilingualNeural") {
       defaultVoice = data.default_voice;
-      chrome.storage.sync.set({ voice: defaultVoice });
+      chrome.storage.sync.set({ voice: defaultVoice }).catch(() => {});
     }
     renderVoiceSelect();
   } catch {
@@ -109,7 +130,10 @@ async function loadVoices() {
 function renderVoiceSelect() {
   voiceSelect.innerHTML = "";
   if (voices.length === 0) {
-    voiceSelect.innerHTML = '<option value="">No voices (server offline?)</option>';
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "No voices (server offline?)";
+    voiceSelect.appendChild(opt);
     return;
   }
 
@@ -155,14 +179,16 @@ function updateButtons() {
 async function speak() {
   if (popupState === "playing") {
     // Pause
-    await chrome.runtime.sendMessage({ action: "pausePlayback" });
+    const response = await chrome.runtime.sendMessage({ action: "pausePlayback" });
+    if (!response?.ok) throw new Error(response?.error || "Failed to pause playback");
     popupState = "paused";
     updateButtons();
     return;
   }
   if (popupState === "paused") {
     // Resume
-    await chrome.runtime.sendMessage({ action: "resumePlayback" });
+    const response = await chrome.runtime.sendMessage({ action: "resumePlayback" });
+    if (!response?.ok) throw new Error(response?.error || "Failed to resume playback");
     popupState = "playing";
     updateButtons();
     return;
@@ -176,16 +202,17 @@ async function speak() {
   const voice = voiceSelect.value || defaultVoice;
   if (voice !== defaultVoice) {
     defaultVoice = voice;
-    chrome.storage.sync.set({ voice });
+    chrome.storage.sync.set({ voice }).catch(() => {});
   }
 
-  chrome.runtime.sendMessage({ action: "speakSentences", text });
+  const response = await chrome.runtime.sendMessage({ action: "speakSentences", text });
+  if (!response?.ok) return;
   popupState = "playing";
   updateButtons();
 }
 
-function stop() {
-  chrome.runtime.sendMessage({ action: "stopPlayback" });
+async function stop() {
+  await chrome.runtime.sendMessage({ action: "stopPlayback" }).catch(() => {});
   popupState = "idle";
   updateButtons();
 }

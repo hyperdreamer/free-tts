@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -83,12 +84,56 @@ def _load_config() -> dict[str, Any]:
 def _cfg(key: str, env_var: str, default: Any, coerce: type = str) -> Any:
     """Resolve a config value: env var > config.json > hardcoded default."""
     env_val = os.environ.get(env_var)
-    if env_val is not None:
-        return coerce(env_val)
-    file_val = _CONFIG_CACHE.get(key)
-    if file_val is not None:
-        return coerce(file_val) if coerce is not str else str(file_val)
+    raw_val = env_val if env_val is not None else _CONFIG_CACHE.get(key)
+    if raw_val is not None:
+        try:
+            return coerce(raw_val) if coerce is not str else str(raw_val)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Invalid value for %s/%s (%r): %s. Using default %r.",
+                env_var,
+                key,
+                raw_val,
+                exc,
+                default,
+            )
+            return default
     return default
+
+
+def _cfg_int(
+    key: str,
+    env_var: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Resolve and clamp an integer config value."""
+    value = int(_cfg(key, env_var, default, coerce=int))
+    if minimum is not None and value < minimum:
+        logger.warning("%s/%s below minimum %d; using %d.", env_var, key, minimum, default)
+        return default
+    if maximum is not None and value > maximum:
+        logger.warning("%s/%s above maximum %d; using %d.", env_var, key, maximum, default)
+        return default
+    return value
+
+
+def _cfg_list(key: str, env_var: str, default: list[str]) -> list[str]:
+    """Resolve a string-list config value from JSON array or comma-separated env."""
+    env_val = os.environ.get(env_var)
+    raw_val = env_val if env_val is not None else _CONFIG_CACHE.get(key)
+    if raw_val is None:
+        return default
+    if isinstance(raw_val, str):
+        values = [item.strip() for item in raw_val.split(",") if item.strip()]
+    elif isinstance(raw_val, list):
+        values = [str(item).strip() for item in raw_val if str(item).strip()]
+    else:
+        logger.warning("Invalid value for %s/%s (%r). Using default.", env_var, key, raw_val)
+        return default
+    return values or default
 
 
 _CONFIG_CACHE = _load_config()
@@ -103,15 +148,15 @@ DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 """Default pitch (edge-tts format) when <prosody pitch> is missing."""
 
 SERVER_HOST: str = _cfg("host", "TTS_HOST", "127.0.0.1")
-SERVER_PORT: int = _cfg("port", "TTS_PORT", 5000, coerce=int)
+SERVER_PORT: int = _cfg_int("port", "TTS_PORT", 5000, minimum=1, maximum=65535)
 
-MAX_SSML_LENGTH: int = _cfg("max_ssml_length", "TTS_MAX_SSML_LENGTH", 0, coerce=int)
+MAX_SSML_LENGTH: int = _cfg_int("max_ssml_length", "TTS_MAX_SSML_LENGTH", 0, minimum=0)
 """Maximum SSML payload size in bytes. 0 = unlimited."""
 
-TTS_STALL_TIMEOUT: int = _cfg("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, coerce=int)
+TTS_STALL_TIMEOUT: int = _cfg_int("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, minimum=0)
 """Seconds of silence (no data from edge-tts) before aborting. 0 = disable."""
 
-TTS_MAX_CONCURRENT: int = _cfg("max_concurrent", "TTS_MAX_CONCURRENT", 2, coerce=int)
+TTS_MAX_CONCURRENT: int = _cfg_int("max_concurrent", "TTS_MAX_CONCURRENT", 2, minimum=0)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
 
 _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
@@ -121,17 +166,29 @@ _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
 )
 """Process-wide thread-safe limiter for concurrent TTS generation."""
 
-WAITRESS_THREADS: int = _cfg("waitress_threads", "TTS_WAITRESS_THREADS", 4, coerce=int)
+WAITRESS_THREADS: int = _cfg_int("waitress_threads", "TTS_WAITRESS_THREADS", 4, minimum=1)
 """Number of Waitress worker threads."""
 
-GUNICORN_WORKERS: int = _cfg("gunicorn_workers", "TTS_GUNICORN_WORKERS", 2, coerce=int)
+GUNICORN_WORKERS: int = _cfg_int("gunicorn_workers", "TTS_GUNICORN_WORKERS", 2, minimum=1)
 """Number of Gunicorn worker processes."""
 
-GUNICORN_THREADS: int = _cfg("gunicorn_threads", "TTS_GUNICORN_THREADS", 4, coerce=int)
+GUNICORN_THREADS: int = _cfg_int("gunicorn_threads", "TTS_GUNICORN_THREADS", 4, minimum=1)
 """Threads per Gunicorn worker."""
 
-WSGI_SERVER: str = _cfg("wsgi_server", "TTS_SERVER", "waitress")
+WSGI_SERVER: str = _cfg("wsgi_server", "TTS_SERVER", "waitress").lower()
 """Which WSGI server to use: 'waitress' or 'gunicorn'."""
+
+CORS_ORIGINS: list[str] = _cfg_list(
+    "cors_origins",
+    "TTS_CORS_ORIGINS",
+    [
+        "null",
+        r"^https?://localhost(?::\d+)?$",
+        r"^https?://127\.0\.0\.1(?::\d+)?$",
+        r"^chrome-extension://[a-z]{32}$",
+    ],
+)
+"""Allowed browser origins. Defaults to local files, loopback, and Chrome extensions."""
 
 SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
 """XML namespace URI for the SSML <speak> element."""
@@ -220,6 +277,19 @@ def _locale_display_name(locale: str) -> str:
         region_name = _REGION_NAMES.get(region, region)
         return f"{lang} ({region_name})"
     return _LANG_NAMES.get(locale, locale)
+
+
+def _local_name(element: ET.Element) -> str:
+    """Return the local tag name without an XML namespace."""
+    return element.tag.rsplit("}", 1)[-1] if "}" in element.tag else element.tag
+
+
+def _find_first(element: ET.Element, tag_name: str) -> ET.Element | None:
+    """Find the first descendant matching a local tag name."""
+    for child in element.iter():
+        if _local_name(child) == tag_name:
+            return child
+    return None
 
 
 async def _refresh_voice_cache() -> None:
@@ -380,14 +450,17 @@ def extract_tts_params(ssml: str) -> TTSRequest:
     pitch: str = DEFAULT_PITCH
     text: str = ""
 
+    if _local_name(root) != "speak":
+        raise ValueError("SSML root element must be <speak>.")
+
     # --- <voice> -----------------------------------------------------------
-    voice_el = root.find(f"{{{SSML_NAMESPACE}}}voice")
+    voice_el = _find_first(root, "voice")
     if voice_el is not None:
         voice_name = voice_el.get("name")
         if voice_name:
             voice = voice_name.strip()
 
-        prosody_el = voice_el.find(f"{{{SSML_NAMESPACE}}}prosody")
+        prosody_el = _find_first(voice_el, "prosody")
         if prosody_el is not None:
             rate = _parse_rate(prosody_el.get("rate"))
             pitch = _parse_pitch(prosody_el.get("pitch"))
@@ -494,9 +567,25 @@ def create_app() -> Flask:
     # Don't serve static files or templates — API only
     app.config["PROPAGATE_EXCEPTIONS"] = True  # let WSGI server handle errors
     # Reject oversized request bodies before JSON parsing
-    app.config["MAX_CONTENT_LENGTH"] = max(MAX_SSML_LENGTH * 2, 64 * 1024) if MAX_SSML_LENGTH > 0 else None
+    app.config["MAX_CONTENT_LENGTH"] = (
+        max(MAX_SSML_LENGTH * 2, 64 * 1024)
+        if MAX_SSML_LENGTH > 0
+        else None
+    )
 
-    CORS(app)
+    cors_origins: list[str | re.Pattern[str]] = []
+    for origin in CORS_ORIGINS:
+        if origin.startswith("^"):
+            cors_origins.append(re.compile(origin))
+        else:
+            cors_origins.append(origin)
+    CORS(
+        app,
+        resources={r"/*": {"origins": cors_origins}},
+        methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type"],
+        max_age=3600,
+    )
 
     # Populate voice cache on startup (works with any WSGI entrypoint)
     if not _voice_cache_ready:
@@ -533,6 +622,10 @@ def create_app() -> Flask:
                 "voice_cache_ready": _voice_cache_ready,
             }
         )
+
+    @app.errorhandler(413)
+    def request_entity_too_large(exc: Exception) -> Response:
+        return jsonify({"error": "Request body is too large."}), 413  # type: ignore[return-value]
 
     # -- Voices endpoint -----------------------------------------------------
     @app.route("/voices", methods=["GET"])
@@ -587,7 +680,7 @@ def create_app() -> Flask:
                     audio = await generate_audio(tts_req)
             else:
                 audio = await generate_audio(tts_req)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             logger.error("TTS stall detected after %ds", TTS_STALL_TIMEOUT)
             return jsonify({"error": _error_message(exc)}), 504  # type: ignore[return-value]
         except RuntimeError as exc:
@@ -681,7 +774,7 @@ if __name__ == "__main__":
                 "Gunicorn requested but not installed. Install with: pip install gunicorn"
             )
             sys.exit(1)
-    else:
+    elif WSGI_SERVER == "waitress":
         if PRODUCTION:
             try:
                 from waitress import serve  # type: ignore[import-untyped]
@@ -701,3 +794,6 @@ if __name__ == "__main__":
             # FLASK_DEBUG mode: use Flask dev server
             logger.info("Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT)
             application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
+    else:
+        logger.critical("Unsupported TTS_SERVER value %r. Use 'waitress' or 'gunicorn'.", WSGI_SERVER)
+        sys.exit(1)

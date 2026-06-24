@@ -38,7 +38,7 @@ let allVoices = [];           // raw from server
 let languages = [];           // [{locale, name}]
 let selectedVoice = DEFAULT_VOICE_FALLBACK;
 let activeGender = "all";     // "all" | "Male" | "Female"
-let activeAbortController = null;  // for cancelling in-flight TTS requests
+const activeAbortControllers = new Set();  // for cancelling in-flight TTS requests
 let sentencePipeline = null;      // { sentences, idx, cache, voice, rate, pitch }
 function splitSentences(text) {
   const sentences = text.match(/[^.!?\n。！？．｡]+[.!?。！？．｡]+(\s|$)|[^.!?\n。！？．｡]+$/g) || [text];
@@ -73,16 +73,21 @@ const stopBtn         = $("#stopBtn");
 const downloadTextBtn  = $("#downloadTextBtn");
 const ssmlPreview = $("#ssmlPreview");
 const audioPlayer     = $("#audioPlayer");
-const errorMsg        = $("#errorMsg");
 
 // ---------------------------------------------------------------------------
 // XML escaping
 // ---------------------------------------------------------------------------
 function escapeXML(str) {
-  return str
+  return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function escapeXMLAttribute(str) {
+  return escapeXML(str)
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +100,7 @@ function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
     : (pitchSliderVal > 0 ? "+" : "") + pitchSliderVal + "Hz";
 
   return SSML_TEMPLATE
-    .replace("VOICE_NAME", escapeXML(voice))
+    .replace("VOICE_NAME", escapeXMLAttribute(voice))
     .replace("RATE%", rateAttr)
     .replace("PITCH%", pitchAttr)
     .replace("TEXT_CONTENT", escapeXML(text));
@@ -263,7 +268,7 @@ async function previewVoice(shortName) {
   // Generate a short sample using this voice
   const ssml = buildSSML(shortName, SAMPLE_TEXT, 0, 0);
   try {
-    const blob = await callTTS(ssml);
+    const blob = await callTTS(ssml, 120000, { cancelExisting: true });
     playBlob(blob);
   } catch (err) {
     console.error("Voice preview failed:", err);
@@ -308,11 +313,10 @@ textInputArea.addEventListener("input", updateSSMLPreview);
 // ---------------------------------------------------------------------------
 // TTS API call
 // ---------------------------------------------------------------------------
-async function callTTS(ssml, timeoutMs = 120000) {
-  // Abort any previous request
-  if (activeAbortController) activeAbortController.abort();
+async function callTTS(ssml, timeoutMs = 120000, { cancelExisting = false } = {}) {
+  if (cancelExisting) cancelGeneration();
   const controller = new AbortController();
-  activeAbortController = controller;
+  activeAbortControllers.add(controller);
   const timeout = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
@@ -328,15 +332,14 @@ async function callTTS(ssml, timeoutMs = 120000) {
     return await resp.blob();
   } finally {
     if (timeout) clearTimeout(timeout);
-    activeAbortController = null;
+    activeAbortControllers.delete(controller);
   }
 }
 
 function cancelGeneration() {
-  if (activeAbortController) {
-    activeAbortController.abort();
-    activeAbortController = null;
-  }
+  activeAbortControllers.forEach(controller => controller.abort());
+  activeAbortControllers.clear();
+  sentencePipeline = null;
   previewBtn.textContent = "▶ Preview Audio";
   downloadTextBtn.textContent = "⬇ Download MP3";
 }
@@ -347,7 +350,11 @@ function playBlob(blob) {
   }
   const url = URL.createObjectURL(blob);
   audioPlayer.src = url;
-  audioPlayer.play();
+  audioPlayer.play().catch((err) => {
+    console.error("Audio playback failed:", err);
+    URL.revokeObjectURL(url);
+    hideStopButton();
+  });
   showStopButton();
   audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); };
 }
@@ -391,7 +398,7 @@ downloadSsmlBtn.addEventListener("click", async () => {
   if (!ssml) return alert("Please enter SSML before downloading.");
 
   // If already generating, cancel instead
-  if (activeAbortController) {
+  if (activeAbortControllers.size > 0) {
     cancelGeneration();
     return;
   }
@@ -400,7 +407,7 @@ downloadSsmlBtn.addEventListener("click", async () => {
   downloadSsmlBtn.classList.add("btn-stop-preview");
 
   try {
-    const blob = await callTTS(ssml, 0);  // no timeout for downloads
+    const blob = await callTTS(ssml, 0, { cancelExisting: true });  // no timeout for downloads
     downloadBlob(blob);
   } catch (err) {
     if (err.name !== "AbortError") alert("Error: " + err.message);
@@ -418,8 +425,7 @@ async function startSentencePreview(text, voice, rate, pitch) {
   if (sentences.length === 0) return;
 
   // Stop any existing pipeline
-  sentencePipeline = null;
-  if (activeAbortController) { activeAbortController.abort(); activeAbortController = null; }
+  cancelGeneration();
 
   const cache = new Map();  // idx → blobUrl
   sentencePipeline = { sentences, idx: 0, cache, voice, rate, pitch };
@@ -488,8 +494,11 @@ async function playNextPreviewSentence() {
 
   // Play current sentence
   audioPlayer.src = url;
-  audioPlayer.play();
-  playingFromResults = false;
+  audioPlayer.play().catch((err) => {
+    console.error("Audio playback failed:", err);
+    sentencePipeline = null;
+    hideStopButton();
+  });
 
   audioPlayer.onended = () => {
     if (!sentencePipeline) { hideStopButton(); return; }
@@ -503,7 +512,7 @@ async function handleTextGenerate(preview = false) {
   if (!text) return alert("Please enter text to synthesize.");
 
   // If already generating, cancel instead
-  if (activeAbortController) {
+  if (activeAbortControllers.size > 0) {
     cancelGeneration();
     return;
   }
@@ -522,7 +531,7 @@ async function handleTextGenerate(preview = false) {
   downloadTextBtn.classList.add("btn-stop-preview");
 
   try {
-    const blob = await callTTS(ssml, 0);  // no timeout for downloads
+    const blob = await callTTS(ssml, 0, { cancelExisting: true });  // no timeout for downloads
     downloadBlob(blob);
   } catch (err) {
     if (err.name !== "AbortError") alert("Error: " + err.message);
