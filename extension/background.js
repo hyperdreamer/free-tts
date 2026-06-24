@@ -217,7 +217,7 @@ async function showControlBar(tabId, isPaused) {
           <button id="free-tts-next" title="Next">⏭</button>
           <button id="free-tts-close" title="Stop">✕</button>
         `;
-        bar.style.cssText = "position:fixed;top:56px;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.12);padding:4px 6px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
+        bar.style.cssText = "position:fixed;top:56px;left:50%;transform:translateX(-50%);background:rgba(255,255,255,0.85);backdrop-filter:blur(8px);border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);padding:4px 6px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
         bar.querySelectorAll("button").forEach(b => {
           b.style.cssText = "border:none;background:none;font-size:16px;cursor:pointer;padding:4px 6px;border-radius:5px;color:#555;transition:background 0.15s;line-height:1;";
           b.addEventListener("mouseenter", () => b.style.background = "#f0f0f0");
