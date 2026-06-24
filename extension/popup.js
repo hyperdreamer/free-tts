@@ -110,7 +110,9 @@ async function checkServer() {
       statusDot.title = "Server online";
       return true;
     }
-  } catch {}
+  } catch (error) {
+    console.warn("free-tts popup: server health check failed", error);
+  }
   statusDot.className = "status-dot offline";
   statusDot.title = "Server offline";
   return false;
@@ -129,13 +131,14 @@ async function loadVoices() {
       chrome.storage.sync.set({ voice: defaultVoice }).catch(() => {});
     }
     renderVoiceSelect();
-  } catch {
+  } catch (error) {
+    console.warn("free-tts popup: failed to load voices", error);
     if (voices.length === 0) renderVoiceSelect();
   }
 }
 
 function renderVoiceSelect() {
-  voiceSelect.innerHTML = "";
+  voiceSelect.replaceChildren();
   if (voices.length === 0) {
     const opt = document.createElement("option");
     opt.value = "";

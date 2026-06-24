@@ -219,7 +219,9 @@ async function pausePlayback() {
       target: { tabId: sentencePipeline.tabId },
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); } },
     });
-  } catch {}
+  } catch (error) {
+    logError("pausing playback in page", error);
+  }
   updateStopMenu();
   await updateControlBar(sentencePipeline.tabId, true);
 }
@@ -255,12 +257,18 @@ async function showControlBar(tabId, isPaused) {
         document.getElementById("free-tts-bar")?.remove();
         const bar = document.createElement("div");
         bar.id = "free-tts-bar";
-        bar.innerHTML = `
-          <button id="free-tts-prev" title="Previous">⏮</button>
-          <button id="free-tts-toggle" title="${paused ? "Resume" : "Pause"}">${paused ? "▶" : "⏸"}</button>
-          <button id="free-tts-next" title="Next">⏭</button>
-          <button id="free-tts-close" title="Stop">✕</button>
-        `;
+        [
+          ["free-tts-prev", "Previous", "⏮"],
+          ["free-tts-toggle", paused ? "Resume" : "Pause", paused ? "▶" : "⏸"],
+          ["free-tts-next", "Next", "⏭"],
+          ["free-tts-close", "Stop", "✕"],
+        ].forEach(([id, title, text]) => {
+          const button = document.createElement("button");
+          button.id = id;
+          button.title = title;
+          button.textContent = text;
+          bar.appendChild(button);
+        });
         bar.style.cssText = "position:fixed;top:56px;right:16px;background:rgba(255,255,255,0.85);backdrop-filter:blur(8px);border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.06);padding:2px 4px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
         bar.querySelectorAll("button").forEach(b => {
           b.style.cssText = "border:none;background:none;font-size:14px;cursor:pointer;padding:2px 4px;border-radius:4px;color:#555;transition:background 0.15s;line-height:1;";
@@ -345,7 +353,9 @@ async function showControlBar(tabId, isPaused) {
       },
       args: [isPaused],
     });
-  } catch {}
+  } catch (error) {
+    logError("showing control bar", error);
+  }
 }
 
 async function updateControlBar(tabId, isPaused) {
@@ -358,7 +368,9 @@ async function updateControlBar(tabId, isPaused) {
       },
       args: [isPaused],
     });
-  } catch {}
+  } catch (error) {
+    logError("updating control bar", error);
+  }
 }
 
 async function hideControlBar(tabId) {
@@ -373,7 +385,9 @@ async function hideControlBar(tabId) {
         }
       },
     });
-  } catch {}
+  } catch (error) {
+    logError("hiding control bar", error);
+  }
 }
 
 // --- Prev/next sentence ----------------------------------------------------
@@ -388,7 +402,9 @@ async function prevSentence() {
       target: { tabId: sentencePipeline.tabId },
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
     });
-  } catch {}
+  } catch (error) {
+    logError("stopping current audio before previous sentence", error);
+  }
   updateStopMenu();
   updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
@@ -403,7 +419,9 @@ async function nextSentence() {
       target: { tabId: sentencePipeline.tabId },
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
     });
-  } catch {}
+  } catch (error) {
+    logError("stopping current audio before next sentence", error);
+  }
   updateStopMenu();
   updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
@@ -420,7 +438,9 @@ async function jumpToSentence(idx) {
       target: { tabId: sentencePipeline.tabId },
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
     });
-  } catch {}
+  } catch (error) {
+    logError("stopping current audio before sentence jump", error);
+  }
   updateStopMenu();
   updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
