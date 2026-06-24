@@ -1,23 +1,41 @@
 {
+    "_comment": "free-tts server configuration. Copy this to config.json and edit.",
+
     "host": "127.0.0.1",
+    "_host": "Listen address. Use 0.0.0.0 to accept remote connections.",
+
     "port": 5000,
+    "_port": "Listen port.",
+
     "default_voice": "en-US-AvaMultilingualNeural",
+    "_default_voice": "Fallback voice when SSML omits <voice name>. See GET /voices for options.",
+
     "max_ssml_length": 200000,
+    "_max_ssml_length": "Max SSML payload in bytes. 0 = unlimited.",
+
     "tts_stall_timeout": 60,
+    "_tts_stall_timeout": "Seconds of silence from Microsoft before aborting. 0 = disable.",
+
     "max_concurrent": 2,
-    "cors_origins": [
-        "null",
-        "^https?://localhost(?::\\d+)?$",
-        "^https?://127\\.0\\.0\\.1(?::\\d+)?$"
-    ],
-    "wsgi_server": "waitress",
-    "waitress_threads": 4,
-    "gunicorn_workers": 2,
-    "gunicorn_threads": 4,
+    "_max_concurrent": "Max concurrent TTS generation requests. 0 = unlimited.",
+
     "cors_origins": [
         "null",
         "^https?://localhost(?::\\d+)?$",
         "^https?://127\\.0\\.0\\.1(?::\\d+)?$",
         "^https?://192\\.168\\..*$"
-    ]
+    ],
+    "_cors_origins": "Allowed browser origins. Plain strings or regex patterns (^...$). 'null' = file:// pages.",
+
+    "wsgi_server": "waitress",
+    "_wsgi_server": "WSGI server: 'waitress' or 'gunicorn'.", 
+
+    "waitress_threads": 4,
+    "_waitress_threads": "Waitress worker threads (only when wsgi_server=waitress).",
+
+    "gunicorn_workers": 2,
+    "_gunicorn_workers": "Gunicorn worker processes (only when wsgi_server=gunicorn).",
+
+    "gunicorn_threads": 4,
+    "_gunicorn_threads": "Threads per Gunicorn worker."
 }
