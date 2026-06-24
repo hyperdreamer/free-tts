@@ -270,6 +270,24 @@ async function showControlBar(tabId, isPaused) {
             }
           }
         });
+
+        // --- Drag-select to jump to sentence ---
+        document.addEventListener("mouseup", () => {
+          setTimeout(() => {
+            const sel = window.getSelection();
+            if (!sel || sel.isCollapsed) return;
+            const text = sel.toString().trim();
+            if (!text) return;
+            const sents = window.__freeTtsSentences;
+            if (!sents) return;
+            for (let i = 0; i < sents.length; i++) {
+              if (sents[i].includes(text)) {
+                chrome.runtime.sendMessage({ action: "jumpToSentence", idx: i });
+                return;
+              }
+            }
+          }, 100);
+        });
       },
       args: [isPaused],
     });
