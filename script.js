@@ -40,7 +40,13 @@ let selectedVoice = DEFAULT_VOICE_FALLBACK;
 let results = [];             // { text, voice, rate, pitch, blobUrl }
 let activeGender = "all";     // "all" | "Male" | "Female"
 let activeAbortController = null;  // for cancelling in-flight TTS requests
-let previewTimeout = null;         // for 30s preview limit
+let sentencePipeline = null;      // { sentences, idx, cache, voice, rate, pitch }
+let previewTimeout = null;
+
+function splitSentences(text) {
+  const sentences = text.match(/[^.!?\n。！？．｡]+[.!?。！？．｡]+(\s|$)|[^.!?\n。！？．｡]+$/g) || [text];
+  return sentences.map(s => s.trim()).filter(s => s.length > 0);
+}
 
 // ---------------------------------------------------------------------------
 // DOM refs
@@ -358,12 +364,20 @@ function playBlob(blob) {
   const url = URL.createObjectURL(blob);
   audioPlayer.src = url;
   audioPlayer.play();
+  playingFromResults = false;
   showStopButton();
-  // Auto-stop preview after 30 seconds
-  previewTimeout = setTimeout(() => {
-    stopAudio();
-  }, 30000);
-  audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); clearPreview(); };
+  audioPlayer.onended = () => { hideStopButton(); URL.revokeObjectURL(url); };
+}
+
+function playResultUrl(blobUrl) {
+  if (audioPlayer.src && audioPlayer.src.startsWith("blob:")) {
+    URL.revokeObjectURL(audioPlayer.src);
+  }
+  audioPlayer.src = blobUrl;
+  audioPlayer.play();
+  playingFromResults = true;
+  showStopButton();
+  audioPlayer.onended = () => { hideStopButton(); playingFromResults = false; };
 }
 
 function stopAudio() {
@@ -374,11 +388,7 @@ function stopAudio() {
   }
   audioPlayer.src = "";
   hideStopButton();
-  clearPreview();
-}
-
-function clearPreview() {
-  if (previewTimeout) { clearTimeout(previewTimeout); previewTimeout = null; }
+  playingFromResults = false;
 }
 
 function downloadBlob(blob, filename = "tts-output.mp3") {
@@ -432,6 +442,91 @@ downloadSsmlBtn.addEventListener("click", async () => {
 // ---------------------------------------------------------------------------
 // Text Input: preview & download
 // ---------------------------------------------------------------------------
+async function startSentencePreview(text, voice, rate, pitch) {
+  const sentences = splitSentences(text);
+  if (sentences.length === 0) return;
+
+  // Stop any existing pipeline
+  sentencePipeline = null;
+  if (activeAbortController) { activeAbortController.abort(); activeAbortController = null; }
+
+  const cache = new Map();  // idx → blobUrl
+  sentencePipeline = { sentences, idx: 0, cache, voice, rate, pitch };
+  showStopButton();
+
+  // Pre-fetch first 2 sentences
+  const preload = Math.min(2, sentences.length);
+  for (let i = 0; i < preload; i++) {
+    fetchSentenceBlob(sentences[i], voice, rate, pitch)
+      .then(blob => cache.set(i, URL.createObjectURL(blob)))
+      .catch(() => {});
+  }
+
+  await playNextPreviewSentence();
+}
+
+function stopSentencePreview() {
+  sentencePipeline = null;
+  stopAudio();
+}
+
+async function fetchSentenceBlob(sentence, voice, rate, pitch) {
+  const ssml = buildSSML(voice, sentence, rate, pitch);
+  return await callTTS(ssml, 0);  // no timeout per sentence
+}
+
+async function playNextPreviewSentence() {
+  if (!sentencePipeline) return;
+  const { sentences, idx, cache, voice, rate, pitch } = sentencePipeline;
+  if (idx >= sentences.length) {
+    sentencePipeline = null;
+    hideStopButton();
+    return;
+  }
+
+  // Wait for current sentence to cache
+  let url = cache.get(idx);
+  if (!url) {
+    const start = Date.now();
+    while (!url && Date.now() - start < 10000) {
+      await new Promise(r => setTimeout(r, 200));
+      url = cache.get(idx);
+      if (!sentencePipeline) return;
+    }
+  }
+  if (!url) {
+    try {
+      const blob = await fetchSentenceBlob(sentences[idx], voice, rate, pitch);
+      url = URL.createObjectURL(blob);
+      cache.set(idx, url);
+    } catch {
+      sentencePipeline = null;
+      hideStopButton();
+      return;
+    }
+  }
+
+  // Pre-fetch upcoming sentences
+  for (let i = idx + 1; i < idx + 3 && i < sentences.length; i++) {
+    if (!cache.has(i)) {
+      fetchSentenceBlob(sentences[i], voice, rate, pitch)
+        .then(blob => cache.set(i, URL.createObjectURL(blob)))
+        .catch(() => {});
+    }
+  }
+
+  // Play current sentence
+  audioPlayer.src = url;
+  audioPlayer.play();
+  playingFromResults = false;
+
+  audioPlayer.onended = () => {
+    if (!sentencePipeline) { hideStopButton(); return; }
+    sentencePipeline.idx++;
+    playNextPreviewSentence();
+  };
+}
+
 async function handleTextGenerate(preview = false) {
   const text = textInputArea.value.trim();
   if (!text) return alert("Please enter text to synthesize.");
@@ -447,15 +542,16 @@ async function handleTextGenerate(preview = false) {
   const ssml = buildSSML(selectedVoice, text, rate, pitch);
 
   if (preview) {
-    previewBtn.textContent = "Cancel Preview";
-    previewBtn.classList.add("btn-stop-preview");
-  } else {
-    downloadTextBtn.textContent = "Cancel Download";
-    downloadTextBtn.classList.add("btn-stop-preview");
+    // Use sentence-by-sentence pipeline with caching
+    startSentencePreview(text, selectedVoice, rate, pitch);
+    return;
   }
 
+  downloadTextBtn.textContent = "Cancel Download";
+  downloadTextBtn.classList.add("btn-stop-preview");
+
   try {
-    const blob = await callTTS(ssml, preview ? 120000 : 0);  // preview: 2 min, download: unlimited
+    const blob = await callTTS(ssml, 0);  // no timeout for downloads
 
     // Add to results
     const blobUrl = URL.createObjectURL(blob);
@@ -463,23 +559,20 @@ async function handleTextGenerate(preview = false) {
     if (results.length > 20) results.pop();
     renderResults();
 
-    if (preview) {
-      playBlob(blob);
-    } else {
-      downloadBlob(blob);
-    }
+    downloadBlob(blob);
   } catch (err) {
     if (err.name !== "AbortError") alert("Error: " + err.message);
   } finally {
-    previewBtn.textContent = "▶ Preview Audio";
-    previewBtn.classList.remove("btn-stop-preview");
     downloadTextBtn.textContent = "⬇ Download MP3";
     downloadTextBtn.classList.remove("btn-stop-preview");
   }
 }
 
 previewBtn.addEventListener("click", () => handleTextGenerate(true));
-stopBtn.addEventListener("click", stopAudio);
+stopBtn.addEventListener("click", () => {
+  if (sentencePipeline) stopSentencePreview();
+  else stopAudio();
+});
 downloadTextBtn.addEventListener("click", () => handleTextGenerate(false));
 
 // Selected voice preview button
@@ -488,6 +581,13 @@ voicePreviewBtn.addEventListener("click", () => previewVoice(selectedVoice));
 // ---------------------------------------------------------------------------
 // Results list
 // ---------------------------------------------------------------------------
+function deleteResult(idx) {
+  // Revoke blob URL to prevent memory leak
+  URL.revokeObjectURL(results[idx].blobUrl);
+  results.splice(idx, 1);
+  renderResults();
+}
+
 function renderResults() {
   clearChildren(resultsList);
 
@@ -507,13 +607,23 @@ function renderResults() {
         el("span", { className: "result-voice", textContent: `${voiceLabel} \u00b7 ${r.rate}% speed \u00b7 ${r.pitch}% pitch` }),
       ]),
       el("span", { className: "result-play", dataset: { idx: String(i) }, textContent: "\u25b6" }),
+      el("span", { className: "result-delete", dataset: { idx: String(i) }, textContent: "\u00d7", title: "Delete" }),
     ]);
 
     const playBtn = item.querySelector(".result-play");
     playBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      audioPlayer.src = r.blobUrl;
-      audioPlayer.play();
+      if (playingFromResults) {
+        stopAudio();
+        return;
+      }
+      playResultUrl(r.blobUrl);
+    });
+
+    const delBtn = item.querySelector(".result-delete");
+    delBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteResult(i);
     });
 
     item.addEventListener("click", () => {

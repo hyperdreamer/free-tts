@@ -698,6 +698,19 @@ body {
     flex-shrink: 0;
 }
 
+.result-item .result-delete {
+    color: #ccc;
+    font-size: 18px;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-left: 8px;
+    transition: color 0.15s;
+}
+
+.result-item .result-delete:hover {
+    color: #ff3b30;
+}
+
 .hidden-audio {
     display: none;
 }
