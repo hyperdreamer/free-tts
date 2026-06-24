@@ -7,7 +7,7 @@ const PRELOAD_AHEAD = 2;  // pre-fetch this many sentences ahead
 // Pipeline state
 let activePlayback = { tabId: null };
 let playbackTimeout = null;
-let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl }
+let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused }
 
 function logError(context, error) {
   console.error(`free-tts background: ${context}`, error);
@@ -35,9 +35,11 @@ function clearPlayback() {
 }
 
 function updateStopMenu() {
-  callContextMenuApi("update", "stop-speaking", {
-    visible: !!activePlayback.tabId,
-  }).catch(() => {});
+  const visible = !!activePlayback.tabId;
+  const paused = sentencePipeline?.isPaused || false;
+  callContextMenuApi("update", "stop-speaking", { visible }).catch(() => {});
+  callContextMenuApi("update", "pause-reading", { visible: visible && !paused }).catch(() => {});
+  callContextMenuApi("update", "resume-reading", { visible: visible && paused }).catch(() => {});
 }
 
 async function createContextMenus() {
@@ -50,6 +52,18 @@ async function createContextMenus() {
   await callContextMenuApi("create", {
     id: "stop-speaking",
     title: "Stop speaking",
+    contexts: ["page"],
+    visible: false,
+  });
+  await callContextMenuApi("create", {
+    id: "pause-reading",
+    title: "Pause reading",
+    contexts: ["page"],
+    visible: false,
+  });
+  await callContextMenuApi("create", {
+    id: "resume-reading",
+    title: "Resume reading",
     contexts: ["page"],
     visible: false,
   });
@@ -75,6 +89,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
     if (info.menuItemId === "stop-speaking") {
       await stopPlayback();
+    }
+    if (info.menuItemId === "pause-reading") {
+      await pausePlayback();
+    }
+    if (info.menuItemId === "resume-reading") {
+      await resumePlayback();
     }
   } catch (error) {
     logError("handling context menu click", error);
@@ -133,6 +153,27 @@ async function stopPlayback() {
     }
   }
   clearPlayback();
+}
+
+// --- Pause / Resume ---------------------------------------------------------
+async function pausePlayback() {
+  if (!sentencePipeline) return;
+  sentencePipeline.isPaused = true;
+  // Stop audio in the tab
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: sentencePipeline.tabId },
+      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); } },
+    });
+  } catch {}
+  updateStopMenu();
+}
+
+async function resumePlayback() {
+  if (!sentencePipeline || !sentencePipeline.isPaused) return;
+  sentencePipeline.isPaused = false;
+  updateStopMenu();
+  await playNextSentence();
 }
 
 // --- Sentence splitting ----------------------------------------------------
@@ -267,7 +308,7 @@ async function startSentenceTTS(tabId, text) {
 
   await stopPlayback();
   const cache = new Map();  // idx → dataUrl
-  sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl, speed };
+  sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl, speed, isPaused: false };
   activePlayback = { tabId };
   updateStopMenu();
 
@@ -356,10 +397,18 @@ async function playNextSentence() {
       }, 500);
     });
 
-    // Move to next sentence
+    // Move to next sentence or pause
     if (sentencePipeline) {
-      sentencePipeline.currentIdx++;
-      await playNextSentence();
+      if (sentencePipeline.isPaused) {
+        // Don't advance — just clean up audio, keep state
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => { const s = window.__freeTtsAudio; if (s) { s.src = ""; } },
+        });
+      } else {
+        sentencePipeline.currentIdx++;
+        await playNextSentence();
+      }
     }
   } catch (error) {
     logError(`playing sentence ${currentIdx}`, error);
