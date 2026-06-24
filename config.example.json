@@ -13,5 +13,11 @@
     "wsgi_server": "waitress",
     "waitress_threads": 4,
     "gunicorn_workers": 2,
-    "gunicorn_threads": 4
+    "gunicorn_threads": 4,
+    "cors_origins": [
+        "null",
+        "^https?://localhost(?::\\d+)?$",
+        "^https?://127\\.0\\.0\\.1(?::\\d+)?$",
+        "^https?://192\\.168\\..*$"
+    ]
 }
