@@ -200,6 +200,11 @@ async function highlightCurrentSentence(tabId, idx) {
           overlay.style.cssText = `position:absolute;left:${rect.left + window.scrollX}px;top:${rect.top + window.scrollY}px;width:${rect.width}px;height:${rect.height}px;background:${color};opacity:0.5;pointer-events:none;z-index:999998;transition:background 0.3s;`;
           document.body.appendChild(overlay);
         }
+        // Auto-scroll to the first highlighted sentence
+        if (allRects.length > 0) {
+          const r = allRects[0];
+          window.scrollTo({ left: 0, top: r.top + window.scrollY - window.innerHeight / 3, behavior: "smooth" });
+        }
       },
       args: [idx],
     });
