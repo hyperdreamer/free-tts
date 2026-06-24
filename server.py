@@ -31,6 +31,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import defusedxml.ElementTree as ET  # type: ignore[import-untyped]
 from dataclasses import dataclass
@@ -112,6 +113,13 @@ TTS_STALL_TIMEOUT: int = _cfg("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, coer
 
 TTS_MAX_CONCURRENT: int = _cfg("max_concurrent", "TTS_MAX_CONCURRENT", 2, coerce=int)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
+
+_TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
+    threading.BoundedSemaphore(TTS_MAX_CONCURRENT)
+    if TTS_MAX_CONCURRENT > 0
+    else None
+)
+"""Process-wide thread-safe limiter for concurrent TTS generation."""
 
 WAITRESS_THREADS: int = _cfg("waitress_threads", "TTS_WAITRESS_THREADS", 4, coerce=int)
 """Number of Waitress worker threads."""
@@ -485,17 +493,6 @@ def create_app() -> Flask:
 
     CORS(app)
 
-    # Concurrency limiter — created lazily in request to use correct event loop
-    _tts_semaphore: "asyncio.Semaphore | None" = None
-
-    def _get_semaphore() -> "asyncio.Semaphore | None":
-        nonlocal _tts_semaphore
-        if TTS_MAX_CONCURRENT <= 0:
-            return None
-        if _tts_semaphore is None:
-            _tts_semaphore = asyncio.Semaphore(TTS_MAX_CONCURRENT)
-        return _tts_semaphore
-
     # Populate voice cache on startup (works with any WSGI entrypoint)
     if not _voice_cache_ready:
         try:
@@ -580,9 +577,8 @@ def create_app() -> Flask:
 
         # 2. Synthesise (stall timeout handled inside generate_audio)
         try:
-            sem = _get_semaphore()
-            if sem is not None:
-                async with sem:
+            if _TTS_SEMAPHORE is not None:
+                with _TTS_SEMAPHORE:
                     audio = await generate_audio(tts_req)
             else:
                 audio = await generate_audio(tts_req)
