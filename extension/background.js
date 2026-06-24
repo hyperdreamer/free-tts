@@ -469,6 +469,7 @@ async function playNextSentence() {
   const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = sentencePipeline;
   if (currentIdx >= sentences.length) {
     await cleanupPageHighlighting(tabId);
+    await hideControlBar(tabId);
     clearPlayback();
     return;
   }
