@@ -131,6 +131,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     resumePlayback().then(() => sendResponse({ ok: true }));
     return true;
   }
+  if (msg.action === "prevSentence") {
+    prevSentence().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.action === "nextSentence") {
+    nextSentence().then(() => sendResponse({ ok: true }));
+    return true;
+  }
 });
 
 // --- Keyboard shortcut -----------------------------------------------------
@@ -162,6 +170,7 @@ async function stopPlayback() {
         func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
       });
       await cleanupPageHighlighting(activePlayback.tabId);
+      await hideControlBar(activePlayback.tabId);
     } catch (error) {
       logError("stopping playback in page", error);
     }
@@ -181,12 +190,106 @@ async function pausePlayback() {
     });
   } catch {}
   updateStopMenu();
+  await updateControlBar(sentencePipeline.tabId, true);
 }
 
 async function resumePlayback() {
   if (!sentencePipeline || !sentencePipeline.isPaused) return;
   sentencePipeline.isPaused = false;
   updateStopMenu();
+  await updateControlBar(sentencePipeline.tabId, false);
+  await playNextSentence();
+}
+
+// --- Control bar -----------------------------------------------------------
+async function showControlBar(tabId, isPaused) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (paused) => {
+        // Remove existing bar
+        document.getElementById("free-tts-bar")?.remove();
+        const bar = document.createElement("div");
+        bar.id = "free-tts-bar";
+        bar.innerHTML = `
+          <button id="free-tts-prev" title="Previous">⏮</button>
+          <button id="free-tts-toggle" title="${paused ? "Resume" : "Pause"}">${paused ? "▶" : "⏸"}</button>
+          <button id="free-tts-next" title="Next">⏭</button>
+          <button id="free-tts-close" title="Stop">✕</button>
+        `;
+        bar.style.cssText = "position:fixed;top:16px;right:16px;background:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:6px 10px;z-index:999999;display:flex;gap:2px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;";
+        bar.querySelectorAll("button").forEach(b => {
+          b.style.cssText = "border:none;background:none;font-size:18px;cursor:pointer;padding:6px 8px;border-radius:6px;color:#333;transition:background 0.15s;";
+          b.addEventListener("mouseenter", () => b.style.background = "#f0f0f0");
+          b.addEventListener("mouseleave", () => b.style.background = "none");
+        });
+        document.body.appendChild(bar);
+
+        bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
+        bar.querySelector("#free-tts-next").addEventListener("click", () => chrome.runtime.sendMessage({ action: "nextSentence" }));
+        bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
+          const btn = document.getElementById("free-tts-toggle");
+          if (btn.textContent === "⏸") chrome.runtime.sendMessage({ action: "pausePlayback" });
+          else chrome.runtime.sendMessage({ action: "resumePlayback" });
+        });
+        bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
+      },
+      args: [isPaused],
+    });
+  } catch {}
+}
+
+async function updateControlBar(tabId, isPaused) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (paused) => {
+        const btn = document.getElementById("free-tts-toggle");
+        if (btn) btn.textContent = paused ? "▶" : "⏸";
+      },
+      args: [isPaused],
+    });
+  } catch {}
+}
+
+async function hideControlBar(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => { const b = document.getElementById("free-tts-bar"); if (b) b.remove(); },
+    });
+  } catch {}
+}
+
+// --- Prev/next sentence ----------------------------------------------------
+async function prevSentence() {
+  if (!sentencePipeline || sentencePipeline.currentIdx <= 0) return;
+  sentencePipeline.currentIdx -= 2;  // -2 because playNextSentence increments
+  if (sentencePipeline.currentIdx < 0) sentencePipeline.currentIdx = 0;
+  sentencePipeline.isPaused = false;
+  // Stop current audio
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: sentencePipeline.tabId },
+      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
+    });
+  } catch {}
+  updateStopMenu();
+  updateControlBar(sentencePipeline.tabId, false);
+  await playNextSentence();
+}
+
+async function nextSentence() {
+  if (!sentencePipeline) return;
+  sentencePipeline.isPaused = false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: sentencePipeline.tabId },
+      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
+    });
+  } catch {}
+  updateStopMenu();
+  updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
 }
 
@@ -325,6 +428,7 @@ async function startSentenceTTS(tabId, text) {
   sentencePipeline = { sentences, currentIdx: 0, cache, tabId, voice, serverUrl, speed, isPaused: false };
   activePlayback = { tabId };
   updateStopMenu();
+  await showControlBar(tabId, false);
 
   // Show first sentence immediately
   await initPageHighlighting(tabId, sentences);
