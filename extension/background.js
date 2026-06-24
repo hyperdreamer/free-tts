@@ -139,6 +139,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     nextSentence().then(() => sendResponse({ ok: true }));
     return true;
   }
+  if (msg.action === "jumpToSentence") {
+    jumpToSentence(msg.idx).then(() => sendResponse({ ok: true }));
+    return true;
+  }
 });
 
 // --- Keyboard shortcut -----------------------------------------------------
@@ -251,6 +255,21 @@ async function showControlBar(tabId, isPaused) {
           else chrome.runtime.sendMessage({ action: "resumePlayback" });
         });
         bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
+
+        // --- Double-click to jump to sentence ---
+        document.addEventListener("dblclick", () => {
+          const sel = window.getSelection();
+          if (!sel || !sel.toString().trim()) return;
+          const word = sel.toString().trim();
+          const sents = window.__freeTtsSentences;
+          if (!sents) return;
+          for (let i = 0; i < sents.length; i++) {
+            if (sents[i].includes(word)) {
+              chrome.runtime.sendMessage({ action: "jumpToSentence", idx: i });
+              return;
+            }
+          }
+        });
       },
       args: [isPaused],
     });
@@ -301,6 +320,23 @@ async function nextSentence() {
   if (!sentencePipeline) return;
   sentencePipeline.isPaused = false;
   sentencePipeline.currentIdx++;  // skip to next
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: sentencePipeline.tabId },
+      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
+    });
+  } catch {}
+  updateStopMenu();
+  updateControlBar(sentencePipeline.tabId, false);
+  await playNextSentence();
+}
+
+// --- Jump to sentence -------------------------------------------------------
+async function jumpToSentence(idx) {
+  if (!sentencePipeline) return;
+  if (idx < 0 || idx >= sentencePipeline.sentences.length) return;
+  sentencePipeline.currentIdx = idx;
+  sentencePipeline.isPaused = false;
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
