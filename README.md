@@ -6,15 +6,26 @@ paste SSML or use the visual **Text Input** builder to pick a voice, set speed/p
 
 ## Features
 
-- **SSML tab** — raw SSML editing with live template pre-fill
+### Web frontend
 - **Text Input tab** — visual voice picker with hundreds of voices across many languages
   - Language dropdown + gender filter + voice search
   - Two-column voice list (Preview | Selected)
-  - Speed slider (−50% to +200%)
-  - Pitch slider (−50% to +50%)
-  - Live SSML preview
+  - Speed slider (−50% to +200%) and pitch slider
+  - **Sentence-by-sentence preview** with pre-caching — plays full text, no 30s limit
+  - Live SSML preview panel
+- **SSML tab** — raw SSML editing with live template pre-fill
 - **Server** — Flask + Waitress/Gunicorn, `/voices` endpoint auto-populated from edge-tts on startup
-- **Production-ready** — local-only CORS defaults, SSML size limits, TTS timeout, request logging, graceful shutdown
+- **Production-ready** — configurable CORS origins, SSML size limits, concurrency control, request logging, stall detection, graceful shutdown
+
+### Chrome Extension
+Right-click any text on any page and hear it spoken — Edge-style sentence-by-sentence reading with in-page highlighting.
+
+- **Right-click "Speak this"** — splits text into sentences, plays sequentially with pre-caching
+- **Yellow highlight bar** tracks current sentence on the page with smooth auto-scroll
+- **Keyboard shortcut** `Ctrl+Shift+S` — speaks selected text (or full page if nothing selected)
+- **Popup** — voice selector, speed slider, text input, Speak/Stop buttons
+- **Options** — configurable server URL, highlight color
+- **"Stop speaking"** context menu item appears while audio is playing
 
 ## Quick Start
 
@@ -30,6 +41,15 @@ open index.html
 ```
 
 The server runs on `http://localhost:5000`. Open `index.html` in a browser — it connects to the backend automatically.
+
+### Chrome Extension
+
+1. Start the server first: `python server.py`
+2. Go to `chrome://extensions`, enable **Developer mode**
+3. Click **Load unpacked** → select the `extension/` directory
+4. Right-click any text on any page → **Speak this**
+
+Right-click the extension icon → **Options** to configure the server URL and highlight color.
 
 ## Configuration
 
@@ -98,7 +118,8 @@ Returns all available voices and languages:
   ],
   "voices": [
     {"ShortName": "en-US-AvaMultilingualNeural", "Gender": "Female", "Locale": "en-US", "LanguageName": "English (United States)"}
-  ]
+  ],
+  "default_voice": "en-US-AvaMultilingualNeural"
 }
 ```
 
