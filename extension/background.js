@@ -245,6 +245,18 @@ async function resumePlayback() {
 }
 
 // --- Control bar -----------------------------------------------------------
+async function getLoopState(tabId) {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => window.__freeTtsLoop ?? true,
+    });
+    return result?.result ?? true;
+  } catch {
+    return true;  // default to loop on
+  }
+}
+
 async function showControlBar(tabId, isPaused) {
   try {
     await chrome.scripting.executeScript({
@@ -269,6 +281,19 @@ async function showControlBar(tabId, isPaused) {
           button.textContent = text;
           bar.appendChild(button);
         });
+        // Loop checkbox — checked by default
+        const loopLabel = document.createElement("label");
+        loopLabel.style.cssText = "display:flex;align-items:center;gap:2px;font-size:12px;color:#555;padding:2px 4px;cursor:pointer;border-left:1px solid #ddd;margin-left:2px;";
+        const loopCheck = document.createElement("input");
+        loopCheck.type = "checkbox";
+        loopCheck.id = "free-tts-loop";
+        loopCheck.checked = true;
+        loopCheck.style.cssText = "margin:0;cursor:pointer;";
+        loopCheck.addEventListener("change", () => { window.__freeTtsLoop = loopCheck.checked; });
+        loopLabel.appendChild(loopCheck);
+        loopLabel.appendChild(document.createTextNode("↻"));
+        bar.appendChild(loopLabel);
+        window.__freeTtsLoop = true;
         bar.style.cssText = "position:fixed;top:56px;right:16px;background:rgba(255,255,255,0.85);backdrop-filter:blur(8px);border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.06);padding:2px 4px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
         bar.querySelectorAll("button").forEach(b => {
           b.style.cssText = "border:none;background:none;font-size:14px;cursor:pointer;padding:2px 4px;border-radius:4px;color:#555;transition:background 0.15s;line-height:1;";
@@ -622,6 +647,13 @@ async function playNextSentence() {
   if (!sentencePipeline) return;
   const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = sentencePipeline;
   if (currentIdx >= sentences.length) {
+    // Check loop checkbox state
+    const loopEnabled = await getLoopState(tabId);
+    if (loopEnabled) {
+      sentencePipeline.currentIdx = 0;
+      await playNextSentence();
+      return;
+    }
     await cleanupPageHighlighting(tabId);
     await hideControlBar(tabId);
     clearPlayback();
