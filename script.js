@@ -477,6 +477,7 @@ async function fetchSentenceBlob(sentence, voice, rate, pitch) {
 async function playNextPreviewSentence() {
   if (!sentencePipeline) return;
   const { sentences, idx, cache, voice, rate, pitch } = sentencePipeline;
+  const startIdx = idx;  // guard: exit if external action changed index
   if (idx >= sentences.length) {
     revokeSentenceCache(cache);
     sentencePipeline = null;
@@ -491,7 +492,7 @@ async function playNextPreviewSentence() {
     while (!url && Date.now() - start < 10000) {
       await new Promise(r => setTimeout(r, 200));
       url = cache.get(idx);
-      if (!sentencePipeline) return;
+      if (!sentencePipeline || sentencePipeline.idx !== startIdx) return;
     }
   }
   if (!url) {
@@ -526,7 +527,7 @@ async function playNextPreviewSentence() {
   });
 
   audioPlayer.onended = () => {
-    if (!sentencePipeline) {
+    if (!sentencePipeline || sentencePipeline.idx !== startIdx) {
       revokeSentenceCache(cache);
       hideStopButton();
       return;

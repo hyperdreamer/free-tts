@@ -68,3 +68,27 @@ def test_split_sentences_preserves_punctuation_splitting(relative_path):
 )
 def test_split_sentences_keeps_closing_quotes_with_sentence(relative_path, text, expected):
     assert split_sentences_like_frontend(relative_path, text) == expected
+
+
+# --- Pipeline guard: startIdx prevents concurrent index advancing ----------
+@pytest.mark.parametrize(
+    ("relative_path", "function_name", "guard_line"),
+    [
+        pytest.param(
+            "extension/background.js",
+            "playNextSentence",
+            "const startIdx = currentIdx;",
+            id="extension-speak-this",
+        ),
+        pytest.param(
+            "script.js",
+            "playNextPreviewSentence",
+            "const startIdx = idx;",
+            id="web-preview",
+        ),
+    ],
+)
+def test_pipeline_has_startIdx_guard(relative_path, function_name, guard_line):
+    text = (ROOT / relative_path).read_text(encoding="utf-8")
+    assert f"async function {function_name}" in text, f"{function_name} not found"
+    assert guard_line in text, f"startIdx guard missing in {relative_path} — add 'const startIdx = ...' at top of {function_name}"

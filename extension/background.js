@@ -648,6 +648,7 @@ async function startSentenceTTS(tabId, text) {
 async function playNextSentence() {
   if (!sentencePipeline) return;
   const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = sentencePipeline;
+  const startIdx = currentIdx;  // guard: exit if external action changed index
   if (currentIdx >= sentences.length) {
     // Check loop checkbox state
     const loopEnabled = await getLoopState(tabId);
@@ -669,7 +670,7 @@ async function playNextSentence() {
     while (!dataUrl && Date.now() - start < 10000) {
       await new Promise(r => setTimeout(r, 200));
       dataUrl = cache.get(currentIdx);
-      if (!sentencePipeline) return;  // cancelled
+      if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) return;  // cancelled or index changed
     }
   }
   if (!dataUrl) {
@@ -712,7 +713,7 @@ async function playNextSentence() {
     // Wait for audio to end (polling approach)
     await new Promise((resolve) => {
       const check = setInterval(async () => {
-        if (!sentencePipeline) { clearInterval(check); resolve(); return; }
+        if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) { clearInterval(check); resolve(); return; }
         try {
           const [result] = await chrome.scripting.executeScript({
             target: { tabId },
@@ -723,8 +724,8 @@ async function playNextSentence() {
       }, 500);
     });
 
-    // Move to next sentence or pause
-    if (sentencePipeline) {
+    // Move to next sentence or pause — only if index hasn't been changed externally
+    if (sentencePipeline && sentencePipeline.currentIdx === startIdx) {
       if (sentencePipeline.isPaused) {
         // Don't advance — just clean up audio, keep state
         await chrome.scripting.executeScript({
