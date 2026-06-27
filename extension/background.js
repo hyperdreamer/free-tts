@@ -699,6 +699,7 @@ async function playNextSentence() {
 
   // Highlight current and scroll
   await highlightCurrentSentence(tabId, currentIdx);
+  if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) return;  // index changed during highlight
 
   // Play
   try {
