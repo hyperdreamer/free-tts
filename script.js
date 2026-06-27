@@ -498,6 +498,7 @@ async function playNextPreviewSentence() {
   if (!url) {
     try {
       const blob = await fetchSentenceBlob(sentences[idx], voice, rate, pitch);
+      if (!sentencePipeline || sentencePipeline.idx !== startIdx) return;  // index changed during fetch
       url = URL.createObjectURL(blob);
       cache.set(idx, url);
     } catch {

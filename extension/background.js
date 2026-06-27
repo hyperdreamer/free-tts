@@ -679,6 +679,7 @@ async function playNextSentence() {
     // Fallback: fetch directly
     try {
       dataUrl = await fetchSentenceAudio(serverUrl, voice, speed, sentences[currentIdx]);
+      if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) return;  // index changed during fetch
       cache.set(currentIdx, dataUrl);
     } catch (error) {
       logError(`fetching sentence ${currentIdx}`, error);
