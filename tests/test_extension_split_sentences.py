@@ -50,3 +50,21 @@ def test_split_sentences_keeps_cjk_newline_fragments(relative_path):
 def test_split_sentences_preserves_punctuation_splitting(relative_path):
     text = "One. Two! Three?"
     assert split_sentences_like_frontend(relative_path, text) == ["One.", "Two!", "Three?"]
+
+
+@pytest.mark.parametrize("relative_path", SPLITTER_FILES)
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('He said "Hello." Then left.', ['He said "Hello."', 'Then left.']),
+        ('“Hello.” Then left.', ['“Hello.”', 'Then left.']),
+        ('He said “Hello.”\nThen left.', ['He said “Hello.”', 'Then left.']),
+        ('「你好。」然后走了。', ['「你好。」', '然后走了。']),
+        ('Sentence one." Sentence two.', ['Sentence one."', 'Sentence two.']),
+        ('Sentence one.” Sentence two.', ['Sentence one.”', 'Sentence two.']),
+        ('Sentence one.) Sentence two.', ['Sentence one.)', 'Sentence two.']),
+        ('Sentence one!"\nSentence two?"', ['Sentence one!"', 'Sentence two?"']),
+    ],
+)
+def test_split_sentences_keeps_closing_quotes_with_sentence(relative_path, text, expected):
+    assert split_sentences_like_frontend(relative_path, text) == expected

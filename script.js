@@ -51,7 +51,7 @@ function splitSentences(text) {
   // Split on sentence-ending punctuation and newline-delimited fragments.
   // Text Input preview often contains headings/list items without punctuation;
   // keep those fragments instead of dropping everything before the final line.
-  const sentences = text.match(/[^.!?\n。！？．｡]+(?:[.!?。！？．｡]+|(?=\n|$))/g) || [text];
+  const sentences = text.match(/[^.!?\n。！？．｡]+(?:[.!?。！？．｡]+["'”’»）)\]}」』】》]*|(?=\n|$))/g) || [text];
   return sentences.map(s => s.trim()).filter(s => s.length > 0);
 }
 

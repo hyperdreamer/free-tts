@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "free-tts",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Text-to-speech via Microsoft Edge TTS. Select text, right-click, or use the popup.",
   "permissions": ["contextMenus", "storage", "activeTab", "scripting"],
   "host_permissions": [
