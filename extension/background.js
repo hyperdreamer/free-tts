@@ -473,8 +473,10 @@ async function jumpToSentence(idx) {
 
 // --- Sentence splitting ----------------------------------------------------
 function splitSentences(text) {
-  // Split on sentence-ending punctuation: Latin (.!?) and CJK (。！？．｡)
-  const sentences = text.match(/[^.!?\n。！？．｡]+[.!?。！？．｡]+(\s|$)|[^.!?\n。！？．｡]+$/g) || [text];
+  // Split on sentence-ending punctuation and newline-delimited fragments.
+  // Selected page text often contains headings/list items without punctuation;
+  // keep those fragments instead of dropping everything before the final line.
+  const sentences = text.match(/[^.!?\n。！？．｡]+(?:[.!?。！？．｡]+|(?=\n|$))/g) || [text];
   return sentences.map(s => s.trim()).filter(s => s.length > 0);
 }
 
