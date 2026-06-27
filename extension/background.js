@@ -418,7 +418,9 @@ async function hideControlBar(tabId) {
 // --- Prev/next sentence ----------------------------------------------------
 async function prevSentence() {
   if (!sentencePipeline || sentencePipeline.currentIdx <= 0) return;
-  sentencePipeline.currentIdx -= 2;  // -2 because playNextSentence increments
+  // currentIdx is the sentence currently playing (increment happens only after
+  // playback ends), so go back one to reach the previous sentence.
+  sentencePipeline.currentIdx -= 1;
   if (sentencePipeline.currentIdx < 0) sentencePipeline.currentIdx = 0;
   sentencePipeline.isPaused = false;
   // Stop current audio
