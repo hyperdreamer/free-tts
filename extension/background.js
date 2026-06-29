@@ -175,6 +175,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // --- Keyboard shortcut -----------------------------------------------------
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === "speak-selection") {
+    // Toggle: stop playback if active, otherwise speak selection
+    if (sentencePipeline || activePlayback.tabId) {
+      await stopPlayback();
+      return;
+    }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) return;
     try {
