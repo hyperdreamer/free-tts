@@ -205,6 +205,7 @@ async function stopPlayback() {
       await cleanupMediaSession(activePlayback.tabId);
       await chrome.scripting.executeScript({
         target: { tabId: activePlayback.tabId },
+        world: "MAIN",
         func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
       });
       await cleanupPageHighlighting(activePlayback.tabId);
@@ -224,6 +225,7 @@ async function pausePlayback() {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
+      world: "MAIN",
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); } },
     });
   } catch (error) {
@@ -241,6 +243,7 @@ async function resumePlayback() {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
+      world: "MAIN",
       func: () => {
         const audio = window.__freeTtsAudio;
         if (audio && !audio.ended) audio.play().catch(() => {});
@@ -252,98 +255,95 @@ async function resumePlayback() {
 }
 
 // --- Media Session (system media keys) --------------------------------------
-let mediaSessionPort = null;
+// Media key handling MUST run in the page's MAIN world: action handlers set in
+// the extension's isolated world are never wired to the hardware media keys,
+// and the Audio element they control lives in the MAIN world too. Since MAIN
+// world cannot use chrome.* APIs, prev/next/stop are bridged out via
+// window.postMessage to an isolated-world relay that calls chrome.runtime.
+//
+// play/pause are handled entirely in the page (direct Audio control), so they
+// work even when the service worker is asleep. prev/next/stop need the worker;
+// incoming runtime messages from the relay wake it, and a 25s keepalive ping
+// keeps it alive across pauses so the in-memory pipeline state survives.
 
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "free-tts-media-session") return;
-  mediaSessionPort = port;
-  port.onMessage.addListener(async (msg) => {
-    try {
-      if (msg.action === "mediaPrev") await prevSentence();
-      else if (msg.action === "mediaNext") await nextSentence();
-      else if (msg.action === "stopPlayback") await stopPlayback();
-      else if (msg.action === "ping") { /* keepalive */ }
-    } catch (error) {
-      logError("media session action", error);
+// Relay installed in the ISOLATED world: forwards MAIN-world postMessages to
+// the service worker. Idempotent so repeated setup calls don't stack listeners.
+function injectMediaRelay() {
+  if (window.__freeTtsRelayInstalled) return;
+  window.__freeTtsRelayInstalled = true;
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.__freeTtsMedia !== true || typeof data.action !== "string") return;
+    try { chrome.runtime.sendMessage({ action: data.action }); } catch {}
+  });
+}
+
+// Media session set up in the MAIN world.
+function injectMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  const send = (action) => {
+    try { window.postMessage({ __freeTtsMedia: true, action }, "*"); } catch {}
+  };
+
+  // Play/pause: directly control the Audio element (no service worker needed).
+  navigator.mediaSession.setActionHandler("play", () => {
+    const a = window.__freeTtsAudio;
+    if (a && !a.ended) {
+      a.play().catch(() => {});
+      navigator.mediaSession.playbackState = "playing";
     }
   });
-  port.onDisconnect.addListener(() => {
-    mediaSessionPort = null;
+  navigator.mediaSession.setActionHandler("pause", () => {
+    const a = window.__freeTtsAudio;
+    if (a) {
+      a.pause();
+      navigator.mediaSession.playbackState = "paused";
+    }
   });
-});
+  // Prev/next/stop: bridge to the service worker via the isolated-world relay.
+  navigator.mediaSession.setActionHandler("previoustrack", () => send("prevSentence"));
+  navigator.mediaSession.setActionHandler("nexttrack", () => send("nextSentence"));
+  navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback"));
+
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: "free-tts",
+    artist: "Text-to-Speech",
+    album: document.title || "Web Page",
+  });
+  navigator.mediaSession.playbackState = "playing";
+
+  // Keepalive: ping the worker so prev/next/stop stay responsive while paused.
+  if (window.__freeTtsKeepalive) clearInterval(window.__freeTtsKeepalive);
+  window.__freeTtsKeepalive = setInterval(() => send("ping"), 25000);
+}
+
+function clearMediaSession() {
+  if (window.__freeTtsKeepalive) {
+    clearInterval(window.__freeTtsKeepalive);
+    window.__freeTtsKeepalive = null;
+  }
+  if (!("mediaSession" in navigator)) return;
+  for (const action of ["play", "pause", "previoustrack", "nexttrack", "stop"]) {
+    try { navigator.mediaSession.setActionHandler(action, null); } catch {}
+  }
+  navigator.mediaSession.metadata = null;
+  try { navigator.mediaSession.playbackState = "none"; } catch {}
+}
 
 async function setupMediaSession(tabId) {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        if (!("mediaSession" in navigator)) return;
-
-        let port = chrome.runtime.connect({ name: "free-tts-media-session" });
-        const send = (action) => {
-          try { port.postMessage({ action }); } catch {
-            // Reconnect and retry
-            port = chrome.runtime.connect({ name: "free-tts-media-session" });
-            try { port.postMessage({ action }); } catch {}
-          }
-        };
-        // Ping every 25s to keep service worker alive
-        const keepalive = setInterval(() => send("ping"), 25000);
-
-        // Play/pause: directly control the Audio element (no worker needed)
-        navigator.mediaSession.setActionHandler("play", () => {
-          const a = window.__freeTtsAudio;
-          if (a && !a.ended) a.play().catch(() => {});
-        });
-        navigator.mediaSession.setActionHandler("pause", () => {
-          const a = window.__freeTtsAudio;
-          if (a) a.pause();
-        });
-        // Prev/next/stop: delegate to service worker
-        navigator.mediaSession.setActionHandler("previoustrack", () => send("mediaPrev"));
-        navigator.mediaSession.setActionHandler("nexttrack", () => send("mediaNext"));
-        navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback"));
-
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: "free-tts",
-          artist: "Text-to-Speech",
-          album: document.title || "Web Page",
-        });
-
-        port.onDisconnect.addListener(() => {
-          clearInterval(keepalive);
-          navigator.mediaSession.setActionHandler("play", null);
-          navigator.mediaSession.setActionHandler("pause", null);
-          navigator.mediaSession.setActionHandler("previoustrack", null);
-          navigator.mediaSession.setActionHandler("nexttrack", null);
-          navigator.mediaSession.setActionHandler("stop", null);
-          navigator.mediaSession.metadata = null;
-        });
-      },
-    });
+    // Relay first (isolated world), then handlers (main world).
+    await chrome.scripting.executeScript({ target: { tabId }, func: injectMediaRelay });
+    await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: injectMediaSession });
   } catch (error) {
     logError("setting up media session", error);
   }
 }
 
 async function cleanupMediaSession(tabId) {
-  if (mediaSessionPort) {
-    try { mediaSessionPort.disconnect(); } catch {}
-    mediaSessionPort = null;
-  }
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        if (!("mediaSession" in navigator)) return;
-        navigator.mediaSession.setActionHandler("play", null);
-        navigator.mediaSession.setActionHandler("pause", null);
-        navigator.mediaSession.setActionHandler("previoustrack", null);
-        navigator.mediaSession.setActionHandler("nexttrack", null);
-        navigator.mediaSession.setActionHandler("stop", null);
-        navigator.mediaSession.metadata = null;
-      },
-    });
+    await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: clearMediaSession });
   } catch (error) {
     logError("cleaning up media session", error);
   }
@@ -532,6 +532,7 @@ async function prevSentence() {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
+      world: "MAIN",
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
     });
   } catch (error) {
@@ -549,6 +550,7 @@ async function nextSentence() {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
+      world: "MAIN",
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
     });
   } catch (error) {
@@ -568,6 +570,7 @@ async function jumpToSentence(idx) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
+      world: "MAIN",
       func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
     });
   } catch (error) {
@@ -813,11 +816,13 @@ async function playNextSentence() {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
+      world: "MAIN",
       func: (url) => {
         if (window.__freeTtsAudio) { window.__freeTtsAudio.pause(); }
         const a = new Audio(url);
         a.play().catch(() => {});
         window.__freeTtsAudio = a;
+        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
       },
       args: [dataUrl],
     });
@@ -829,6 +834,7 @@ async function playNextSentence() {
         try {
           const [result] = await chrome.scripting.executeScript({
             target: { tabId },
+            world: "MAIN",
             func: () => window.__freeTtsAudio?.ended ?? true,
           });
           if (result?.result) { clearInterval(check); resolve(); }
@@ -842,6 +848,7 @@ async function playNextSentence() {
         // Don't advance — just clean up audio, keep state
         await chrome.scripting.executeScript({
           target: { tabId },
+          world: "MAIN",
           func: () => { const s = window.__freeTtsAudio; if (s) { s.src = ""; } },
         });
       } else {
