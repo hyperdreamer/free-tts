@@ -170,19 +170,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "jumpToSentence") {
     return sendAsyncResponse(sendResponse, jumpToSentence(msg.idx).then(() => ({ ok: true })));
   }
-  // Media Session actions (triggered by system media keys)
-  if (msg.action === "mediaPause") {
-    return sendAsyncResponse(sendResponse, pausePlayback().then(() => ({ ok: true })));
-  }
-  if (msg.action === "mediaResume") {
-    return sendAsyncResponse(sendResponse, resumePlayback().then(() => ({ ok: true })));
-  }
-  if (msg.action === "mediaPrev") {
-    return sendAsyncResponse(sendResponse, prevSentence().then(() => ({ ok: true })));
-  }
-  if (msg.action === "mediaNext") {
-    return sendAsyncResponse(sendResponse, nextSentence().then(() => ({ ok: true })));
-  }
 });
 
 // --- Keyboard shortcut -----------------------------------------------------
@@ -265,35 +252,53 @@ async function resumePlayback() {
 }
 
 // --- Media Session (system media keys) --------------------------------------
+let mediaSessionPort = null;  // long-lived port to keep service worker alive
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "free-tts-media-session") return;
+  mediaSessionPort = port;
+  port.onMessage.addListener(async (msg) => {
+    try {
+      if (msg.action === "mediaResume") await resumePlayback();
+      else if (msg.action === "mediaPause") await pausePlayback();
+      else if (msg.action === "mediaPrev") await prevSentence();
+      else if (msg.action === "mediaNext") await nextSentence();
+      else if (msg.action === "stopPlayback") await stopPlayback();
+    } catch (error) {
+      logError("media session action", error);
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    mediaSessionPort = null;
+  });
+});
+
 async function setupMediaSession(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
         if (!("mediaSession" in navigator)) return;
-        // Play/pause toggle
-        navigator.mediaSession.setActionHandler("play", () => {
-          chrome.runtime.sendMessage({ action: "mediaResume" }).catch(() => {});
-        });
-        navigator.mediaSession.setActionHandler("pause", () => {
-          chrome.runtime.sendMessage({ action: "mediaPause" }).catch(() => {});
-        });
-        // Prev/next track
-        navigator.mediaSession.setActionHandler("previoustrack", () => {
-          chrome.runtime.sendMessage({ action: "mediaPrev" }).catch(() => {});
-        });
-        navigator.mediaSession.setActionHandler("nexttrack", () => {
-          chrome.runtime.sendMessage({ action: "mediaNext" }).catch(() => {});
-        });
-        // Stop
-        navigator.mediaSession.setActionHandler("stop", () => {
-          chrome.runtime.sendMessage({ action: "stopPlayback" }).catch(() => {});
-        });
-        // Set metadata so OS media overlay shows the extension
+        const port = chrome.runtime.connect({ name: "free-tts-media-session" });
+        const send = (action) => port.postMessage({ action });
+        navigator.mediaSession.setActionHandler("play", () => send("mediaResume"));
+        navigator.mediaSession.setActionHandler("pause", () => send("mediaPause"));
+        navigator.mediaSession.setActionHandler("previoustrack", () => send("mediaPrev"));
+        navigator.mediaSession.setActionHandler("nexttrack", () => send("mediaNext"));
+        navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback"));
         navigator.mediaSession.metadata = new MediaMetadata({
           title: "free-tts",
           artist: "Text-to-Speech",
           album: document.title || "Web Page",
+        });
+        // Clean up on port disconnect (service worker killed)
+        port.onDisconnect.addListener(() => {
+          navigator.mediaSession.setActionHandler("play", null);
+          navigator.mediaSession.setActionHandler("pause", null);
+          navigator.mediaSession.setActionHandler("previoustrack", null);
+          navigator.mediaSession.setActionHandler("nexttrack", null);
+          navigator.mediaSession.setActionHandler("stop", null);
+          navigator.mediaSession.metadata = null;
         });
       },
     });
@@ -303,6 +308,10 @@ async function setupMediaSession(tabId) {
 }
 
 async function cleanupMediaSession(tabId) {
+  if (mediaSessionPort) {
+    try { mediaSessionPort.disconnect(); } catch {}
+    mediaSessionPort = null;
+  }
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
