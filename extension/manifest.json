@@ -40,21 +40,12 @@
       "description": "Speak selected text (toggle stop when playing)"
     },
     "pause-resume": {
-      "suggested_key": {
-        "default": "MediaPlayPause"
-      },
       "description": "Pause or resume reading"
     },
     "prev-sentence": {
-      "suggested_key": {
-        "default": "MediaPreviousTrack"
-      },
       "description": "Previous sentence"
     },
     "next-sentence": {
-      "suggested_key": {
-        "default": "MediaNextTrack"
-      },
       "description": "Next sentence"
     }
   },
