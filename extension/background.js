@@ -252,18 +252,17 @@ async function resumePlayback() {
 }
 
 // --- Media Session (system media keys) --------------------------------------
-let mediaSessionPort = null;  // long-lived port to keep service worker alive
+let mediaSessionPort = null;
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "free-tts-media-session") return;
   mediaSessionPort = port;
   port.onMessage.addListener(async (msg) => {
     try {
-      if (msg.action === "mediaResume") await resumePlayback();
-      else if (msg.action === "mediaPause") await pausePlayback();
-      else if (msg.action === "mediaPrev") await prevSentence();
+      if (msg.action === "mediaPrev") await prevSentence();
       else if (msg.action === "mediaNext") await nextSentence();
       else if (msg.action === "stopPlayback") await stopPlayback();
+      else if (msg.action === "ping") { /* keepalive */ }
     } catch (error) {
       logError("media session action", error);
     }
@@ -279,20 +278,40 @@ async function setupMediaSession(tabId) {
       target: { tabId },
       func: () => {
         if (!("mediaSession" in navigator)) return;
-        const port = chrome.runtime.connect({ name: "free-tts-media-session" });
-        const send = (action) => port.postMessage({ action });
-        navigator.mediaSession.setActionHandler("play", () => send("mediaResume"));
-        navigator.mediaSession.setActionHandler("pause", () => send("mediaPause"));
+
+        let port = chrome.runtime.connect({ name: "free-tts-media-session" });
+        const send = (action) => {
+          try { port.postMessage({ action }); } catch {
+            // Reconnect and retry
+            port = chrome.runtime.connect({ name: "free-tts-media-session" });
+            try { port.postMessage({ action }); } catch {}
+          }
+        };
+        // Ping every 25s to keep service worker alive
+        const keepalive = setInterval(() => send("ping"), 25000);
+
+        // Play/pause: directly control the Audio element (no worker needed)
+        navigator.mediaSession.setActionHandler("play", () => {
+          const a = window.__freeTtsAudio;
+          if (a && !a.ended) a.play().catch(() => {});
+        });
+        navigator.mediaSession.setActionHandler("pause", () => {
+          const a = window.__freeTtsAudio;
+          if (a) a.pause();
+        });
+        // Prev/next/stop: delegate to service worker
         navigator.mediaSession.setActionHandler("previoustrack", () => send("mediaPrev"));
         navigator.mediaSession.setActionHandler("nexttrack", () => send("mediaNext"));
         navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback"));
+
         navigator.mediaSession.metadata = new MediaMetadata({
           title: "free-tts",
           artist: "Text-to-Speech",
           album: document.title || "Web Page",
         });
-        // Clean up on port disconnect (service worker killed)
+
         port.onDisconnect.addListener(() => {
+          clearInterval(keepalive);
           navigator.mediaSession.setActionHandler("play", null);
           navigator.mediaSession.setActionHandler("pause", null);
           navigator.mediaSession.setActionHandler("previoustrack", null);
