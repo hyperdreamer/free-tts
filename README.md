@@ -21,11 +21,13 @@ paste SSML or use the visual **Text Input** builder to pick a voice, set speed/p
 Right-click any text on any page and hear it spoken — Edge-style sentence-by-sentence reading with in-page highlighting.
 
 - **Right-click "Speak this"** — splits text into sentences, plays sequentially with pre-caching
-- **Yellow highlight bar** tracks current sentence on the page with smooth auto-scroll
-- **Keyboard shortcut** `Ctrl+Shift+S` — speaks selected text (or full page if nothing selected)
-- **Popup** — voice selector, speed slider, text input, Speak/Stop buttons
-- **Options** — configurable server URL, highlight color
-- **"Stop speaking"** context menu item appears while audio is playing
+- **Floating control bar** — prev/next sentence, pause/resume, stop, loop checkbox. Draggable anywhere on the page.
+- **Yellow highlight overlays** track the current sentence with smooth auto-scroll
+- **Sentence jumping** — double-click a word or drag-select text to jump directly to that sentence
+- **Keyboard shortcut** `Ctrl+Shift+U` — toggles: speaks selection/full page when idle, stops playback when active
+- **Popup** — voice selector, speed slider, text input, Speak/Pause/Stop buttons
+- **Context menu** — "Stop speaking", "Pause reading", "Resume reading" appear dynamically
+- **Options** — configurable server URL (host + port) and highlight color
 
 ## Quick Start
 
@@ -49,7 +51,7 @@ The server runs on `http://localhost:5000`. Open `index.html` in a browser — i
 3. Click **Load unpacked** → select the `extension/` directory
 4. Right-click any text on any page → **Speak this**
 
-Right-click the extension icon → **Options** to configure the server URL and highlight color.
+Right-click the extension icon → **Options** to configure the server host, port, and highlight color.
 
 ## Configuration
 
