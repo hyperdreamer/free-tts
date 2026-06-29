@@ -101,3 +101,20 @@ def test_play_pause_sync_worker_state():
     assert "updateControlBar(" in body
     # The sync path must NOT re-issue audio control (the page already did it).
     assert "__freeTtsAudio" not in body, "syncPausedState must not touch the Audio element"
+
+
+def test_loop_checkbox_syncs_to_worker_pipeline():
+    src = _source()
+    assert 'msg.action === "setLoopState"' in src, "loop state message not routed"
+    assert "sentencePipeline.loopEnabled = msg.enabled !== false" in src
+    assert 'chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked })' in src
+
+
+def test_loop_decision_uses_worker_owned_state_before_injected_fallback():
+    src = _source()
+    match = re.search(r"async function getLoopState\(.*?\n}\n", src, re.DOTALL)
+    assert match, "getLoopState body not found"
+    body = match.group(0)
+    assert "sentencePipeline?.tabId === tabId" in body
+    assert "sentencePipeline.loopEnabled !== false" in body
+    assert "document.getElementById(\"free-tts-loop\")?.checked" in body

@@ -8,7 +8,7 @@ const FETCH_TIMEOUT_MS = 120000;
 // Pipeline state
 let activePlayback = { tabId: null };
 let playbackTimeout = null;
-let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused }
+let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled }
 
 function logError(context, error) {
   console.error(`free-tts background: ${context}`, error);
@@ -178,6 +178,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.action === "jumpToSentence") {
     return sendAsyncResponse(sendResponse, jumpToSentence(msg.idx).then(() => ({ ok: true })));
+  }
+  if (msg.action === "setLoopState") {
+    if (sentencePipeline && sender.tab?.id === sentencePipeline.tabId) {
+      sentencePipeline.loopEnabled = msg.enabled !== false;
+    }
+    sendResponse({ ok: true });
+    return false;
   }
 });
 
@@ -374,10 +381,11 @@ async function cleanupMediaSession(tabId) {
 
 // --- Control bar -----------------------------------------------------------
 async function getLoopState(tabId) {
+  if (sentencePipeline?.tabId === tabId) return sentencePipeline.loopEnabled !== false;
   try {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => window.__freeTtsLoop ?? true,
+      func: () => document.getElementById("free-tts-loop")?.checked ?? window.__freeTtsLoop ?? true,
     });
     return result?.result ?? true;
   } catch {
@@ -385,11 +393,11 @@ async function getLoopState(tabId) {
   }
 }
 
-async function showControlBar(tabId, isPaused) {
+async function showControlBar(tabId, isPaused, loopEnabled = true) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (paused) => {
+      func: (paused, initialLoopEnabled) => {
         // Remove existing bar
         if (typeof window.__freeTtsCleanupControlBar === "function") {
           window.__freeTtsCleanupControlBar();
@@ -415,13 +423,16 @@ async function showControlBar(tabId, isPaused) {
         const loopCheck = document.createElement("input");
         loopCheck.type = "checkbox";
         loopCheck.id = "free-tts-loop";
-        loopCheck.checked = true;
+        loopCheck.checked = initialLoopEnabled !== false;
         loopCheck.style.cssText = "margin:0;cursor:pointer;";
-        loopCheck.addEventListener("change", () => { window.__freeTtsLoop = loopCheck.checked; });
+        loopCheck.addEventListener("change", () => {
+          window.__freeTtsLoop = loopCheck.checked;
+          chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked });
+        });
         loopLabel.appendChild(loopCheck);
         loopLabel.appendChild(document.createTextNode("↻"));
         bar.appendChild(loopLabel);
-        window.__freeTtsLoop = true;
+        window.__freeTtsLoop = initialLoopEnabled !== false;
         bar.style.cssText = "position:fixed;top:56px;right:16px;background:rgba(255,255,255,0.85);backdrop-filter:blur(8px);border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.06);padding:2px 4px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
         bar.querySelectorAll("button").forEach(b => {
           b.style.cssText = "border:none;background:none;font-size:14px;cursor:pointer;padding:2px 4px;border-radius:4px;color:#555;transition:background 0.15s;line-height:1;";
@@ -504,7 +515,7 @@ async function showControlBar(tabId, isPaused) {
           delete window.__freeTtsCleanupControlBar;
         };
       },
-      args: [isPaused],
+      args: [isPaused, loopEnabled],
     });
   } catch (error) {
     logError("showing control bar", error);
@@ -758,10 +769,11 @@ async function startSentenceTTS(tabId, text) {
     serverUrl: normalizeServerUrl(serverUrl),
     speed: normalizeSpeed(speed),
     isPaused: false,
+    loopEnabled: true,
   };
   activePlayback = { tabId };
   updateStopMenu();
-  await showControlBar(tabId, false);
+  await showControlBar(tabId, false, sentencePipeline.loopEnabled);
 
   // Set up Media Session for system media keys (play/pause/prev/next)
   await setupMediaSession(tabId);
