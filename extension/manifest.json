@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "free-tts",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Text-to-speech via Microsoft Edge TTS. Select text, right-click, or use the popup.",
   "permissions": [
     "contextMenus",
@@ -37,7 +37,25 @@
       "suggested_key": {
         "default": "Ctrl+Shift+U"
       },
-      "description": "Speak selected text"
+      "description": "Speak selected text (toggle stop when playing)"
+    },
+    "pause-resume": {
+      "suggested_key": {
+        "default": "MediaPlayPause"
+      },
+      "description": "Pause or resume reading"
+    },
+    "prev-sentence": {
+      "suggested_key": {
+        "default": "MediaPreviousTrack"
+      },
+      "description": "Previous sentence"
+    },
+    "next-sentence": {
+      "suggested_key": {
+        "default": "MediaNextTrack"
+      },
+      "description": "Next sentence"
     }
   },
   "options_ui": {

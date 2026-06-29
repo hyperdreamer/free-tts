@@ -193,6 +193,31 @@ chrome.commands.onCommand.addListener(async (command) => {
       // scripting permission may not be available on all URLs
       logError("handling keyboard shortcut", error);
     }
+    return;
+  }
+
+  if (command === "pause-resume") {
+    if (!sentencePipeline) return;
+    if (sentencePipeline.isPaused) {
+      await resumePlayback();
+    } else {
+      await pausePlayback();
+    }
+    return;
+  }
+
+  if (command === "prev-sentence") {
+    if (sentencePipeline && !sentencePipeline.isPaused) {
+      await prevSentence();
+    }
+    return;
+  }
+
+  if (command === "next-sentence") {
+    if (sentencePipeline && !sentencePipeline.isPaused) {
+      await nextSentence();
+    }
+    return;
   }
 });
 
