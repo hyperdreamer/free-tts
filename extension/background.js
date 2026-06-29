@@ -170,6 +170,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "jumpToSentence") {
     return sendAsyncResponse(sendResponse, jumpToSentence(msg.idx).then(() => ({ ok: true })));
   }
+  // Media Session actions (triggered by system media keys)
+  if (msg.action === "mediaPause") {
+    return sendAsyncResponse(sendResponse, pausePlayback().then(() => ({ ok: true })));
+  }
+  if (msg.action === "mediaResume") {
+    return sendAsyncResponse(sendResponse, resumePlayback().then(() => ({ ok: true })));
+  }
+  if (msg.action === "mediaPrev") {
+    return sendAsyncResponse(sendResponse, prevSentence().then(() => ({ ok: true })));
+  }
+  if (msg.action === "mediaNext") {
+    return sendAsyncResponse(sendResponse, nextSentence().then(() => ({ ok: true })));
+  }
 });
 
 // --- Keyboard shortcut -----------------------------------------------------
@@ -195,30 +208,6 @@ chrome.commands.onCommand.addListener(async (command) => {
     }
     return;
   }
-
-  if (command === "pause-resume") {
-    if (!sentencePipeline) return;
-    if (sentencePipeline.isPaused) {
-      await resumePlayback();
-    } else {
-      await pausePlayback();
-    }
-    return;
-  }
-
-  if (command === "prev-sentence") {
-    if (sentencePipeline && !sentencePipeline.isPaused) {
-      await prevSentence();
-    }
-    return;
-  }
-
-  if (command === "next-sentence") {
-    if (sentencePipeline && !sentencePipeline.isPaused) {
-      await nextSentence();
-    }
-    return;
-  }
 });
 
 // --- Stop playback ---------------------------------------------------------
@@ -226,6 +215,7 @@ async function stopPlayback() {
   sentencePipeline = null;
   if (activePlayback.tabId) {
     try {
+      await cleanupMediaSession(activePlayback.tabId);
       await chrome.scripting.executeScript({
         target: { tabId: activePlayback.tabId },
         func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
@@ -271,6 +261,63 @@ async function resumePlayback() {
     });
   } catch (error) {
     logError("resuming playback in page", error);
+  }
+}
+
+// --- Media Session (system media keys) --------------------------------------
+async function setupMediaSession(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (!("mediaSession" in navigator)) return;
+        // Play/pause toggle
+        navigator.mediaSession.setActionHandler("play", () => {
+          chrome.runtime.sendMessage({ action: "mediaResume" }).catch(() => {});
+        });
+        navigator.mediaSession.setActionHandler("pause", () => {
+          chrome.runtime.sendMessage({ action: "mediaPause" }).catch(() => {});
+        });
+        // Prev/next track
+        navigator.mediaSession.setActionHandler("previoustrack", () => {
+          chrome.runtime.sendMessage({ action: "mediaPrev" }).catch(() => {});
+        });
+        navigator.mediaSession.setActionHandler("nexttrack", () => {
+          chrome.runtime.sendMessage({ action: "mediaNext" }).catch(() => {});
+        });
+        // Stop
+        navigator.mediaSession.setActionHandler("stop", () => {
+          chrome.runtime.sendMessage({ action: "stopPlayback" }).catch(() => {});
+        });
+        // Set metadata so OS media overlay shows the extension
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: "free-tts",
+          artist: "Text-to-Speech",
+          album: document.title || "Web Page",
+        });
+      },
+    });
+  } catch (error) {
+    logError("setting up media session", error);
+  }
+}
+
+async function cleanupMediaSession(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (!("mediaSession" in navigator)) return;
+        navigator.mediaSession.setActionHandler("play", null);
+        navigator.mediaSession.setActionHandler("pause", null);
+        navigator.mediaSession.setActionHandler("previoustrack", null);
+        navigator.mediaSession.setActionHandler("nexttrack", null);
+        navigator.mediaSession.setActionHandler("stop", null);
+        navigator.mediaSession.metadata = null;
+      },
+    });
+  } catch (error) {
+    logError("cleaning up media session", error);
   }
 }
 
@@ -661,6 +708,9 @@ async function startSentenceTTS(tabId, text) {
   activePlayback = { tabId };
   updateStopMenu();
   await showControlBar(tabId, false);
+
+  // Set up Media Session for system media keys (play/pause/prev/next)
+  await setupMediaSession(tabId);
 
   // Show first sentence immediately
   await initPageHighlighting(tabId, sentences);
