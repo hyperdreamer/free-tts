@@ -161,6 +161,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "resumePlayback") {
     return sendAsyncResponse(sendResponse, resumePlayback().then(() => ({ ok: true })));
   }
+  // Media keys already paused/played the Audio element in the page; only sync
+  // worker state (pipeline + control bar + context menu) without re-issuing
+  // audio control.
+  if (msg.action === "mediaPause") {
+    return sendAsyncResponse(sendResponse, syncPausedState(true).then(() => ({ ok: true })));
+  }
+  if (msg.action === "mediaResume") {
+    return sendAsyncResponse(sendResponse, syncPausedState(false).then(() => ({ ok: true })));
+  }
   if (msg.action === "prevSentence") {
     return sendAsyncResponse(sendResponse, prevSentence().then(() => ({ ok: true })));
   }
@@ -254,6 +263,16 @@ async function resumePlayback() {
   }
 }
 
+// Sync worker state after a media key already paused/resumed the Audio element
+// in the page. Updates the pipeline flag, context menu, and control bar without
+// re-issuing audio control (the page already did it, with lower latency).
+async function syncPausedState(paused) {
+  if (!sentencePipeline || sentencePipeline.isPaused === paused) return;
+  sentencePipeline.isPaused = paused;
+  updateStopMenu();
+  await updateControlBar(sentencePipeline.tabId, paused);
+}
+
 // --- Media Session (system media keys) --------------------------------------
 // Media key handling MUST run in the page's MAIN world: action handlers set in
 // the extension's isolated world are never wired to the hardware media keys,
@@ -286,13 +305,16 @@ function injectMediaSession() {
     try { window.postMessage({ __freeTtsMedia: true, action }, "*"); } catch {}
   };
 
-  // Play/pause: directly control the Audio element (no service worker needed).
+  // Play/pause: directly control the Audio element for latency (no service
+  // worker round-trip), then notify the worker so it syncs sentencePipeline
+  // state and the floating control bar / context menu.
   navigator.mediaSession.setActionHandler("play", () => {
     const a = window.__freeTtsAudio;
     if (a && !a.ended) {
       a.play().catch(() => {});
       navigator.mediaSession.playbackState = "playing";
     }
+    send("mediaResume");
   });
   navigator.mediaSession.setActionHandler("pause", () => {
     const a = window.__freeTtsAudio;
@@ -300,6 +322,7 @@ function injectMediaSession() {
       a.pause();
       navigator.mediaSession.playbackState = "paused";
     }
+    send("mediaPause");
   });
   // Prev/next/stop: bridge to the service worker via the isolated-world relay.
   navigator.mediaSession.setActionHandler("previoustrack", () => send("prevSentence"));

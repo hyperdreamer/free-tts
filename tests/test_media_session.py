@@ -78,3 +78,26 @@ def test_keepalive_ping_present():
     src = _source()
     assert 'send("ping")' in src, "25s keepalive ping missing"
     assert "msg.action === \"ping\"" not in src, "ping must be a no-op runtime message, not a port message"
+
+
+def test_play_pause_sync_worker_state():
+    """Media-key play/pause control the Audio element in-page for latency, but
+    must ALSO notify the worker so sentencePipeline.isPaused, the context menu,
+    and the floating control bar stay in sync."""
+    src = _source()
+    # MAIN-world handlers bridge a sync message out alongside the direct control.
+    assert 'send("mediaResume")' in src, "play handler must notify worker"
+    assert 'send("mediaPause")' in src, "pause handler must notify worker"
+    # The worker routes those to a state-sync path.
+    assert 'msg.action === "mediaPause"' in src, "mediaPause not routed"
+    assert 'msg.action === "mediaResume"' in src, "mediaResume not routed"
+    # Sync must touch the pipeline flag, context menu, and control bar.
+    assert "function syncPausedState" in src, "syncPausedState helper missing"
+    match = re.search(r"function syncPausedState\(.*?\n}\n", src, re.DOTALL)
+    assert match, "syncPausedState body not found"
+    body = match.group(0)
+    assert "isPaused" in body
+    assert "updateStopMenu()" in body
+    assert "updateControlBar(" in body
+    # The sync path must NOT re-issue audio control (the page already did it).
+    assert "__freeTtsAudio" not in body, "syncPausedState must not touch the Audio element"
