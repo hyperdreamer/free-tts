@@ -31,6 +31,7 @@ function normalizeServerUrl(value) {
     url.hash = "";
     return url.toString().replace(/\/$/, "");
   } catch {
+    console.warn("free-tts: invalid server URL, falling back to default:", value);
     return DEFAULT_SERVER;
   }
 }

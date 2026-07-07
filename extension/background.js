@@ -24,6 +24,7 @@ function normalizeServerUrl(value) {
     url.hash = "";
     return url.toString().replace(/\/$/, "");
   } catch {
+    console.warn("free-tts: invalid server URL, falling back to default:", value);
     return DEFAULT_SERVER;
   }
 }
@@ -301,7 +302,7 @@ function injectMediaRelay() {
     if (event.source !== window) return;
     const data = event.data;
     if (!data || data.__freeTtsMedia !== true || typeof data.action !== "string") return;
-    try { chrome.runtime.sendMessage({ action: data.action }); } catch {}
+    try { chrome.runtime.sendMessage({ action: data.action }).catch(() => {}); } catch {}
   });
 }
 
@@ -916,3 +917,8 @@ ${escapeXML(text)}
     </voice>
 </speak>`;
 }
+
+// Reset context menu state on service worker restart (state is wiped, menus persist)
+callContextMenuApi("update", "stop-speaking", { visible: false }).catch(() => {});
+callContextMenuApi("update", "pause-reading", { visible: false }).catch(() => {});
+callContextMenuApi("update", "resume-reading", { visible: false }).catch(() => {});
