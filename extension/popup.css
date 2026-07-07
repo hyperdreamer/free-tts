@@ -61,6 +61,50 @@ body {
 
 .options-link:hover { color: #333; }
 
+/* Server config (toggled by gear icon) */
+.server-config {
+  display: none;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.server-config.show { display: flex; }
+
+.server-config label {
+  font-size: 11px;
+  color: #666;
+  white-space: nowrap;
+}
+
+.server-config input {
+  padding: 4px 6px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+}
+
+.server-config input:focus { border-color: #0071e3; }
+
+#hostInput { flex: 1; min-width: 0; }
+
+#portInput { width: 55px; }
+
+.server-config input.invalid { border-color: #ff3b30; }
+
+.more-link {
+  font-size: 14px;
+  color: #999;
+  cursor: pointer;
+  text-decoration: none;
+  margin-left: 2px;
+}
+
+.more-link:hover { color: #333; }
+
 /* Voice */
 .voice-select {
   width: 100%;

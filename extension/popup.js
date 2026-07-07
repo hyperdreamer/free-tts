@@ -9,8 +9,12 @@ const speedSlider  = document.getElementById("speedSlider");
 const speedVal     = document.getElementById("speedVal");
 const speakBtn     = document.getElementById("speakBtn");
 const stopBtn      = document.getElementById("stopBtn");
-const optionsLink  = document.getElementById("optionsLink");
-const statusDot    = document.getElementById("statusDot");
+const optionsLink     = document.getElementById("optionsLink");
+const statusDot       = document.getElementById("statusDot");
+const hostInput       = document.getElementById("hostInput");
+const portInput       = document.getElementById("portInput");
+const serverConfig    = document.getElementById("serverConfig");
+const moreOptionsLink = document.getElementById("moreOptionsLink");
 
 let serverUrl = DEFAULT_SERVER;
 let voices = [];
@@ -37,10 +41,42 @@ function normalizeSpeed(value) {
   return Math.min(200, Math.max(-50, speed));
 }
 
+function parseUrl(serverUrl) {
+  try {
+    const url = new URL(serverUrl || DEFAULT_SERVER);
+    return { host: url.hostname, port: url.port };
+  } catch {
+    return { host: "localhost", port: "5000" };
+  }
+}
+
+async function applyServerConfig() {
+  const host = (hostInput.value || "").trim() || "localhost";
+  const port = Number.parseInt(portInput.value, 10);
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    portInput.classList.add("invalid");
+    return;
+  }
+  const url = `http://${host}:${port}`;
+  const normalized = normalizeServerUrl(url);
+  if (normalized === serverUrl) {
+    portInput.classList.remove("invalid");
+    return;
+  }
+  serverUrl = normalized;
+  portInput.classList.remove("invalid");
+  await chrome.storage.sync.set({ serverUrl: normalized }).catch(() => {});
+  await checkServer();
+  await loadVoices();
+}
+
 // --- Init ------------------------------------------------------------------
 async function init() {
   const { serverUrl: stored } = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER });
   serverUrl = normalizeServerUrl(stored);
+  const parsed = parseUrl(serverUrl);
+  hostInput.value = parsed.host;
+  portInput.value = parsed.port;
 
   // Load saved default voice
   const { voice: savedVoice } = await chrome.storage.sync.get({ voice: DEFAULT_VOICE });
@@ -97,7 +133,15 @@ async function init() {
   stopBtn.addEventListener("click", () => stop());
   optionsLink.addEventListener("click", (event) => {
     event.preventDefault();
+    serverConfig.classList.toggle("show");
+  });
+  moreOptionsLink.addEventListener("click", () => {
     chrome.runtime.openOptionsPage();
+  });
+  hostInput.addEventListener("blur", () => applyServerConfig());
+  portInput.addEventListener("blur", () => applyServerConfig());
+  portInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") applyServerConfig();
   });
 }
 
