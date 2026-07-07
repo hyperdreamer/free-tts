@@ -112,10 +112,14 @@ def _cfg_int(
     """Resolve and clamp an integer config value."""
     value = int(_cfg(key, env_var, default, coerce=int))
     if minimum is not None and value < minimum:
-        logger.warning("%s/%s below minimum %d; using %d.", env_var, key, minimum, default)
+        logger.warning(
+            "%s/%s below minimum %d; using %d.", env_var, key, minimum, default
+        )
         return default
     if maximum is not None and value > maximum:
-        logger.warning("%s/%s above maximum %d; using %d.", env_var, key, maximum, default)
+        logger.warning(
+            "%s/%s above maximum %d; using %d.", env_var, key, maximum, default
+        )
         return default
     return value
 
@@ -131,14 +135,18 @@ def _cfg_list(key: str, env_var: str, default: list[str]) -> list[str]:
     elif isinstance(raw_val, list):
         values = [str(item).strip() for item in raw_val if str(item).strip()]
     else:
-        logger.warning("Invalid value for %s/%s (%r). Using default.", env_var, key, raw_val)
+        logger.warning(
+            "Invalid value for %s/%s (%r). Using default.", env_var, key, raw_val
+        )
         return default
     return values or default
 
 
 _CONFIG_CACHE = _load_config()
 
-DEFAULT_VOICE: str = _cfg("default_voice", "TTS_DEFAULT_VOICE", "en-US-AvaMultilingualNeural")
+DEFAULT_VOICE: str = _cfg(
+    "default_voice", "TTS_DEFAULT_VOICE", "en-US-AvaMultilingualNeural"
+)
 """Default voice name used when the SSML omits a <voice> element."""
 
 DEFAULT_RATE: str = _cfg("default_rate", "TTS_DEFAULT_RATE", "+0%")
@@ -150,29 +158,37 @@ DEFAULT_PITCH: str = _cfg("default_pitch", "TTS_DEFAULT_PITCH", "+0Hz")
 SERVER_HOST: str = _cfg("host", "TTS_HOST", "127.0.0.1")
 SERVER_PORT: int = _cfg_int("port", "TTS_PORT", 5000, minimum=1, maximum=65535)
 
-MAX_SSML_LENGTH: int = _cfg_int("max_ssml_length", "TTS_MAX_SSML_LENGTH", 200_000, minimum=0)
+MAX_SSML_LENGTH: int = _cfg_int(
+    "max_ssml_length", "TTS_MAX_SSML_LENGTH", 200_000, minimum=0
+)
 """Maximum SSML payload size in bytes. 0 = unlimited."""
 
-TTS_STALL_TIMEOUT: int = _cfg_int("tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, minimum=0)
+TTS_STALL_TIMEOUT: int = _cfg_int(
+    "tts_stall_timeout", "TTS_STALL_TIMEOUT", 60, minimum=0
+)
 """Seconds of silence (no data from edge-tts) before aborting. 0 = disable."""
 
 TTS_MAX_CONCURRENT: int = _cfg_int("max_concurrent", "TTS_MAX_CONCURRENT", 2, minimum=0)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
 
 _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
-    threading.BoundedSemaphore(TTS_MAX_CONCURRENT)
-    if TTS_MAX_CONCURRENT > 0
-    else None
+    threading.BoundedSemaphore(TTS_MAX_CONCURRENT) if TTS_MAX_CONCURRENT > 0 else None
 )
 """Process-wide thread-safe limiter for concurrent TTS generation."""
 
-WAITRESS_THREADS: int = _cfg_int("waitress_threads", "TTS_WAITRESS_THREADS", 4, minimum=1)
+WAITRESS_THREADS: int = _cfg_int(
+    "waitress_threads", "TTS_WAITRESS_THREADS", 4, minimum=1
+)
 """Number of Waitress worker threads."""
 
-GUNICORN_WORKERS: int = _cfg_int("gunicorn_workers", "TTS_GUNICORN_WORKERS", 2, minimum=1)
+GUNICORN_WORKERS: int = _cfg_int(
+    "gunicorn_workers", "TTS_GUNICORN_WORKERS", 2, minimum=1
+)
 """Number of Gunicorn worker processes."""
 
-GUNICORN_THREADS: int = _cfg_int("gunicorn_threads", "TTS_GUNICORN_THREADS", 4, minimum=1)
+GUNICORN_THREADS: int = _cfg_int(
+    "gunicorn_threads", "TTS_GUNICORN_THREADS", 4, minimum=1
+)
 """Threads per Gunicorn worker."""
 
 WSGI_SERVER: str = _cfg("wsgi_server", "TTS_SERVER", "waitress").lower()
@@ -211,56 +227,192 @@ _LANGUAGE_LIST: list[dict[str, str]] = []
 # Locale → display name mapping (ISO 639-1 language + ISO 3166-1 region)
 # ---------------------------------------------------------------------------
 _LANG_NAMES: dict[str, str] = {
-    "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
-    "hy": "Armenian", "az": "Azerbaijani", "bn": "Bangla", "eu": "Basque",
-    "bs": "Bosnian", "bg": "Bulgarian", "my": "Burmese", "ca": "Catalan",
-    "yue": "Cantonese", "zh": "Chinese", "hr": "Croatian", "cs": "Czech",
-    "da": "Danish", "nl": "Dutch", "en": "English", "et": "Estonian",
-    "fil": "Filipino", "fi": "Finnish", "fr": "French", "gl": "Galician",
-    "ka": "Georgian", "de": "German", "el": "Greek", "gu": "Gujarati",
-    "he": "Hebrew", "hi": "Hindi", "hu": "Hungarian", "is": "Icelandic",
-    "id": "Indonesian", "ga": "Irish", "it": "Italian", "ja": "Japanese",
-    "jv": "Javanese", "kn": "Kannada", "kk": "Kazakh", "km": "Khmer",
-    "ko": "Korean", "lo": "Lao", "lv": "Latvian", "lt": "Lithuanian",
-    "mk": "Macedonian", "ms": "Malay", "ml": "Malayalam", "mt": "Maltese",
-    "mr": "Marathi", "mn": "Mongolian", "ne": "Nepali", "nb": "Norwegian",
-    "ps": "Pashto", "fa": "Persian", "pl": "Polish", "pt": "Portuguese",
-    "pa": "Punjabi", "ro": "Romanian", "ru": "Russian", "sr": "Serbian",
-    "si": "Sinhala", "sk": "Slovak", "sl": "Slovenian", "so": "Somali",
-    "es": "Spanish", "su": "Sundanese", "sw": "Swahili", "sv": "Swedish",
-    "ta": "Tamil", "te": "Telugu", "th": "Thai", "tr": "Turkish",
-    "uk": "Ukrainian", "ur": "Urdu", "uz": "Uzbek", "vi": "Vietnamese",
-    "cy": "Welsh", "zu": "Zulu",
+    "af": "Afrikaans",
+    "sq": "Albanian",
+    "am": "Amharic",
+    "ar": "Arabic",
+    "hy": "Armenian",
+    "az": "Azerbaijani",
+    "bn": "Bangla",
+    "eu": "Basque",
+    "bs": "Bosnian",
+    "bg": "Bulgarian",
+    "my": "Burmese",
+    "ca": "Catalan",
+    "yue": "Cantonese",
+    "zh": "Chinese",
+    "hr": "Croatian",
+    "cs": "Czech",
+    "da": "Danish",
+    "nl": "Dutch",
+    "en": "English",
+    "et": "Estonian",
+    "fil": "Filipino",
+    "fi": "Finnish",
+    "fr": "French",
+    "gl": "Galician",
+    "ka": "Georgian",
+    "de": "German",
+    "el": "Greek",
+    "gu": "Gujarati",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hu": "Hungarian",
+    "is": "Icelandic",
+    "id": "Indonesian",
+    "ga": "Irish",
+    "it": "Italian",
+    "ja": "Japanese",
+    "jv": "Javanese",
+    "kn": "Kannada",
+    "kk": "Kazakh",
+    "km": "Khmer",
+    "ko": "Korean",
+    "lo": "Lao",
+    "lv": "Latvian",
+    "lt": "Lithuanian",
+    "mk": "Macedonian",
+    "ms": "Malay",
+    "ml": "Malayalam",
+    "mt": "Maltese",
+    "mr": "Marathi",
+    "mn": "Mongolian",
+    "ne": "Nepali",
+    "nb": "Norwegian",
+    "ps": "Pashto",
+    "fa": "Persian",
+    "pl": "Polish",
+    "pt": "Portuguese",
+    "pa": "Punjabi",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "sr": "Serbian",
+    "si": "Sinhala",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "so": "Somali",
+    "es": "Spanish",
+    "su": "Sundanese",
+    "sw": "Swahili",
+    "sv": "Swedish",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "th": "Thai",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
+    "uz": "Uzbek",
+    "vi": "Vietnamese",
+    "cy": "Welsh",
+    "zu": "Zulu",
 }
 
 _REGION_NAMES: dict[str, str] = {
-    "AE": "United Arab Emirates", "AR": "Argentina", "AT": "Austria",
-    "AU": "Australia", "BD": "Bangladesh", "BE": "Belgium", "BG": "Bulgaria",
-    "BH": "Bahrain", "BO": "Bolivia", "BR": "Brazil", "CA": "Canada",
-    "CH": "Switzerland", "CL": "Chile", "CN": "China", "CO": "Colombia",
-    "CR": "Costa Rica", "CU": "Cuba", "CY": "Cyprus", "CZ": "Czechia",
-    "DE": "Germany", "DK": "Denmark", "DO": "Dominican Republic",
-    "DZ": "Algeria", "EC": "Ecuador", "EE": "Estonia", "EG": "Egypt",
-    "ES": "Spain", "ET": "Ethiopia", "FI": "Finland", "FR": "France",
-    "GB": "United Kingdom", "GH": "Ghana", "GR": "Greece", "GT": "Guatemala",
-    "GQ": "Equatorial Guinea", "HK": "Hong Kong", "HN": "Honduras",
-    "HR": "Croatia", "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland",
-    "IL": "Israel", "IN": "India", "IQ": "Iraq", "IS": "Iceland",
-    "IT": "Italy", "JM": "Jamaica", "JO": "Jordan", "JP": "Japan",
-    "KE": "Kenya", "KH": "Cambodia", "KR": "South Korea", "KW": "Kuwait",
-    "LB": "Lebanon", "LK": "Sri Lanka", "LT": "Lithuania", "LV": "Latvia",
-    "LY": "Libya", "MA": "Morocco", "MK": "North Macedonia", "MN": "Mongolia",
-    "MT": "Malta", "MX": "Mexico", "MY": "Malaysia", "NG": "Nigeria",
-    "NI": "Nicaragua", "NL": "Netherlands", "NO": "Norway", "NP": "Nepal",
-    "NZ": "New Zealand", "OM": "Oman", "PA": "Panama", "PE": "Peru",
-    "PH": "Philippines", "PK": "Pakistan", "PL": "Poland", "PR": "Puerto Rico",
-    "PT": "Portugal", "PY": "Paraguay", "QA": "Qatar", "RO": "Romania",
-    "RS": "Serbia", "RU": "Russia", "SA": "Saudi Arabia", "SE": "Sweden",
-    "SG": "Singapore", "SI": "Slovenia", "SK": "Slovakia", "SN": "Senegal",
-    "SV": "El Salvador", "SY": "Syria", "TH": "Thailand", "TN": "Tunisia",
-    "TR": "Turkey", "TW": "Taiwan", "TZ": "Tanzania", "UA": "Ukraine",
-    "UG": "Uganda", "US": "United States", "UY": "Uruguay", "VE": "Venezuela",
-    "VN": "Vietnam", "YE": "Yemen", "ZA": "South Africa", "ZW": "Zimbabwe",
+    "AE": "United Arab Emirates",
+    "AR": "Argentina",
+    "AT": "Austria",
+    "AU": "Australia",
+    "BD": "Bangladesh",
+    "BE": "Belgium",
+    "BG": "Bulgaria",
+    "BH": "Bahrain",
+    "BO": "Bolivia",
+    "BR": "Brazil",
+    "CA": "Canada",
+    "CH": "Switzerland",
+    "CL": "Chile",
+    "CN": "China",
+    "CO": "Colombia",
+    "CR": "Costa Rica",
+    "CU": "Cuba",
+    "CY": "Cyprus",
+    "CZ": "Czechia",
+    "DE": "Germany",
+    "DK": "Denmark",
+    "DO": "Dominican Republic",
+    "DZ": "Algeria",
+    "EC": "Ecuador",
+    "EE": "Estonia",
+    "EG": "Egypt",
+    "ES": "Spain",
+    "ET": "Ethiopia",
+    "FI": "Finland",
+    "FR": "France",
+    "GB": "United Kingdom",
+    "GH": "Ghana",
+    "GR": "Greece",
+    "GT": "Guatemala",
+    "GQ": "Equatorial Guinea",
+    "HK": "Hong Kong",
+    "HN": "Honduras",
+    "HR": "Croatia",
+    "HU": "Hungary",
+    "ID": "Indonesia",
+    "IE": "Ireland",
+    "IL": "Israel",
+    "IN": "India",
+    "IQ": "Iraq",
+    "IS": "Iceland",
+    "IT": "Italy",
+    "JM": "Jamaica",
+    "JO": "Jordan",
+    "JP": "Japan",
+    "KE": "Kenya",
+    "KH": "Cambodia",
+    "KR": "South Korea",
+    "KW": "Kuwait",
+    "LB": "Lebanon",
+    "LK": "Sri Lanka",
+    "LT": "Lithuania",
+    "LV": "Latvia",
+    "LY": "Libya",
+    "MA": "Morocco",
+    "MK": "North Macedonia",
+    "MN": "Mongolia",
+    "MT": "Malta",
+    "MX": "Mexico",
+    "MY": "Malaysia",
+    "NG": "Nigeria",
+    "NI": "Nicaragua",
+    "NL": "Netherlands",
+    "NO": "Norway",
+    "NP": "Nepal",
+    "NZ": "New Zealand",
+    "OM": "Oman",
+    "PA": "Panama",
+    "PE": "Peru",
+    "PH": "Philippines",
+    "PK": "Pakistan",
+    "PL": "Poland",
+    "PR": "Puerto Rico",
+    "PT": "Portugal",
+    "PY": "Paraguay",
+    "QA": "Qatar",
+    "RO": "Romania",
+    "RS": "Serbia",
+    "RU": "Russia",
+    "SA": "Saudi Arabia",
+    "SE": "Sweden",
+    "SG": "Singapore",
+    "SI": "Slovenia",
+    "SK": "Slovakia",
+    "SN": "Senegal",
+    "SV": "El Salvador",
+    "SY": "Syria",
+    "TH": "Thailand",
+    "TN": "Tunisia",
+    "TR": "Turkey",
+    "TW": "Taiwan",
+    "TZ": "Tanzania",
+    "UA": "Ukraine",
+    "UG": "Uganda",
+    "US": "United States",
+    "UY": "Uruguay",
+    "VE": "Venezuela",
+    "VN": "Vietnam",
+    "YE": "Yemen",
+    "ZA": "South Africa",
+    "ZW": "Zimbabwe",
 }
 
 
@@ -339,10 +491,7 @@ async def _refresh_voice_cache() -> None:
     _LANGUAGE_LIST.clear()
     _LANGUAGE_LIST.extend(
         sorted(
-            [
-                {"locale": loc, "name": name}
-                for loc, name in seen_locales.items()
-            ],
+            [{"locale": loc, "name": name} for loc, name in seen_locales.items()],
             key=lambda x: x["name"].lower(),
         )
     )
@@ -473,9 +622,7 @@ def extract_tts_params(ssml: str) -> TTSRequest:
             text = " ".join(prosody_el.itertext()).strip()
         else:
             text = " ".join(voice_el.itertext()).strip()
-            logger.warning(
-                "No <prosody> inside <voice>; using default rate/pitch."
-            )
+            logger.warning("No <prosody> inside <voice>; using default rate/pitch.")
     else:
         text = " ".join(root.itertext()).strip()
         logger.warning(
@@ -574,9 +721,7 @@ def create_app() -> Flask:
     app.config["PROPAGATE_EXCEPTIONS"] = True  # let WSGI server handle errors
     # Reject oversized request bodies before JSON parsing
     app.config["MAX_CONTENT_LENGTH"] = (
-        max(MAX_SSML_LENGTH * 2, 64 * 1024)
-        if MAX_SSML_LENGTH > 0
-        else None
+        max(MAX_SSML_LENGTH * 2, 64 * 1024) if MAX_SSML_LENGTH > 0 else None
     )
 
     cors_origins: list[str | re.Pattern[str]] = []
@@ -798,11 +943,22 @@ if __name__ == "__main__":
                 SERVER_PORT,
                 WAITRESS_THREADS,
             )
-            serve(application, host=SERVER_HOST, port=SERVER_PORT, threads=WAITRESS_THREADS, _quiet=True)
+            serve(
+                application,
+                host=SERVER_HOST,
+                port=SERVER_PORT,
+                threads=WAITRESS_THREADS,
+                _quiet=True,
+            )
         else:
             # FLASK_DEBUG mode: use Flask dev server
-            logger.info("Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT)
+            logger.info(
+                "Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT
+            )
             application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
     else:
-        logger.critical("Unsupported TTS_SERVER value %r. Use 'waitress' or 'gunicorn'.", WSGI_SERVER)
+        logger.critical(
+            "Unsupported TTS_SERVER value %r. Use 'waitress' or 'gunicorn'.",
+            WSGI_SERVER,
+        )
         sys.exit(1)

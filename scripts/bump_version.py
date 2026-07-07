@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bump version across all project references: VERSION, extension/manifest.json."""
+
 import json
 import sys
 from pathlib import Path
