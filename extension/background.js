@@ -49,93 +49,11 @@ function sendAsyncResponse(sendResponse, promise) {
   return true;
 }
 
-function callContextMenuApi(method, ...args) {
-  return new Promise((resolve, reject) => {
-    try {
-      chrome.contextMenus[method](...args, () => {
-        const error = chrome.runtime.lastError;
-        if (error) reject(new Error(error.message));
-        else resolve();
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-}
-
 function clearPlayback() {
   activePlayback = { tabId: null };
   if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
   sentencePipeline = null;
-  updateStopMenu();
 }
-
-function updateStopMenu() {
-  const visible = !!activePlayback.tabId;
-  const paused = sentencePipeline?.isPaused || false;
-  callContextMenuApi("update", "stop-speaking", { visible }).catch(() => {});
-  callContextMenuApi("update", "pause-reading", { visible: visible && !paused }).catch(() => {});
-  callContextMenuApi("update", "resume-reading", { visible: visible && paused }).catch(() => {});
-}
-
-async function createContextMenus() {
-  await callContextMenuApi("removeAll");
-  await callContextMenuApi("create", {
-    id: "speak-selection",
-    title: "Speak this",
-    contexts: ["selection"],
-  });
-  await callContextMenuApi("create", {
-    id: "stop-speaking",
-    title: "Stop speaking",
-    contexts: ["page"],
-    visible: false,
-  });
-  await callContextMenuApi("create", {
-    id: "pause-reading",
-    title: "Pause reading",
-    contexts: ["page"],
-    visible: false,
-  });
-  await callContextMenuApi("create", {
-    id: "resume-reading",
-    title: "Resume reading",
-    contexts: ["page"],
-    visible: false,
-  });
-}
-
-// --- Context menu ----------------------------------------------------------
-chrome.runtime.onInstalled.addListener(() => {
-  createContextMenus().catch((error) => logError("creating context menus on install", error));
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  createContextMenus().catch((error) => logError("creating context menus on startup", error));
-});
-
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  try {
-    if (info.menuItemId === "speak-selection") {
-      const text = info.selectionText?.trim();
-      if (!tab?.id || !text) return;
-      await startSentenceTTS(tab.id, text);
-      return;
-    }
-
-    if (info.menuItemId === "stop-speaking") {
-      await stopPlayback();
-    }
-    if (info.menuItemId === "pause-reading") {
-      await pausePlayback();
-    }
-    if (info.menuItemId === "resume-reading") {
-      await resumePlayback();
-    }
-  } catch (error) {
-    logError("handling context menu click", error);
-  }
-});
 
 // --- Messages from popup ---------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -248,14 +166,12 @@ async function pausePlayback() {
   } catch (error) {
     logError("pausing playback in page", error);
   }
-  updateStopMenu();
   await updateControlBar(sentencePipeline.tabId, true);
 }
 
 async function resumePlayback() {
   if (!sentencePipeline || !sentencePipeline.isPaused) return;
   sentencePipeline.isPaused = false;
-  updateStopMenu();
   await updateControlBar(sentencePipeline.tabId, false);
   try {
     await chrome.scripting.executeScript({
@@ -277,7 +193,6 @@ async function resumePlayback() {
 async function syncPausedState(paused) {
   if (!sentencePipeline || sentencePipeline.isPaused === paused) return;
   sentencePipeline.isPaused = paused;
-  updateStopMenu();
   await updateControlBar(sentencePipeline.tabId, paused);
 }
 
@@ -472,6 +387,13 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
         });
         bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
 
+        // --- ESC key stops playback ---
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") {
+            chrome.runtime.sendMessage({ action: "stopPlayback" });
+          }
+        }, { once: false });
+
         // --- Double-click to jump to sentence ---
         const onDoubleClick = () => {
           const sel = window.getSelection();
@@ -573,7 +495,6 @@ async function prevSentence() {
   } catch (error) {
     logError("stopping current audio before previous sentence", error);
   }
-  updateStopMenu();
   updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
 }
@@ -591,7 +512,6 @@ async function nextSentence() {
   } catch (error) {
     logError("stopping current audio before next sentence", error);
   }
-  updateStopMenu();
   updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
 }
@@ -611,7 +531,6 @@ async function jumpToSentence(idx) {
   } catch (error) {
     logError("stopping current audio before sentence jump", error);
   }
-  updateStopMenu();
   updateControlBar(sentencePipeline.tabId, false);
   await playNextSentence();
 }
@@ -773,7 +692,6 @@ async function startSentenceTTS(tabId, text) {
     loopEnabled: true,
   };
   activePlayback = { tabId };
-  updateStopMenu();
   await showControlBar(tabId, false, sentencePipeline.loopEnabled);
 
   // Set up Media Session for system media keys (play/pause/prev/next)
@@ -918,7 +836,3 @@ ${escapeXML(text)}
 </speak>`;
 }
 
-// Reset context menu state on service worker restart (state is wiped, menus persist)
-callContextMenuApi("update", "stop-speaking", { visible: false }).catch(() => {});
-callContextMenuApi("update", "pause-reading", { visible: false }).catch(() => {});
-callContextMenuApi("update", "resume-reading", { visible: false }).catch(() => {});

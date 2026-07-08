@@ -3,9 +3,8 @@
   "name": "free-tts",
   "version": "0.0.0",
   "minimum_chrome_version": "103",
-  "description": "Text-to-speech via Microsoft Edge TTS. Select text, right-click, or use the popup.",
+  "description": "Text-to-speech via Microsoft Edge TTS. Select text or use the popup.",
   "permissions": [
-    "contextMenus",
     "storage",
     "activeTab",
     "scripting"
