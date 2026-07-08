@@ -171,6 +171,11 @@ TTS_STALL_TIMEOUT: int = _cfg_int(
 TTS_MAX_CONCURRENT: int = _cfg_int("max_concurrent", "TTS_MAX_CONCURRENT", 2, minimum=0)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
 
+TTS_QUEUE_TIMEOUT: int = _cfg_int(
+    "queue_timeout", "TTS_QUEUE_TIMEOUT", 30, minimum=5
+)
+"""Seconds to wait for a TTS slot before returning 503. Minimum 5s."""
+
 _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
     threading.BoundedSemaphore(TTS_MAX_CONCURRENT) if TTS_MAX_CONCURRENT > 0 else None
 )
@@ -222,6 +227,9 @@ _LANGUAGE_MAP: dict[str, str] = {}
 
 _LANGUAGE_LIST: list[dict[str, str]] = []
 """Unique languages for the frontend dropdown, sorted by display name."""
+
+_cache_lock = threading.Lock()
+"""Serialises voice-cache mutations; reads are lock-free."""
 
 # ---------------------------------------------------------------------------
 # Locale → display name mapping (ISO 639-1 language + ISO 3166-1 region)
@@ -481,21 +489,19 @@ async def _refresh_voice_cache() -> None:
             }
         )
 
-    # Mutate in-place so imported references stay valid
-    _voice_cache.clear()
-    _voice_cache.extend(new_voices)
-
-    _LANGUAGE_MAP.clear()
-    _LANGUAGE_MAP.update(seen_locales)
-
-    _LANGUAGE_LIST.clear()
-    _LANGUAGE_LIST.extend(
-        sorted(
-            [{"locale": loc, "name": name} for loc, name in seen_locales.items()],
-            key=lambda x: x["name"].lower(),
-        )
+    # Build the language list locally (no I/O).
+    new_language_list = sorted(
+        [{"locale": loc, "name": name} for loc, name in seen_locales.items()],
+        key=lambda x: x["name"].lower(),
     )
-    _voice_cache_ready = True
+
+    # Atomically swap all four globals under the write-side lock.
+    with _cache_lock:
+        _voice_cache[:] = new_voices
+        _LANGUAGE_MAP.clear()
+        _LANGUAGE_MAP.update(seen_locales)
+        _LANGUAGE_LIST[:] = new_language_list
+        _voice_cache_ready = True
 
     logger.info(
         "Voice cache refreshed: %d voices across %d languages.",
@@ -836,8 +842,15 @@ def create_app() -> Flask:
         # 2. Synthesise (stall timeout handled inside generate_audio)
         try:
             if _TTS_SEMAPHORE is not None:
-                with _TTS_SEMAPHORE:
+                acquired = _TTS_SEMAPHORE.acquire(timeout=TTS_QUEUE_TIMEOUT)
+                if not acquired:
+                    resp = jsonify({"error": "Server busy, try again later."})
+                    resp.headers["Retry-After"] = str(TTS_QUEUE_TIMEOUT)
+                    return resp, 503  # type: ignore[return-value]
+                try:
                     audio = await generate_audio(tts_req)
+                finally:
+                    _TTS_SEMAPHORE.release()
             else:
                 audio = await generate_audio(tts_req)
         except TimeoutError as exc:
