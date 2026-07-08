@@ -7,7 +7,6 @@ const FETCH_TIMEOUT_MS = 120000;
 
 // Pipeline state
 let activePlayback = { tabId: null };
-let playbackTimeout = null;
 let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled }
 
 function logError(context, error) {
@@ -18,7 +17,7 @@ function normalizeServerUrl(value) {
   try {
     const url = new URL(value || DEFAULT_SERVER);
     if (!["http:", "https:"].includes(url.protocol)) return DEFAULT_SERVER;
-    if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) return DEFAULT_SERVER;
+    if (!["localhost", "127.0.0.1", "::1"].includes(url.hostname)) return DEFAULT_SERVER;
     url.pathname = url.pathname.replace(/\/+$/, "");
     url.search = "";
     url.hash = "";
@@ -51,7 +50,6 @@ function sendAsyncResponse(sendResponse, promise) {
 
 function clearPlayback() {
   activePlayback = { tabId: null };
-  if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
   sentencePipeline = null;
 }
 
@@ -388,11 +386,12 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
         bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
 
         // --- ESC key stops playback ---
-        document.addEventListener("keydown", (e) => {
+        const onKeyDown = (e) => {
           if (e.key === "Escape") {
             chrome.runtime.sendMessage({ action: "stopPlayback" });
           }
-        }, { once: false });
+        };
+        document.addEventListener("keydown", onKeyDown);
 
         // --- Double-click to jump to sentence ---
         const onDoubleClick = () => {
@@ -434,6 +433,7 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
           document.removeEventListener("mouseup", onDragMouseUp);
           document.removeEventListener("dblclick", onDoubleClick);
           document.removeEventListener("mouseup", onSelectionMouseUp);
+          document.removeEventListener("keydown", onKeyDown);
           document.getElementById("free-tts-bar")?.remove();
           delete window.__freeTtsCleanupControlBar;
         };

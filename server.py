@@ -738,6 +738,12 @@ def create_app() -> Flask:
         max_age=3600,
     )
 
+    # Custom 500 handler — ensures JSON error contract even when Flask's
+    # internal error handling is bypassed (PROPAGATE_EXCEPTIONS = True).
+    @app.errorhandler(500)
+    def _handle_500(error):
+        return jsonify({"error": "Internal server error"}), 500
+
     # Populate voice cache on startup (works with any WSGI entrypoint)
     if not _voice_cache_ready:
         try:

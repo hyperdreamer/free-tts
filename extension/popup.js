@@ -25,7 +25,7 @@ function normalizeServerUrl(value) {
   try {
     const url = new URL(value || DEFAULT_SERVER);
     if (!["http:", "https:"].includes(url.protocol)) return DEFAULT_SERVER;
-    if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) return DEFAULT_SERVER;
+    if (!["localhost", "127.0.0.1", "::1"].includes(url.hostname)) return DEFAULT_SERVER;
     url.pathname = url.pathname.replace(/\/+$/, "");
     url.search = "";
     url.hash = "";
