@@ -45,7 +45,7 @@ function normalizeSpeed(value) {
 function parseUrl(serverUrl) {
   try {
     const url = new URL(serverUrl || DEFAULT_SERVER);
-    return { host: url.hostname, port: url.port };
+    return { host: url.hostname, port: url.port || "5000" };
   } catch {
     return { host: "localhost", port: "5000" };
   }

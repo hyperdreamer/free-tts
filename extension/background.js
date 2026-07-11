@@ -7,7 +7,7 @@ const FETCH_TIMEOUT_MS = 120000;
 
 // Pipeline state
 let activePlayback = { tabId: null };
-let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled }
+let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled, _pausedAtEnd }
 
 function logError(context, error) {
   console.error(`free-tts background: ${context}`, error);
@@ -171,6 +171,13 @@ async function resumePlayback() {
   if (!sentencePipeline || !sentencePipeline.isPaused) return;
   sentencePipeline.isPaused = false;
   await updateControlBar(sentencePipeline.tabId, false);
+  // If we paused after the current sentence finished, the page's audio element is
+  // already terminated — re-fetch and play the sentence instead of trying to play a dead element.
+  if (sentencePipeline._pausedAtEnd) {
+    sentencePipeline._pausedAtEnd = false;
+    await playNextSentence();
+    return;
+  }
   try {
     await chrome.scripting.executeScript({
       target: { tabId: sentencePipeline.tabId },
@@ -190,6 +197,14 @@ async function resumePlayback() {
 // re-issuing audio control (the page already did it, with lower latency).
 async function syncPausedState(paused) {
   if (!sentencePipeline || sentencePipeline.isPaused === paused) return;
+  // If resuming from a paused-at-end state, re-fetch the sentence
+  if (!paused && sentencePipeline._pausedAtEnd) {
+    sentencePipeline._pausedAtEnd = false;
+    sentencePipeline.isPaused = false;
+    await updateControlBar(sentencePipeline.tabId, false);
+    await playNextSentence();
+    return;
+  }
   sentencePipeline.isPaused = paused;
   await updateControlBar(sentencePipeline.tabId, paused);
 }
@@ -799,12 +814,8 @@ async function playNextSentence() {
     // Move to next sentence or pause — only if index hasn't been changed externally
     if (sentencePipeline && sentencePipeline.currentIdx === startIdx) {
       if (sentencePipeline.isPaused) {
-        // Don't advance — just clean up audio, keep state
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          world: "MAIN",
-          func: () => { const s = window.__freeTtsAudio; if (s) { s.src = ""; } },
-        });
+        // Don't advance — mark that we paused at end-of-sentence so resume can re-fetch
+        sentencePipeline._pausedAtEnd = true;
       } else {
         sentencePipeline.currentIdx++;
         await playNextSentence();

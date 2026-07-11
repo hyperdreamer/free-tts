@@ -453,9 +453,11 @@ def _find_first(element: ET.Element, tag_name: str) -> ET.Element | None:
 
 def _is_known_voice(voice: str) -> bool:
     """Return whether a voice exists in the cache, if the cache is available."""
-    if not _voice_cache_ready or not _voice_cache:
+    if not _voice_cache_ready:
         return True
-    return any(item.get("ShortName") == voice for item in _voice_cache)
+    # Hold the lock so the cache isn't mutated mid-iteration.
+    with _cache_lock:
+        return any(item.get("ShortName") == voice for item in _voice_cache)
 
 
 async def _refresh_voice_cache() -> None:
@@ -625,9 +627,12 @@ def extract_tts_params(ssml: str) -> TTSRequest:
         if prosody_el is not None:
             rate = _parse_rate(prosody_el.get("rate"))
             pitch = _parse_pitch(prosody_el.get("pitch"))
-            text = " ".join(prosody_el.itertext()).strip()
-        else:
-            text = " ".join(voice_el.itertext()).strip()
+        # Collect text from ALL children of <voice>, not just <prosody>, so that
+        # sibling text outside <prosody> is preserved.
+        text = " ".join(
+            t.strip() for t in voice_el.itertext() if t.strip()
+        ).strip()
+        if prosody_el is None:
             logger.warning("No <prosody> inside <voice>; using default rate/pitch.")
     else:
         text = " ".join(root.itertext()).strip()
@@ -687,6 +692,10 @@ async def generate_audio(req: TTSRequest) -> bytes:
         except StopAsyncIteration:
             break
         except asyncio.TimeoutError:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
             raise TimeoutError(
                 f"No data from TTS service for {TTS_STALL_TIMEOUT}s (stall detected)"
             )
@@ -802,10 +811,15 @@ def create_app() -> Flask:
                 "default_voice": "en-US-EmmaMultilingualNeural"
             }
         """
+        # Snapshot the cache under the lock so a concurrent refresh can't mutate
+        # the lists mid-serialisation.
+        with _cache_lock:
+            languages_snapshot = list(_LANGUAGE_LIST)
+            voices_snapshot = list(_voice_cache)
         return jsonify(
             {
-                "languages": _LANGUAGE_LIST,
-                "voices": _voice_cache,
+                "languages": languages_snapshot,
+                "voices": voices_snapshot,
                 "default_voice": DEFAULT_VOICE,
             }
         )
