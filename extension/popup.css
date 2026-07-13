@@ -155,6 +155,10 @@ body {
   font-weight: 500;
 }
 
+.speed-input {
+  width: 4ch;
+}
+
 .slider-row input[type="range"] {
   flex: 1;
   -webkit-appearance: none;
