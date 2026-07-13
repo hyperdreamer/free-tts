@@ -75,7 +75,6 @@ const voicePreviewBtn = $("#voicePreviewBtn");
 const textInputArea   = $("#textInputArea");
 const charCount       = $("#charCount");
 const speedSlider     = $("#speedSlider");
-const speedValue      = $("#speedValue");
 const speedInput      = $("#speedInput");
 const pitchSlider     = $("#pitchSlider");
 const pitchValue      = $("#pitchValue");
@@ -308,7 +307,6 @@ voiceSearch.addEventListener("input", renderVoiceList);
 // Sliders → live value + SSML preview
 // ---------------------------------------------------------------------------
 function updateSliderDisplay() {
-  speedValue.textContent = speedSlider.value + "%";
   pitchValue.textContent = pitchSlider.value + " Hz";
 }
 
