@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "free-tts",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "minimum_chrome_version": "103",
   "description": "Text-to-speech via Microsoft Edge TTS. Select text or use the popup.",
   "permissions": [
