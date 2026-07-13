@@ -6,6 +6,7 @@ const DEFAULT_VOICE = "en-US-AvaMultilingualNeural";
 const voiceSelect  = document.getElementById("voiceSelect");
 const textInput    = document.getElementById("textInput");
 const speedSlider  = document.getElementById("speedSlider");
+const speedInput   = document.getElementById("speedInput");
 const speedVal     = document.getElementById("speedVal");
 const speakBtn     = document.getElementById("speakBtn");
 const stopBtn      = document.getElementById("stopBtn");
@@ -119,13 +120,21 @@ async function init() {
   const { speed } = await chrome.storage.sync.get({ speed: 0 });
   const safeSpeed = normalizeSpeed(speed);
   speedSlider.value = safeSpeed;
+  speedInput.value = safeSpeed;
   speedVal.textContent = safeSpeed + "%";
 
   // Save speed on change
   speedSlider.addEventListener("input", () => {
     const s = speedSlider.value;
+    speedInput.value = s;
     speedVal.textContent = s + "%";
     chrome.storage.sync.set({ speed: normalizeSpeed(s) }).catch(() => {});
+  });
+  speedInput.addEventListener("input", () => {
+    const s = normalizeSpeed(speedInput.value);
+    speedSlider.value = s;
+    speedVal.textContent = s + "%";
+    chrome.storage.sync.set({ speed: s }).catch(() => {});
   });
   speakBtn.addEventListener("click", () => speak().catch(() => {
     popupState = "idle";

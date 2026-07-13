@@ -76,6 +76,7 @@ const textInputArea   = $("#textInputArea");
 const charCount       = $("#charCount");
 const speedSlider     = $("#speedSlider");
 const speedValue      = $("#speedValue");
+const speedInput      = $("#speedInput");
 const pitchSlider     = $("#pitchSlider");
 const pitchValue      = $("#pitchValue");
 const previewBtn      = $("#previewBtn");
@@ -318,9 +319,18 @@ function updateSSMLPreview() {
   charCount.textContent = textInputArea.value.length + " characters";
 }
 
-speedSlider.addEventListener("input", () => { updateSliderDisplay(); updateSSMLPreview(); });
+speedSlider.addEventListener("input", () => {
+  speedInput.value = speedSlider.value;
+  updateSliderDisplay();
+  updateSSMLPreview();
+});
 pitchSlider.addEventListener("input", () => { updateSliderDisplay(); updateSSMLPreview(); });
 textInputArea.addEventListener("input", updateSSMLPreview);
+speedInput.addEventListener("input", () => {
+  speedSlider.value = speedInput.value;
+  updateSliderDisplay();
+  updateSSMLPreview();
+});
 
 // ---------------------------------------------------------------------------
 // TTS API call

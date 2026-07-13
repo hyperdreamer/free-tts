@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "free-tts",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "minimum_chrome_version": "103",
   "description": "Text-to-speech via Microsoft Edge TTS. Select text or use the popup.",
   "permissions": [
@@ -35,7 +35,10 @@
   "commands": {
     "speak-selection": {
       "suggested_key": {
-        "default": "Ctrl+Shift+U"
+        "default": "Ctrl+Shift+U",
+        "mac": "Command+Shift+U",
+        "linux": "Ctrl+Shift+U",
+        "windows": "Ctrl+Shift+U"
       },
       "description": "Speak selected text (toggle stop when playing)"
     }
