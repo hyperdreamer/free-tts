@@ -41,7 +41,7 @@ body {
 /* ---- Container ---- */
 .container {
     width: 100%;
-    max-width: 1060px;
+    max-width: 1180px;
     background: var(--surface);
     border-radius: 12px;
     box-shadow: var(--shadow);
@@ -213,10 +213,9 @@ body {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 0;
+    width: 100%;
     height: min(720px, calc(100vh - 120px));
     min-height: 640px;
-    border-top: 1px solid var(--border-light);
-    overflow: hidden;
 }
 
 /* Left: controls */
@@ -228,7 +227,6 @@ body {
     border-right: 1px solid var(--border-light);
     min-height: 0;
     overflow-y: auto;
-    scrollbar-gutter: stable;
 }
 
 /* ---- Voice Panel ---- */
@@ -319,7 +317,7 @@ body {
 /* Voice columns: Preview | Selected */
 .voice-columns {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1.3fr 1fr;
     border-top: 1px solid var(--border-light);
     height: 230px;
     min-height: 230px;
@@ -575,22 +573,18 @@ body {
 
 /* ---- Right: SSML preview + results ---- */
 .text-results-panel {
-    padding: 0;
+    padding: 20px;
     display: flex;
     flex-direction: column;
-    background: #fafafa;
     min-height: 0;
-    overflow: hidden;
 }
 
 .panel-content {
     display: none;
     flex: 1;
     min-height: 0;
-    padding: 16px 20px;
-    overflow-y: scroll;
+    overflow-y: auto;
     overflow-x: hidden;
-    scrollbar-gutter: stable;
 }
 
 .panel-content.active {
@@ -625,7 +619,7 @@ body {
     font-size: 12px;
     line-height: 1.6;
     white-space: pre-wrap;
-    word-break: break-all;
+    overflow-wrap: break-word;
     color: var(--text-secondary);
     margin: 0;
 }

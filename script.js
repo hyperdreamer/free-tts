@@ -13,7 +13,7 @@
 const SSML_TEMPLATE = `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xmlns:emo="http://www.w3.org/2009/10/emotionml" version="1.0" xml:lang="en-US">
     <voice name="VOICE_NAME">
         <prosody rate="RATE%" pitch="PITCH%">
-TEXT_CONTENT
+            TEXT_CONTENT
         </prosody>
     </voice>
 </speak>`;
@@ -115,7 +115,7 @@ function buildSSML(voice, text, rateSliderVal, pitchSliderVal) {
     .replace("VOICE_NAME", escapeXMLAttribute(voice))
     .replace("RATE%", rateAttr)
     .replace("PITCH%", pitchAttr)
-    .replace("TEXT_CONTENT", escapeXML(text));
+    .replace("TEXT_CONTENT", escapeXML(text).replace(/\n/g, "\n            "));
 }
 
 function fillDefaultSSML() {
