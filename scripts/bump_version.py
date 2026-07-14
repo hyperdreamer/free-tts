@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Bump version across all project references: VERSION, extension/manifest.json."""
+"""Bump version across all project references: VERSION, extension/manifest.json, index.html."""
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def bump_version(current: str, part: str = "patch") -> str:
 
 
 def write_all(version: str) -> None:
-    """Write version to VERSION and extension/manifest.json."""
+    """Write version to VERSION, extension/manifest.json, and index.html."""
     # VERSION
     (ROOT / "VERSION").write_text(version + "\n")
     # manifest.json
@@ -41,6 +42,15 @@ def write_all(version: str) -> None:
     old = data["version"]
     data["version"] = version
     mf.write_text(json.dumps(data, indent=2) + "\n")
+    # index.html (version span)
+    idx = ROOT / "index.html"
+    html = idx.read_text()
+    html = re.sub(
+        r'<span class="version">v[\d.]+</span>',
+        f'<span class="version">v{version}</span>',
+        html,
+    )
+    idx.write_text(html)
     print(f"{old} → {version}")
 
 
