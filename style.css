@@ -80,6 +80,12 @@ body {
     border-bottom-color: var(--accent);
 }
 
+.version {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
 /* ---- Tab Content ---- */
 .tab-content {
     display: none;
