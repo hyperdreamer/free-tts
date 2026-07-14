@@ -556,6 +556,7 @@ body {
 
 .speed-input {
     width: 6ch;
+    text-align: right;
 }
 
 /* ---- Text actions ---- */
