@@ -74,9 +74,12 @@ All settings can be set via `config.json` or environment variables. Env vars tak
 | config.json | Env var | Default | Description |
 |---|---|---|---|
 | `default_voice` | `TTS_DEFAULT_VOICE` | `en-US-AvaMultilingualNeural` | Fallback voice when SSML omits `<voice name>`. See `GET /voices` for available names. |
+| `default_rate` | `TTS_DEFAULT_RATE` | `+0%` | Default speaking rate when `<prosody rate>` is missing. Signed relative format (`+20%`, `-10%`, `+0%`). SSML percentages (`50%`, `150%`) and named presets (`x-slow`, `fast`) are also accepted and auto-converted. |
+| `default_pitch` | `TTS_DEFAULT_PITCH` | `+0Hz` | Default pitch when `<prosody pitch>` is missing. Signed Hz format (`+0Hz`, `-5Hz`, `+10Hz`). Named presets (`x-low`, `high`) pass through unchanged. |
 | `max_ssml_length` | `TTS_MAX_SSML_LENGTH` | `200000` | Max SSML payload in bytes. Set `0` to disable the limit. |
 | `tts_stall_timeout` | `TTS_STALL_TIMEOUT` | `60` | Seconds of silence from Microsoft before aborting. `0` = disable stall detection. |
-| `max_concurrent` | `TTS_MAX_CONCURRENT` | `2` | Max concurrent TTS generation requests. `0` = unlimited. |
+| `max_concurrent` | `TTS_MAX_CONCURRENT` | `2` | Max concurrent TTS generation requests per worker process. `0` = unlimited. |
+| `queue_timeout` | `TTS_QUEUE_TIMEOUT` | `30` | Seconds to wait for a TTS slot before returning HTTP 503. Minimum 5s. |
 
 ### CORS
 

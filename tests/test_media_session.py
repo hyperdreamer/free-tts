@@ -39,10 +39,12 @@ def test_every_audio_executescript_runs_in_main_world():
     the MAIN world, or the media-session handlers (also MAIN world) can't see it."""
     src = _source()
     # Find each executeScript({...}) call and check the ones referencing the audio.
-    for call in re.findall(r"chrome\.scripting\.executeScript\(\{.*?\}\)", src, re.DOTALL):
+    for call in re.findall(
+        r"chrome\.scripting\.executeScript\(\{.*?\}\)", src, re.DOTALL
+    ):
         if "__freeTtsAudio" in call:
             assert 'world: "MAIN"' in call, (
-                "executeScript touching __freeTtsAudio is missing world: \"MAIN\":\n"
+                'executeScript touching __freeTtsAudio is missing world: "MAIN":\n'
                 + call[:200]
             )
 
@@ -77,7 +79,9 @@ def test_relay_is_idempotent():
 def test_keepalive_ping_present():
     src = _source()
     assert 'send("ping")' in src, "25s keepalive ping missing"
-    assert "msg.action === \"ping\"" not in src, "ping must be a no-op runtime message, not a port message"
+    assert 'msg.action === "ping"' not in src, (
+        "ping must be a no-op runtime message, not a port message"
+    )
 
 
 def test_play_pause_sync_worker_state():
@@ -99,14 +103,19 @@ def test_play_pause_sync_worker_state():
     assert "isPaused" in body
     assert "updateControlBar(" in body
     # The sync path must NOT re-issue audio control (the page already did it).
-    assert "__freeTtsAudio" not in body, "syncPausedState must not touch the Audio element"
+    assert "__freeTtsAudio" not in body, (
+        "syncPausedState must not touch the Audio element"
+    )
 
 
 def test_loop_checkbox_syncs_to_worker_pipeline():
     src = _source()
     assert 'msg.action === "setLoopState"' in src, "loop state message not routed"
     assert "sentencePipeline.loopEnabled = msg.enabled !== false" in src
-    assert 'chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked })' in src
+    assert (
+        'chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked })'
+        in src
+    )
 
 
 def test_loop_decision_uses_worker_owned_state_before_injected_fallback():
@@ -116,4 +125,28 @@ def test_loop_decision_uses_worker_owned_state_before_injected_fallback():
     body = match.group(0)
     assert "sentencePipeline?.tabId === tabId" in body
     assert "sentencePipeline.loopEnabled !== false" in body
-    assert "document.getElementById(\"free-tts-loop\")?.checked" in body
+    assert 'document.getElementById("free-tts-loop")?.checked' in body
+
+
+def test_cleanup_ordering_on_natural_completion():
+    """The non-loop completion path in playNextSentence must call
+    cleanupMediaSession *before* clearPlayback so the media-session
+    integration is torn down cleanly rather than left dangling."""
+    src = _source()
+    match = re.search(r"async function playNextSentence\(.*?\n}\n", src, re.DOTALL)
+    assert match, "playNextSentence body not found"
+    body = match.group(0)
+
+    # The natural-completion cleanup sequence is uniquely identifiable:
+    # cleanupMediaSession → cleanupPageHighlighting → hideControlBar → clearPlayback → return
+    sequence = re.search(
+        r"await cleanupMediaSession\(tabId\);\s*"
+        r"await cleanupPageHighlighting\(tabId\);\s*"
+        r"await hideControlBar\(tabId\);\s*"
+        r"clearPlayback\(\);",
+        body,
+    )
+    assert sequence, (
+        "cleanupMediaSession(tabId) must be called before clearPlayback() "
+        "in the natural non-loop completion path of playNextSentence"
+    )

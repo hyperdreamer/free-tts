@@ -27,7 +27,11 @@ def split_sentences_like_frontend(relative_path: str, text: str) -> list[str]:
 @pytest.mark.parametrize("relative_path", SPLITTER_FILES)
 def test_split_sentences_preserves_newline_delimited_selection(relative_path):
     text = "First line\nSecond line\nThird line"
-    assert split_sentences_like_frontend(relative_path, text) == ["First line", "Second line", "Third line"]
+    assert split_sentences_like_frontend(relative_path, text) == [
+        "First line",
+        "Second line",
+        "Third line",
+    ]
 
 
 @pytest.mark.parametrize("relative_path", SPLITTER_FILES)
@@ -43,30 +47,40 @@ def test_split_sentences_keeps_heading_before_punctuated_lines(relative_path):
 @pytest.mark.parametrize("relative_path", SPLITTER_FILES)
 def test_split_sentences_keeps_cjk_newline_fragments(relative_path):
     text = "第一句\n第二句。\n第三句"
-    assert split_sentences_like_frontend(relative_path, text) == ["第一句", "第二句。", "第三句"]
+    assert split_sentences_like_frontend(relative_path, text) == [
+        "第一句",
+        "第二句。",
+        "第三句",
+    ]
 
 
 @pytest.mark.parametrize("relative_path", SPLITTER_FILES)
 def test_split_sentences_preserves_punctuation_splitting(relative_path):
     text = "One. Two! Three?"
-    assert split_sentences_like_frontend(relative_path, text) == ["One.", "Two!", "Three?"]
+    assert split_sentences_like_frontend(relative_path, text) == [
+        "One.",
+        "Two!",
+        "Three?",
+    ]
 
 
 @pytest.mark.parametrize("relative_path", SPLITTER_FILES)
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ('He said "Hello." Then left.', ['He said "Hello."', 'Then left.']),
-        ('“Hello.” Then left.', ['“Hello.”', 'Then left.']),
-        ('He said “Hello.”\nThen left.', ['He said “Hello.”', 'Then left.']),
-        ('「你好。」然后走了。', ['「你好。」', '然后走了。']),
-        ('Sentence one." Sentence two.', ['Sentence one."', 'Sentence two.']),
-        ('Sentence one.” Sentence two.', ['Sentence one.”', 'Sentence two.']),
-        ('Sentence one.) Sentence two.', ['Sentence one.)', 'Sentence two.']),
+        ('He said "Hello." Then left.', ['He said "Hello."', "Then left."]),
+        ("“Hello.” Then left.", ["“Hello.”", "Then left."]),
+        ("He said “Hello.”\nThen left.", ["He said “Hello.”", "Then left."]),
+        ("「你好。」然后走了。", ["「你好。」", "然后走了。"]),
+        ('Sentence one." Sentence two.', ['Sentence one."', "Sentence two."]),
+        ("Sentence one.” Sentence two.", ["Sentence one.”", "Sentence two."]),
+        ("Sentence one.) Sentence two.", ["Sentence one.)", "Sentence two."]),
         ('Sentence one!"\nSentence two?"', ['Sentence one!"', 'Sentence two?"']),
     ],
 )
-def test_split_sentences_keeps_closing_quotes_with_sentence(relative_path, text, expected):
+def test_split_sentences_keeps_closing_quotes_with_sentence(
+    relative_path, text, expected
+):
     assert split_sentences_like_frontend(relative_path, text) == expected
 
 
@@ -91,4 +105,6 @@ def test_split_sentences_keeps_closing_quotes_with_sentence(relative_path, text,
 def test_pipeline_has_startIdx_guard(relative_path, function_name, guard_line):
     text = (ROOT / relative_path).read_text(encoding="utf-8")
     assert f"async function {function_name}" in text, f"{function_name} not found"
-    assert guard_line in text, f"startIdx guard missing in {relative_path} — add 'const startIdx = ...' at top of {function_name}"
+    assert guard_line in text, (
+        f"startIdx guard missing in {relative_path} — add 'const startIdx = ...' at top of {function_name}"
+    )

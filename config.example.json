@@ -2,9 +2,12 @@
     "host": "127.0.0.1",
     "port": 5000,
     "default_voice": "en-US-AvaMultilingualNeural",
+    "default_rate": "+0%",
+    "default_pitch": "+0Hz",
     "max_ssml_length": 200000,
     "tts_stall_timeout": 60,
     "max_concurrent": 2,
+    "queue_timeout": 30,
     "cors_origins": [
         "null",
         "^https?://localhost(?::\\d+)?$",

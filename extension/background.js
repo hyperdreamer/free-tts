@@ -739,6 +739,7 @@ async function playNextSentence() {
       await playNextSentence();
       return;
     }
+    await cleanupMediaSession(tabId);
     await cleanupPageHighlighting(tabId);
     await hideControlBar(tabId);
     clearPlayback();

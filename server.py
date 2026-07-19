@@ -171,15 +171,13 @@ TTS_STALL_TIMEOUT: int = _cfg_int(
 TTS_MAX_CONCURRENT: int = _cfg_int("max_concurrent", "TTS_MAX_CONCURRENT", 2, minimum=0)
 """Maximum concurrent TTS generation requests. 0 = unlimited."""
 
-TTS_QUEUE_TIMEOUT: int = _cfg_int(
-    "queue_timeout", "TTS_QUEUE_TIMEOUT", 30, minimum=5
-)
+TTS_QUEUE_TIMEOUT: int = _cfg_int("queue_timeout", "TTS_QUEUE_TIMEOUT", 30, minimum=5)
 """Seconds to wait for a TTS slot before returning 503. Minimum 5s."""
 
 _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
     threading.BoundedSemaphore(TTS_MAX_CONCURRENT) if TTS_MAX_CONCURRENT > 0 else None
 )
-"""Process-wide thread-safe limiter for concurrent TTS generation."""
+"""Per-worker thread-safe limiter for concurrent TTS generation."""
 
 WAITRESS_THREADS: int = _cfg_int(
     "waitress_threads", "TTS_WAITRESS_THREADS", 4, minimum=1
@@ -222,14 +220,11 @@ _voice_cache: list[dict[str, Any]] = []
 _voice_cache_ready: bool = False
 """True once the voice cache has been successfully populated."""
 
-_LANGUAGE_MAP: dict[str, str] = {}
-"""Locale → human-readable language name, derived from voice data."""
-
 _LANGUAGE_LIST: list[dict[str, str]] = []
 """Unique languages for the frontend dropdown, sorted by display name."""
 
 _cache_lock = threading.Lock()
-"""Serialises voice-cache mutations; reads are lock-free."""
+"""Serialises voice-cache mutations and reads."""
 
 # ---------------------------------------------------------------------------
 # Locale → display name mapping (ISO 639-1 language + ISO 3166-1 region)
@@ -462,7 +457,7 @@ def _is_known_voice(voice: str) -> bool:
 
 async def _refresh_voice_cache() -> None:
     """Fetch all available voices from edge-tts and rebuild the caches."""
-    global _voice_cache, _voice_cache_ready, _LANGUAGE_MAP, _LANGUAGE_LIST
+    global _voice_cache, _voice_cache_ready, _LANGUAGE_LIST
 
     try:
         raw = await edge_tts.list_voices()
@@ -497,11 +492,9 @@ async def _refresh_voice_cache() -> None:
         key=lambda x: x["name"].lower(),
     )
 
-    # Atomically swap all four globals under the write-side lock.
+    # Atomically swap all globals under the write-side lock.
     with _cache_lock:
         _voice_cache[:] = new_voices
-        _LANGUAGE_MAP.clear()
-        _LANGUAGE_MAP.update(seen_locales)
         _LANGUAGE_LIST[:] = new_language_list
         _voice_cache_ready = True
 
@@ -629,9 +622,7 @@ def extract_tts_params(ssml: str) -> TTSRequest:
             pitch = _parse_pitch(prosody_el.get("pitch"))
         # Collect text from ALL children of <voice>, not just <prosody>, so that
         # sibling text outside <prosody> is preserved.
-        text = " ".join(
-            t.strip() for t in voice_el.itertext() if t.strip()
-        ).strip()
+        text = " ".join(t.strip() for t in voice_el.itertext() if t.strip()).strip()
         if prosody_el is None:
             logger.warning("No <prosody> inside <voice>; using default rate/pitch.")
     else:
