@@ -18,15 +18,13 @@ paste SSML or use the visual **Text Input** builder to pick a voice, set speed/p
 - **Production-ready** — configurable CORS origins, SSML size limits, concurrency control, request logging, stall detection, graceful shutdown
 
 ### Chrome Extension
-Right-click any text on any page and hear it spoken — Edge-style sentence-by-sentence reading with in-page highlighting.
+Select text on any page and hear it spoken — Edge-style sentence-by-sentence reading with in-page highlighting. Activate via the popup or `Ctrl+Shift+U`.
 
-- **Right-click "Speak this"** — splits text into sentences, plays sequentially with pre-caching
 - **Floating control bar** — prev/next sentence, pause/resume, stop, loop checkbox. Draggable anywhere on the page.
 - **Yellow highlight overlays** track the current sentence with smooth auto-scroll
 - **Sentence jumping** — double-click a word or drag-select text to jump directly to that sentence
 - **Keyboard shortcut** `Ctrl+Shift+U` — toggles: speaks selection/full page when idle, stops playback when active
 - **Popup** — voice selector, speed slider, text input, Speak/Pause/Stop buttons
-- **Context menu** — "Stop speaking", "Pause reading", "Resume reading" appear dynamically
 - **Options** — configurable server URL (host + port) and highlight color
 
 ## Quick Start
@@ -49,7 +47,7 @@ The server runs on `http://localhost:5000`. Open `index.html` in a browser — i
 1. Start the server first: `python server.py`
 2. Go to `chrome://extensions`, enable **Developer mode**
 3. Click **Load unpacked** → select the `extension/` directory
-4. Right-click any text on any page → **Speak this**
+4. Select text and press `Ctrl+Shift+U`, or open the popup and click **Speak**
 
 Right-click the extension icon → **Options** to configure the server host, port, and highlight color.
 
