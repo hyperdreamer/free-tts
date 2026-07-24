@@ -7,7 +7,7 @@ const FETCH_TIMEOUT_MS = 120000;
 
 // Pipeline state
 let activePlayback = { tabId: null };
-let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled, _pausedAtEnd }
+let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled, repeatCurrentEnabled, _pausedAtEnd }
 
 function logError(context, error) {
   console.error(`free-tts background: ${context}`, error);
@@ -99,6 +99,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "setLoopState") {
     if (sentencePipeline && sender.tab?.id === sentencePipeline.tabId) {
       sentencePipeline.loopEnabled = msg.enabled !== false;
+      if (msg.enabled) sentencePipeline.repeatCurrentEnabled = false;
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg.action === "setRepeatCurrentState") {
+    if (sentencePipeline && sender.tab?.id === sentencePipeline.tabId) {
+      sentencePipeline.repeatCurrentEnabled = msg.enabled !== false;
+      if (msg.enabled) sentencePipeline.loopEnabled = false;
     }
     sendResponse({ ok: true });
     return false;
@@ -322,11 +331,24 @@ async function getLoopState(tabId) {
   }
 }
 
-async function showControlBar(tabId, isPaused, loopEnabled = true) {
+async function getRepeatCurrentState(tabId) {
+  if (sentencePipeline?.tabId === tabId) return sentencePipeline.repeatCurrentEnabled === true;
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => document.getElementById("free-tts-repeat-current")?.checked ?? false,
+    });
+    return result?.result ?? false;
+  } catch {
+    return false;
+  }
+}
+
+async function showControlBar(tabId, isPaused, loopEnabled = true, repeatCurrentEnabled = false) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (paused, initialLoopEnabled) => {
+      func: (paused, initialLoopEnabled, initialRepeatCurrent) => {
         // Remove existing bar
         if (typeof window.__freeTtsCleanupControlBar === "function") {
           window.__freeTtsCleanupControlBar();
@@ -346,8 +368,9 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
           button.textContent = text;
           bar.appendChild(button);
         });
-        // Loop checkbox — checked by default
+        // Repeat All (loop) checkbox — checked by default
         const loopLabel = document.createElement("label");
+        loopLabel.title = "Repeat All";
         loopLabel.style.cssText = "display:flex;align-items:center;gap:2px;font-size:12px;color:#555;padding:2px 4px;cursor:pointer;border-left:1px solid #ddd;margin-left:2px;";
         const loopCheck = document.createElement("input");
         loopCheck.type = "checkbox";
@@ -355,6 +378,10 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
         loopCheck.checked = initialLoopEnabled !== false;
         loopCheck.style.cssText = "margin:0;cursor:pointer;";
         loopCheck.addEventListener("change", () => {
+          if (loopCheck.checked) {
+            const repeatCurrent = document.getElementById("free-tts-repeat-current");
+            if (repeatCurrent) repeatCurrent.checked = false;
+          }
           window.__freeTtsLoop = loopCheck.checked;
           chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked });
         });
@@ -362,6 +389,26 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
         loopLabel.appendChild(document.createTextNode("↻"));
         bar.appendChild(loopLabel);
         window.__freeTtsLoop = initialLoopEnabled !== false;
+
+        // Repeat Current Sentence checkbox — unchecked by default
+        const repeatCurrentLabel = document.createElement("label");
+        repeatCurrentLabel.title = "Repeat Current Sentence";
+        repeatCurrentLabel.style.cssText = "display:flex;align-items:center;gap:2px;font-size:12px;color:#555;padding:2px 4px;cursor:pointer;";
+        const repeatCurrentCheck = document.createElement("input");
+        repeatCurrentCheck.type = "checkbox";
+        repeatCurrentCheck.id = "free-tts-repeat-current";
+        repeatCurrentCheck.checked = initialRepeatCurrent === true;
+        repeatCurrentCheck.style.cssText = "margin:0;cursor:pointer;";
+        repeatCurrentCheck.addEventListener("change", () => {
+          if (repeatCurrentCheck.checked) {
+            const loop = document.getElementById("free-tts-loop");
+            if (loop) loop.checked = false;
+          }
+          chrome.runtime.sendMessage({ action: "setRepeatCurrentState", enabled: repeatCurrentCheck.checked });
+        });
+        repeatCurrentLabel.appendChild(repeatCurrentCheck);
+        repeatCurrentLabel.appendChild(document.createTextNode("↻1"));
+        bar.appendChild(repeatCurrentLabel);
         bar.style.cssText = "position:fixed;top:56px;right:16px;background:rgba(255,255,255,0.85);backdrop-filter:blur(8px);border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.06);padding:2px 4px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
         bar.querySelectorAll("button").forEach(b => {
           b.style.cssText = "border:none;background:none;font-size:14px;cursor:pointer;padding:2px 4px;border-radius:4px;color:#555;transition:background 0.15s;line-height:1;";
@@ -453,7 +500,7 @@ async function showControlBar(tabId, isPaused, loopEnabled = true) {
           delete window.__freeTtsCleanupControlBar;
         };
       },
-      args: [isPaused, loopEnabled],
+      args: [isPaused, loopEnabled, repeatCurrentEnabled],
     });
   } catch (error) {
     logError("showing control bar", error);
@@ -705,9 +752,10 @@ async function startSentenceTTS(tabId, text) {
     speed: normalizeSpeed(speed),
     isPaused: false,
     loopEnabled: true,
+    repeatCurrentEnabled: false,
   };
   activePlayback = { tabId };
-  await showControlBar(tabId, false, sentencePipeline.loopEnabled);
+  await showControlBar(tabId, false, sentencePipeline.loopEnabled, false);
 
   // Set up Media Session for system media keys (play/pause/prev/next)
   await setupMediaSession(tabId);
@@ -732,7 +780,14 @@ async function playNextSentence() {
   const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = sentencePipeline;
   const startIdx = currentIdx;  // guard: exit if external action changed index
   if (currentIdx >= sentences.length) {
-    // Check loop checkbox state
+    // Check repeat-current state first, then loop state
+    const repeatCurrent = await getRepeatCurrentState(tabId);
+    if (repeatCurrent) {
+      // Replay the first sentence (since we already reached the end, go back to 0 and replay it)
+      sentencePipeline.currentIdx = 0;
+      await playNextSentence();
+      return;
+    }
     const loopEnabled = await getLoopState(tabId);
     if (loopEnabled) {
       sentencePipeline.currentIdx = 0;
@@ -818,7 +873,11 @@ async function playNextSentence() {
         // Don't advance — mark that we paused at end-of-sentence so resume can re-fetch
         sentencePipeline._pausedAtEnd = true;
       } else {
-        sentencePipeline.currentIdx++;
+        // Check if repeat-current is enabled; if so, don't advance the index
+        const repeatCurrent = await getRepeatCurrentState(tabId);
+        if (!repeatCurrent) {
+          sentencePipeline.currentIdx++;
+        }
         await playNextSentence();
       }
     }
