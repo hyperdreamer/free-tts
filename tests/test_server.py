@@ -622,20 +622,20 @@ class TestCancellation:
             assert resp.get_json()["cancelled"] is True
             assert token.is_set()
         finally:
-            server._release_cancel_token("abc123")
+            server._release_cancel_token("abc123", token)
 
     def test_cancel_is_idempotent_until_released(self, client):
-        server._register_cancel_token("dup")
+        token = server._register_cancel_token("dup")
         try:
             assert client.delete("/tts-request/dup").status_code == 200
             assert client.delete("/tts-request/dup").status_code == 200
         finally:
-            server._release_cancel_token("dup")
+            server._release_cancel_token("dup", token)
         assert client.delete("/tts-request/dup").status_code == 404
 
     def test_released_token_is_gone(self, client):
-        server._register_cancel_token("gone")
-        server._release_cancel_token("gone")
+        token = server._register_cancel_token("gone")
+        server._release_cancel_token("gone", token)
         assert client.delete("/tts-request/gone").status_code == 404
 
     def test_malformed_request_id_rejected(self, client):
@@ -739,7 +739,7 @@ class TestCancellation:
         try:
             asyncio.run(scenario())
         finally:
-            server._release_cancel_token("blocked-read")
+            server._release_cancel_token("blocked-read", token)
 
     def test_mid_await_delete_returns_499_and_releases_slot(
         self, monkeypatch
@@ -851,6 +851,86 @@ class TestCancellation:
         finally:
             guard.release()
             thread.join(1)
+
+
+class TestRequestIdOwnership:
+    """A live request id belongs to exactly one request."""
+
+    @pytest.fixture
+    def client(self):
+        with (
+            mock.patch.object(server, "_voice_cache_ready", True),
+            mock.patch.object(
+                server, "_voice_cache", [{"ShortName": "en-US-AriaNeural"}]
+            ),
+        ):
+            app = server.create_app()
+            app.config["TESTING"] = True
+            app.config["PROPAGATE_EXCEPTIONS"] = False
+            with app.test_client() as c:
+                yield c
+
+    def test_duplicate_live_registration_is_refused(self):
+        first = server._register_cancel_token("dup-live")
+        try:
+            with pytest.raises(server.DuplicateRequestId):
+                server._register_cancel_token("dup-live")
+            assert server._CANCEL_REGISTRY["dup-live"] is first
+        finally:
+            server._release_cancel_token("dup-live", first)
+
+    def test_release_of_a_stale_token_keeps_the_live_entry(self):
+        first = server._register_cancel_token("reused")
+        server._release_cancel_token("reused", first)
+        second = server._register_cancel_token("reused")
+        try:
+            server._release_cancel_token("reused", first)
+            assert server._CANCEL_REGISTRY.get("reused") is second
+            assert server._cancel_request("reused") is True
+            assert second.is_set()
+        finally:
+            server._release_cancel_token("reused", second)
+
+    def test_id_is_reusable_after_identity_safe_release(self):
+        token = server._register_cancel_token("cycle")
+        server._release_cancel_token("cycle", token)
+        again = server._register_cancel_token("cycle")
+        try:
+            assert server._cancel_request("cycle") is True
+            assert again.is_set()
+            assert token.is_set() is False
+        finally:
+            server._release_cancel_token("cycle", again)
+
+    def test_duplicate_live_request_id_returns_409(self, client):
+        ssml = VALID_SSML_TEMPLATE.format(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hi."
+        )
+        held = server._register_cancel_token("held")
+        try:
+            resp = client.post(
+                "/generate-and-download-tts",
+                json={"ssml": ssml, "request_id": "held"},
+            )
+            assert resp.status_code == 409
+            assert server._CANCEL_REGISTRY["held"] is held
+        finally:
+            server._release_cancel_token("held", held)
+
+    def test_completed_request_releases_only_its_own_token(self, client):
+        ssml = VALID_SSML_TEMPLATE.format(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hi."
+        )
+
+        async def _ok(_req, cancel_event=None):
+            return b"\xff\xfbaudio"
+
+        with mock.patch.object(server, "generate_audio", side_effect=_ok):
+            assert client.post(
+                "/generate-and-download-tts",
+                json={"ssml": ssml, "request_id": "own1"},
+            ).status_code == 200
+        assert "own1" not in server._CANCEL_REGISTRY
 
 
 class TestIdleShutdownWatchdog:

@@ -285,18 +285,33 @@ class _CancellationToken:
 _CANCEL_REGISTRY: dict[str, _CancellationToken] = {}
 
 
+class DuplicateRequestId(Exception):
+    """A caller reused a request id that is still live."""
+
+
 def _register_cancel_token(request_id: str) -> _CancellationToken:
-    """Create and store a cancellation token for an in-flight request."""
+    """Claim ``request_id`` for one live request.
+
+    Ownership is exclusive: a second live registration would make the first
+    request uncancellable and let either completion delete the other's token.
+    """
     event = _CancellationToken()
     with _CANCEL_LOCK:
+        if request_id in _CANCEL_REGISTRY:
+            raise DuplicateRequestId(request_id)
         _CANCEL_REGISTRY[request_id] = event
     return event
 
 
-def _release_cancel_token(request_id: str) -> None:
-    """Drop a token once its request finished, however it finished."""
+def _release_cancel_token(request_id: str, token: _CancellationToken) -> None:
+    """Drop ``request_id`` only if ``token`` still owns it.
+
+    Releasing by id alone would let a slow request's cleanup delete the token of
+    a newer request that reused the id.
+    """
     with _CANCEL_LOCK:
-        _CANCEL_REGISTRY.pop(request_id, None)
+        if _CANCEL_REGISTRY.get(request_id) is token:
+            del _CANCEL_REGISTRY[request_id]
 
 
 def _cancel_request(request_id: str) -> bool:
@@ -1121,9 +1136,13 @@ def create_app() -> Flask:
             return jsonify({"error": f"Unknown voice: {tts_req.voice}"}), 400  # type: ignore[return-value]
 
         # 2. Synthesise (stall timeout handled inside generate_audio)
-        cancel_event = (
-            _register_cancel_token(request_id) if request_id is not None else None
-        )
+        cancel_event = None
+        if request_id is not None:
+            try:
+                cancel_event = _register_cancel_token(request_id)
+            except DuplicateRequestId:
+                logger.warning("Refusing duplicate live request_id %r", request_id)
+                return jsonify({"error": "request_id is already in flight."}), 409  # type: ignore[return-value]
         semaphore = _TTS_SEMAPHORE
         slot_acquired = False
         if _IDLE_WATCHDOG is not None:
@@ -1155,8 +1174,8 @@ def create_app() -> Flask:
                 semaphore.release()
             if _IDLE_WATCHDOG is not None:
                 _IDLE_WATCHDOG.end_request()
-            if request_id is not None:
-                _release_cancel_token(request_id)
+            if request_id is not None and cancel_event is not None:
+                _release_cancel_token(request_id, cancel_event)
 
         # 3. Respond
         return Response(
