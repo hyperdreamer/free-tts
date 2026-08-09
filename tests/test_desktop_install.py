@@ -369,6 +369,79 @@ class TestOwnershipSafety:
         assert _snapshot(tmp_path) == before
 
 
+class TestLegacyManifestProvenance:
+    """A manifest without provenance is never repaired by guessing."""
+
+    def _legacy_install(self, source_root, paths):
+        _install(source_root, paths)
+        manifest_file = paths["root"] / install.MANIFEST_NAME
+        payload = json.loads(manifest_file.read_text())
+        del payload["speechd_conf_existed"]
+        del payload["speechd_conf_mode"]
+        manifest_file.write_text(json.dumps(payload, indent=2))
+        return manifest_file
+
+    def test_upgrade_refuses_a_legacy_manifest_without_mutation(
+        self, source_root, paths
+    ):
+        self._legacy_install(source_root, paths)
+        before = _snapshot(source_root.parent)
+
+        with pytest.raises(install.InstallError, match="provenance"):
+            _install(source_root, paths)
+
+        assert _snapshot(source_root.parent) == before
+
+    def test_legacy_uninstall_keeps_the_config_and_its_mode(
+        self, source_root, paths
+    ):
+        self._legacy_install(source_root, paths)
+        conf = paths["config_dir"] / "speechd.conf"
+        conf.chmod(0o600)
+
+        removed = install.uninstall(
+            root=paths["root"],
+            launcher=paths["launcher"],
+            config_dir=paths["config_dir"],
+        )
+
+        assert conf.is_file()
+        assert sc.BEGIN_MARKER not in conf.read_text()
+        assert conf.stat().st_mode & 0o777 == 0o600
+        assert str(conf) in removed
+        assert not paths["root"].exists()
+
+    def test_legacy_uninstall_preserves_unrelated_user_content(
+        self, source_root, paths
+    ):
+        paths["config_dir"].mkdir(parents=True)
+        conf = paths["config_dir"] / "speechd.conf"
+        conf.write_text("LogLevel 3\n")
+        self._legacy_install(source_root, paths)
+
+        install.uninstall(
+            root=paths["root"],
+            launcher=paths["launcher"],
+            config_dir=paths["config_dir"],
+        )
+
+        assert conf.read_text() == "LogLevel 3\n"
+
+    def test_incomplete_provenance_is_still_rejected(self, source_root, paths):
+        _install(source_root, paths)
+        manifest_file = paths["root"] / install.MANIFEST_NAME
+        payload = json.loads(manifest_file.read_text())
+        del payload["speechd_conf_mode"]
+        manifest_file.write_text(json.dumps(payload, indent=2))
+
+        with pytest.raises(install.InstallOwnershipError, match="incomplete"):
+            install.uninstall(
+                root=paths["root"],
+                launcher=paths["launcher"],
+                config_dir=paths["config_dir"],
+            )
+
+
 class TestUpgradeRollback:
     def _prepare(self, source_root, paths):
         _install(source_root, paths)

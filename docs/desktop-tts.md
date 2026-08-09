@@ -132,3 +132,8 @@ Removes only paths recorded in a valid ownership manifest, restores any
 unrelated config, and running backends alone. If the manifest is missing or
 invalid, uninstall leaves the conventional paths untouched rather than guessing
 that they belong to free-tts.
+
+Uninstall restores `speechd.conf` exactly when the ownership manifest recorded
+its original state. An installation made by an older build that did not record
+that state must be uninstalled before reinstalling; in that case uninstall
+keeps `speechd.conf` and removes only the managed block.

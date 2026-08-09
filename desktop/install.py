@@ -276,19 +276,9 @@ def _snapshot_path(path: pathlib.Path) -> _PathSnapshot:
     return _PathSnapshot("missing")
 
 
-def _speechd_provenance(
-    manifest: dict[str, object] | None,
-    snapshot: _PathSnapshot,
-) -> tuple[bool, int | None]:
-    if manifest is not None and "speechd_conf_existed" in manifest:
-        existed = manifest["speechd_conf_existed"] is True
-        mode = manifest["speechd_conf_mode"]
-        return existed, mode if isinstance(mode, int) else None
-
-    # Legacy manifests cannot distinguish an originally absent file from an
-    # originally empty one, so preserve the state seen during this upgrade.
-    existed = snapshot.kind == "file"
-    return existed, snapshot.mode if existed else None
+def _has_provenance(manifest: dict[str, object]) -> bool:
+    """True when the manifest records the original speechd.conf state."""
+    return "speechd_conf_existed" in manifest
 
 
 def _atomic_write(path: pathlib.Path, data: bytes, mode: int = 0o644) -> None:
@@ -426,9 +416,21 @@ def install(
 
     external_paths = (launcher_file, module_conf, speechd_conf, backup)
     snapshots = {path: _snapshot_path(path) for path in external_paths}
-    speechd_conf_existed, speechd_conf_mode = _speechd_provenance(
-        owned_manifest, snapshots[speechd_conf]
-    )
+    if owned_manifest is not None and not _has_provenance(owned_manifest):
+        raise InstallError(
+            "this installation was made by an older build that did not record "
+            "speechd.conf provenance, so its original state cannot be restored. "
+            f"Run `python -m desktop.install uninstall` first (it keeps "
+            f"{speechd_conf}), then install again."
+        )
+    snapshot = snapshots[speechd_conf]
+    if owned_manifest is not None:
+        speechd_conf_existed = owned_manifest["speechd_conf_existed"] is True
+        recorded_mode = owned_manifest["speechd_conf_mode"]
+        speechd_conf_mode = recorded_mode if isinstance(recorded_mode, int) else None
+    else:
+        speechd_conf_existed = snapshot.kind == "file"
+        speechd_conf_mode = snapshot.mode if speechd_conf_existed else None
     manifest: dict[str, object] = {
         **expected,
         "speechd_conf_existed": speechd_conf_existed,
@@ -570,9 +572,21 @@ def uninstall(
             )
 
     speechd_snapshot = _snapshot_path(speechd_conf)
-    speechd_conf_existed, speechd_conf_mode = _speechd_provenance(
-        owned, speechd_snapshot
-    )
+    if _has_provenance(owned):
+        speechd_conf_existed = owned["speechd_conf_existed"] is True
+        recorded_mode = owned["speechd_conf_mode"]
+        speechd_conf_mode = recorded_mode if isinstance(recorded_mode, int) else None
+    else:
+        # Provenance was never recorded, and an installer-created file is now
+        # indistinguishable from a pre-existing empty one. Keep the file.
+        logger.warning(
+            "Ownership manifest has no speechd.conf provenance; keeping %s and "
+            "removing only the managed block.",
+            speechd_conf,
+        )
+        speechd_conf_existed = True
+        speechd_conf_mode = speechd_snapshot.mode
+
     removed: list[str] = []
     if speechd_conf.is_file():
         current = speechd_conf.read_text(encoding="utf-8")
@@ -583,7 +597,7 @@ def uninstall(
         else:
             restored_mode = (
                 speechd_conf_mode
-                if speechd_conf_existed and speechd_conf_mode is not None
+                if speechd_conf_mode is not None
                 else speechd_snapshot.mode
             )
             if cleaned != current or restored_mode != speechd_snapshot.mode:
