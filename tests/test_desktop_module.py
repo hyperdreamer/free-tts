@@ -101,7 +101,7 @@ def _engine(client=None, controller=None, config=None):
         config or settings.DEFAULTS,
         controller or _FakeController(),
         client or _FakeClient(),
-        decoder=lambda mp3, ffmpeg_path, sample_rate: b"\x01\x00" * 8,
+        decoder=lambda mp3, ffmpeg_path, sample_rate, cancel: b"\x01\x00" * 8,
     )
     return engine, fake_io
 
@@ -238,7 +238,7 @@ class TestSpeak:
 
         fake_io = _FakeIO()
 
-        def failing_decoder(mp3, ffmpeg_path, sample_rate):
+        def failing_decoder(mp3, ffmpeg_path, sample_rate, cancel):
             raise DecodeError("no ffmpeg")
 
         engine = module.SpeechEngine(
@@ -259,7 +259,7 @@ class TestSpeak:
             settings.DEFAULTS,
             _FakeController(),
             _FakeClient(),
-            decoder=lambda mp3, ffmpeg_path, sample_rate: b"\xff\x7f",
+            decoder=lambda mp3, ffmpeg_path, sample_rate, cancel: b"\xff\x7f",
         )
         engine.apply_settings({"volume": "-100"})
         engine.handle_speak(SSML)
@@ -291,7 +291,7 @@ class TestStop:
                 self.lines.append("AUDIO")
                 super().send_audio(pcm, sample_rate)
 
-        def blocked_decoder(mp3, ffmpeg_path, sample_rate):
+        def blocked_decoder(mp3, ffmpeg_path, sample_rate, cancel):
             entered_decode.set()
             release_decode.wait()
             return b"\x01\x00" * 8
@@ -647,6 +647,64 @@ class TestPauseFallback:
         assert module._mark_ahead(chunks, 0) is True
         assert module._mark_ahead(chunks, 1) is False
         assert module._mark_ahead(chunks, 2) is False
+
+
+class TestDecoderLifetime:
+    """Cancelling speech leaves no decoder thread behind."""
+
+    def test_stop_leaves_no_decode_thread_running(self):
+        entered = threading.Event()
+        cancel_seen = threading.Event()
+
+        def cancellable_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            entered.set()
+            if not cancel.wait(3):
+                raise AssertionError("cancel event was never set")
+            cancel_seen.set()
+            from desktop.audio import DecodeCancelled
+
+            raise DecodeCancelled("cancelled during decode")
+
+        fake_io = _FakeIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            _FakeClient(),
+            decoder=cancellable_decoder,
+        )
+        engine.handle_speak(SSML)
+        assert entered.wait(2)
+
+        engine.handle_stop()
+        assert engine.wait_idle(3)
+        assert cancel_seen.is_set()
+        assert fake_io.lines.count("703 STOP") == 1
+        assert not [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "free-tts-decode"
+        ]
+
+    def test_decoder_receives_the_generation_cancel_event(self):
+        seen = {}
+
+        def recording_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            seen["cancel"] = cancel
+            return b"\x01\x00" * 8
+
+        fake_io = _FakeIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            _FakeClient(),
+            decoder=recording_decoder,
+        )
+        engine.handle_speak(SSML)
+        assert engine.wait_idle(3)
+        assert isinstance(seen["cancel"], threading.Event)
+        assert fake_io.lines[-1] == "702 END"
 
 
 class TestCheckFfmpeg:

@@ -17,7 +17,13 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from desktop import protocol
-from desktop.audio import SAMPLE_RATE, DecodeError, apply_gain, decode_mp3
+from desktop.audio import (
+    SAMPLE_RATE,
+    DecodeCancelled,
+    DecodeError,
+    apply_gain,
+    decode_mp3,
+)
 from desktop.backend import BackendController, BackendUnavailable
 from desktop.chunks import split_marked
 from desktop.settings import (
@@ -115,8 +121,11 @@ class SpeechEngine:
         self._controller = controller
         self._client = client
         self._decode = decoder or (
-            lambda mp3, ffmpeg_path, sample_rate: decode_mp3(
-                mp3, ffmpeg_path=ffmpeg_path, sample_rate=sample_rate
+            lambda mp3, ffmpeg_path, sample_rate, cancel: decode_mp3(
+                mp3,
+                ffmpeg_path=ffmpeg_path,
+                sample_rate=sample_rate,
+                cancel=cancel,
             )
         )
         self.catalog: VoiceCatalog | None = None
@@ -311,38 +320,6 @@ class SpeechEngine:
             action()
             return True
 
-    def _decode_interruptibly(
-        self, generation: _GenerationToken, mp3: bytes
-    ) -> bytes:
-        """Stop waiting for a decoder as soon as this generation is cancelled."""
-        done = threading.Event()
-        result: list[bytes] = []
-        errors: list[BaseException] = []
-
-        def decode() -> None:
-            try:
-                result.append(
-                    self._decode(mp3, self._config.ffmpeg_path, SAMPLE_RATE)
-                )
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                done.set()
-
-        threading.Thread(
-            target=decode,
-            name="free-tts-decode",
-            daemon=True,
-        ).start()
-        while not done.wait(0.02):
-            if self._should_abort(generation):
-                raise Cancelled("aborted while decoding")
-        if self._should_abort(generation):
-            raise Cancelled("aborted after decoding")
-        if errors:
-            raise errors[0]
-        return result[0]
-
     def _speak_worker(
         self,
         generation: _GenerationToken,
@@ -395,7 +372,13 @@ class SpeechEngine:
                         outcome = "stop"
                         break
                     pcm = apply_gain(
-                        self._decode_interruptibly(generation, mp3), gain
+                        self._decode(
+                            mp3,
+                            self._config.ffmpeg_path,
+                            SAMPLE_RATE,
+                            generation.cancelled,
+                        ),
+                        gain,
                     )
                     if self._should_abort(generation):
                         outcome = "stop"
@@ -435,7 +418,7 @@ class SpeechEngine:
                     ):
                         outcome = "pause"
                         break
-            except Cancelled:
+            except (Cancelled, DecodeCancelled):
                 outcome = "stop"
             except (SynthError, DecodeError) as exc:
                 logger.error("Synthesis aborted: %s", exc)
