@@ -8,5 +8,6 @@ dist/
 build/
 .venv/
 venv/
+.venv-dev/
 config.json
 insight-china-full.mp3

@@ -27,6 +27,19 @@ Select text on any page and hear it spoken — Edge-style sentence-by-sentence r
 - **Popup** — voice selector, speed slider, text input, Speak/Pause/Stop buttons
 - **Options** — configurable server URL (host + port) and highlight color
 
+### Desktop TTS engine (Okular, KDE, any Speech Dispatcher client)
+Use free-tts voices from Okular's built-in **Tools > Speak** actions by installing
+a per-user Speech Dispatcher output module:
+
+```bash
+sudo pacman -S --needed speech-dispatcher ffmpeg   # or your distro's equivalent
+python -m desktop.install install
+```
+
+The backend starts on demand and exits when idle. See
+[docs/desktop-tts.md](docs/desktop-tts.md) for configuration, verification, and
+uninstall.
+
 ## Quick Start
 
 ```bash

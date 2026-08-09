@@ -453,6 +453,10 @@ def run(argv: list[str], stdin: object, stdout: object) -> int:
             else:
                 io.send(protocol.ERR_BAD_SYNTAX)
         elif line == "QUIT":
+            # speechd sends STOP before QUIT when it wants to abort, so a
+            # bare QUIT must let the current message finish, not kill it.
+            while not engine.wait_idle():
+                pass
             engine.close()
             io.send(protocol.OK_QUIT)
             return 0
