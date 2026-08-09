@@ -38,6 +38,8 @@ MANIFEST_NAME = "install-manifest.json"
 RUNTIME_ENTRIES = ("server.py", "requirements.txt", "config.example.json", "desktop")
 _PRESERVED = (".venv", "config.json")
 
+SPEECHD_PROCESS_NAMES = ("speech-dispatcher",)
+
 _LAUNCHER_TEMPLATE = """#!/bin/sh
 # Managed by free-tts install. Launched by Speech Dispatcher as: {launcher} <conf>
 FREE_TTS_HOME={root}
@@ -639,13 +641,35 @@ def _read_speechd_pid(path: pathlib.Path) -> int | None:
     return pid
 
 
+def _process_identity(pid: int) -> str | None:
+    """Basename of the live process's program, or None if it cannot be read."""
+    try:
+        return os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            argv0 = stream.read().split(b"\0")[0]
+    except OSError:
+        return None
+    if not argv0:
+        return None
+    return os.path.basename(argv0.decode("utf-8", "replace"))
+
+
 def restart_speech_dispatcher(
-    kill: Callable[[int, int], None] = os.kill,
+    *,
+    opener: Callable[[int, int], int] = os.pidfd_open,
+    sender: Callable[[int, int], None] = signal.pidfd_send_signal,
+    identity: Callable[[int], str | None] = _process_identity,
 ) -> bool:
     """Reload the user's running Speech Dispatcher with ``SIGHUP``.
 
-    A missing PID file or stale PID means no daemon is currently running; its
-    next start will read the updated configuration.
+    The recorded PID is pinned with a pidfd before it is signalled, so a PID that
+    has already been recycled cannot be reached: signalling a stale pidfd fails
+    instead of hitting whatever process now owns that number. A missing PID file,
+    an exited daemon, or a process that is not Speech Dispatcher is a no-op,
+    because the next daemon start reads the updated configuration anyway.
     """
     pid_path = _speechd_pid_path()
     if pid_path is None:
@@ -657,15 +681,47 @@ def restart_speech_dispatcher(
     if pid is None:
         logger.info("No running Speech Dispatcher to reload at %s.", pid_path)
         return False
+
     try:
-        kill(pid, signal.SIGHUP)
+        descriptor = opener(pid, 0)
     except ProcessLookupError:
         logger.info("Speech Dispatcher PID %d is no longer running.", pid)
         return False
-    except (OSError, OverflowError, ValueError) as exc:
-        raise InstallError(
-            f"could not signal Speech Dispatcher PID {pid} to reload: {exc}"
-        ) from exc
+    except (AttributeError, NotImplementedError, OSError) as exc:
+        logger.warning(
+            "Cannot pin Speech Dispatcher PID %d for a safe reload (%s); "
+            "restart Speech Dispatcher manually to load the new configuration.",
+            pid,
+            exc,
+        )
+        return False
+
+    try:
+        # The pidfd already pins one process, so this check cannot be raced into
+        # signalling a different one: if the pinned process exited, the send below
+        # fails rather than reaching a recycled PID.
+        name = identity(pid)
+        if name not in SPEECHD_PROCESS_NAMES:
+            logger.warning(
+                "PID %d from %s is %s, not Speech Dispatcher; refusing to signal "
+                "it. Restart Speech Dispatcher manually if it is running.",
+                pid,
+                pid_path,
+                name if name is not None else "gone",
+            )
+            return False
+        try:
+            sender(descriptor, signal.SIGHUP)
+        except ProcessLookupError:
+            logger.info("Speech Dispatcher PID %d exited before reload.", pid)
+            return False
+        except (OSError, OverflowError, ValueError) as exc:
+            raise InstallError(
+                f"could not signal Speech Dispatcher PID {pid} to reload: {exc}"
+            ) from exc
+    finally:
+        os.close(descriptor)
+
     logger.info("Reloaded Speech Dispatcher configuration for PID %d.", pid)
     return True
 

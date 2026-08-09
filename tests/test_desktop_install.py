@@ -552,45 +552,14 @@ class TestPaths:
 
 
 class TestRestart:
-    def test_missing_daemon_is_a_no_op(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-        assert install.restart_speech_dispatcher() is False
+    @staticmethod
+    def _pid_file(runtime):
+        return runtime / "speech-dispatcher" / "pid" / "speech-dispatcher.pid"
 
-    def test_malformed_pid_file_is_actionable(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-        pid_file = (
-            tmp_path
-            / "speech-dispatcher"
-            / "pid"
-            / "speech-dispatcher.pid"
-        )
-        pid_file.parent.mkdir(parents=True)
-        pid_file.write_text("not-a-pid\n")
-
-        with pytest.raises(install.InstallError, match="PID|pid"):
-            install.restart_speech_dispatcher()
-
-    def test_signal_failure_is_actionable(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-        pid_file = (
-            tmp_path
-            / "speech-dispatcher"
-            / "pid"
-            / "speech-dispatcher.pid"
-        )
-        pid_file.parent.mkdir(parents=True)
-        pid_file.write_text(f"{os.getpid()}\n")
-
-        def deny_signal(_pid, _signal):
-            raise PermissionError("signal denied")
-
-        with pytest.raises(install.InstallError, match="reload|signal"):
-            install.restart_speech_dispatcher(kill=deny_signal)
-
-    def test_sends_real_sighup_to_pid_file_process(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    @staticmethod
+    def _daemon():
         script = (
-            "import signal\n"
+            "import signal, sys\n"
             "def reload_config(_signum, _frame):\n"
             "    print('RELOADED', flush=True)\n"
             "    raise SystemExit(0)\n"
@@ -604,23 +573,115 @@ class TestRestart:
             stderr=subprocess.PIPE,
             text=True,
         )
+        assert process.stdout is not None
+        assert process.stdout.readline() == "READY\n"
+        return process
+
+    def test_missing_daemon_is_a_no_op(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        assert install.restart_speech_dispatcher() is False
+
+    def test_malformed_pid_file_is_actionable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        pid_file = self._pid_file(tmp_path)
+        pid_file.parent.mkdir(parents=True)
+        pid_file.write_text("not-a-pid\n")
+
+        with pytest.raises(install.InstallError, match="PID|pid"):
+            install.restart_speech_dispatcher()
+
+    def test_recycled_pid_of_another_process_is_never_signalled(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        process = self._daemon()
         try:
-            assert process.stdout is not None
-            assert process.stdout.readline() == "READY\n"
-            pid_file = (
-                tmp_path
-                / "speech-dispatcher"
-                / "pid"
-                / "speech-dispatcher.pid"
-            )
+            pid_file = self._pid_file(tmp_path)
             pid_file.parent.mkdir(parents=True)
             pid_file.write_text(f"{process.pid}\n")
 
-            reloaded = install.restart_speech_dispatcher()
+            # Real identity: an ordinary Python child is not Speech Dispatcher.
+            assert install.restart_speech_dispatcher() is False
+            assert process.poll() is None
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
+    def test_exited_pid_is_a_no_op(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        process = self._daemon()
+        process.terminate()
+        process.wait(timeout=3)
+        pid_file = self._pid_file(tmp_path)
+        pid_file.parent.mkdir(parents=True)
+        pid_file.write_text(f"{process.pid}\n")
+
+        assert (
+            install.restart_speech_dispatcher(
+                identity=lambda _pid: "speech-dispatcher"
+            )
+            is False
+        )
+
+    def test_unsupported_pidfd_does_not_signal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        process = self._daemon()
+        try:
+            pid_file = self._pid_file(tmp_path)
+            pid_file.parent.mkdir(parents=True)
+            pid_file.write_text(f"{process.pid}\n")
+
+            def unsupported(_pid, _flags):
+                raise NotImplementedError("pidfd unavailable")
+
+            assert (
+                install.restart_speech_dispatcher(
+                    opener=unsupported,
+                    identity=lambda _pid: "speech-dispatcher",
+                )
+                is False
+            )
+            assert process.poll() is None
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
+    def test_signal_failure_is_actionable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        process = self._daemon()
+        try:
+            pid_file = self._pid_file(tmp_path)
+            pid_file.parent.mkdir(parents=True)
+            pid_file.write_text(f"{process.pid}\n")
+
+            def deny(_descriptor, _signal):
+                raise PermissionError("signal denied")
+
+            with pytest.raises(install.InstallError, match="reload|signal"):
+                install.restart_speech_dispatcher(
+                    sender=deny,
+                    identity=lambda _pid: "speech-dispatcher",
+                )
+            assert process.poll() is None
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
+    def test_sends_real_sighup_through_a_pidfd(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        process = self._daemon()
+        try:
+            pid_file = self._pid_file(tmp_path)
+            pid_file.parent.mkdir(parents=True)
+            pid_file.write_text(f"{process.pid}\n")
+
+            reloaded = install.restart_speech_dispatcher(
+                identity=lambda _pid: "speech-dispatcher"
+            )
             try:
                 stdout, stderr = process.communicate(timeout=3)
             except subprocess.TimeoutExpired:
-                pytest.fail("Speech Dispatcher PID did not receive SIGHUP")
+                pytest.fail("the verified daemon did not receive SIGHUP")
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -629,3 +690,7 @@ class TestRestart:
         assert reloaded is True
         assert process.returncode == 0, stderr
         assert stdout == "RELOADED\n"
+
+    def test_identity_reads_the_live_executable(self):
+        assert install._process_identity(os.getpid()) is not None
+        assert install._process_identity(2**31 - 1) is None
