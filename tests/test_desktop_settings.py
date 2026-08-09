@@ -85,6 +85,57 @@ class TestLoadConfig:
         assert settings.config_path() == tmp_path / ".config" / "free-tts" / "config.json"
 
 
+class TestBackendUrlValidation:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "/health",
+            "127.0.0.1:5000",
+            "ftp://127.0.0.1:5000",
+            "http://",
+            "http://127.0.0.1:notaport",
+            "http://user:pass@127.0.0.1:5000",
+            "http://127.0.0.1:5000/api",
+            "http://127.0.0.1:5000?x=1",
+            "http://127.0.0.1:5000#frag",
+        ],
+    )
+    def test_unusable_urls_are_rejected(self, tmp_path, raw):
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"backend_url": raw}))
+        with pytest.raises(settings.ConfigError):
+            settings.load_config(path, env={})
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("http://127.0.0.1:5000", "http://127.0.0.1:5000"),
+            ("http://127.0.0.1:5000/", "http://127.0.0.1:5000"),
+            ("https://localhost:8443", "https://localhost:8443"),
+            ("http://localhost", "http://localhost"),
+            ("  http://127.0.0.1:5000  ", "http://127.0.0.1:5000"),
+        ],
+    )
+    def test_valid_urls_normalize(self, tmp_path, raw, expected):
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"backend_url": raw}))
+        assert settings.load_config(path, env={}).backend_url == expected
+
+    def test_env_value_is_validated_too(self, tmp_path):
+        with pytest.raises(settings.ConfigError):
+            settings.load_config(
+                tmp_path / "missing.json", env={"FREE_TTS_BACKEND_URL": "nonsense"}
+            )
+
+    def test_validator_returns_normalized_url(self):
+        assert (
+            settings.validate_backend_url("http://127.0.0.1:5000/")
+            == "http://127.0.0.1:5000"
+        )
+
+
 class TestMapRate:
     @pytest.mark.parametrize(
         "raw,expected",

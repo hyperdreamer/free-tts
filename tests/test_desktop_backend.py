@@ -224,3 +224,23 @@ class TestPaths:
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         with backend.file_lock():
             assert backend.lock_path().exists()
+
+
+class TestMalformedBackendUrl:
+    """A bad address must degrade to an unavailable backend, not an exception."""
+
+    def test_probe_reports_unreachable_for_an_unusable_url(self):
+        config = dataclasses.replace(settings.DEFAULTS, backend_url="")
+        controller = backend.BackendController(config)
+        health = controller.probe()
+        assert health.reachable is False
+        assert health.ready is False
+        assert health.detail
+
+    def test_ensure_ready_raises_backend_unavailable(self):
+        config = dataclasses.replace(
+            settings.DEFAULTS, backend_url="", autostart=False
+        )
+        controller = backend.BackendController(config)
+        with pytest.raises(backend.BackendUnavailable):
+            controller.ensure_ready()

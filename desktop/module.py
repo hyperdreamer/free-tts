@@ -28,6 +28,7 @@ from desktop.backend import BackendController, BackendUnavailable
 from desktop.chunks import split_marked
 from desktop.settings import (
     AdapterConfig,
+    ConfigError,
     load_config,
     map_pitch,
     map_rate,
@@ -542,7 +543,13 @@ def _configure_logging() -> None:
 def run(argv: list[str], stdin: object, stdout: object) -> int:
     """Perform the INIT handshake and then serve commands until QUIT or EOF."""
     io = protocol.ProtocolIO(stdin, stdout)  # type: ignore[arg-type]
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        # INIT has not been answered yet, so read it first and then refuse.
+        io.read_line()
+        io.send_multiline([f"399-{exc}"], protocol.ERR_CANT_INIT)
+        return 1
 
     first = io.read_line()
     if first != "INIT":

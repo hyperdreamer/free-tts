@@ -162,6 +162,10 @@ class BackendController:
             payload = self._fetch(url, _PROBE_TIMEOUT)
         except OSError as exc:
             return Health(False, False, False, str(exc))
+        except (ValueError, UnicodeError) as exc:
+            # A malformed backend_url reaches urllib as ValueError; report it as
+            # an unusable backend instead of killing the command loop.
+            return Health(False, False, False, f"invalid backend_url: {exc}")
         if not isinstance(payload, dict):
             return Health(True, False, False, "health response was not an object")
         if payload.get("service") != _SERVICE_NAME:

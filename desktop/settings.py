@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import pathlib
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -42,6 +43,46 @@ DEFAULTS = AdapterConfig(
 
 _INT_FIELDS = ("idle_timeout", "startup_timeout", "request_timeout", "max_chunk_chars")
 _STR_FIELDS = ("backend_url", "ffmpeg_path")
+
+
+class ConfigError(Exception):
+    """Configuration cannot be used, with a message safe to show at INIT."""
+
+
+_ALLOWED_SCHEMES = ("http", "https")
+
+
+def validate_backend_url(value: str) -> str:
+    """Return a normalized backend URL or raise ``ConfigError``.
+
+    The adapter builds request URLs by string concatenation, so an unusable base
+    would otherwise surface as an uncaught ValueError deep inside urllib.
+    """
+    candidate = value.strip().rstrip("/")
+    if not candidate:
+        raise ConfigError("backend_url must not be empty")
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise ConfigError(
+            f"backend_url must use http or https, got {parsed.scheme!r}"
+        )
+    if not parsed.hostname:
+        raise ConfigError("backend_url must include a hostname")
+    if parsed.username or parsed.password:
+        raise ConfigError("backend_url must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ConfigError("backend_url must not contain a query or fragment")
+    if parsed.path not in ("", "/"):
+        raise ConfigError(
+            f"backend_url must not include a path, got {parsed.path!r}"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"backend_url has an invalid port: {exc}") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(f"backend_url port is out of range: {port}")
+    return candidate
 
 
 def config_path() -> pathlib.Path:
@@ -103,7 +144,10 @@ def load_config(
     for field in _STR_FIELDS:
         value = env.get(f"FREE_TTS_{field.upper()}", raw.get(field))
         if value is not None:
-            updates[field] = str(value).strip().rstrip("/")
+            cleaned = str(value).strip().rstrip("/")
+            if field == "backend_url":
+                cleaned = validate_backend_url(str(value))
+            updates[field] = cleaned
     for field in _INT_FIELDS:
         value = env.get(f"FREE_TTS_{field.upper()}", raw.get(field))
         if value is not None:

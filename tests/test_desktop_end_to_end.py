@@ -379,3 +379,21 @@ class TestStdoutDiscipline:
             if not line or line.startswith(b"705-AUDIO"):
                 continue
             assert line[:1].isdigit(), f"non-protocol line on stdout: {line!r}"
+
+
+class TestMalformedConfiguration:
+    def test_invalid_backend_url_fails_init_without_crashing(self):
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg not installed")
+        env = _module_env("http://127.0.0.1:9")
+        env["FREE_TTS_BACKEND_URL"] = "not-a-url"
+        result = subprocess.run(
+            [sys.executable, "-m", "desktop.module", "/dev/null"],
+            input=b"INIT\nQUIT\n",
+            capture_output=True,
+            env=env,
+            cwd=str(ROOT),
+            timeout=60,
+        )
+        assert b"399" in result.stdout
+        assert b"Traceback" not in result.stderr
