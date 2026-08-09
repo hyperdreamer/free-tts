@@ -8,6 +8,7 @@
     "tts_stall_timeout": 60,
     "max_concurrent": 2,
     "queue_timeout": 30,
+    "idle_timeout": 0,
     "cors_origins": [
         "null",
         "^https?://localhost(?::\\d+)?$",

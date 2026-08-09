@@ -179,6 +179,13 @@ _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
 )
 """Per-worker thread-safe limiter for concurrent TTS generation."""
 
+TTS_IDLE_TIMEOUT: int = _cfg_int("idle_timeout", "TTS_IDLE_TIMEOUT", 0, minimum=0)
+"""Seconds of inactivity before self-shutdown. 0 = never (the default).
+
+Only the desktop adapter sets this, for a backend it started itself. A backend
+started by hand keeps running.
+"""
+
 WAITRESS_THREADS: int = _cfg_int(
     "waitress_threads", "TTS_WAITRESS_THREADS", 4, minimum=1
 )
@@ -768,6 +775,57 @@ def _error_message(exc: Exception, is_client_error: bool = False) -> str:
     return str(exc)
 
 
+class IdleShutdownWatchdog:
+    """Fires ``on_shutdown`` after ``timeout`` seconds with no synthesis.
+
+    Pure logic: it never reads the wall clock directly and never starts a
+    thread, so its behavior is fully testable with an injected clock. Call
+    :meth:`poll` from a supervisor loop.
+    """
+
+    def __init__(
+        self,
+        timeout: int,
+        on_shutdown: Any,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self._timeout = timeout
+        self._on_shutdown = on_shutdown
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._active = 0
+        self._last_activity = clock()
+        self.fired = False
+
+    def begin_request(self) -> None:
+        """Mark a synthesis request as started."""
+        with self._lock:
+            self._active += 1
+
+    def end_request(self) -> None:
+        """Mark a synthesis request as finished and restart the idle window."""
+        with self._lock:
+            if self._active > 0:
+                self._active -= 1
+            self._last_activity = self._clock()
+
+    def poll(self) -> bool:
+        """Return True exactly once, when the idle window has elapsed."""
+        with self._lock:
+            if self.fired or self._timeout <= 0 or self._active > 0:
+                return False
+            if self._clock() - self._last_activity <= self._timeout:
+                return False
+            self.fired = True
+        logger.info("Idle for %ds with no synthesis; shutting down.", self._timeout)
+        self._on_shutdown()
+        return True
+
+
+_IDLE_WATCHDOG: IdleShutdownWatchdog | None = None
+"""Set by create_app() when idle shutdown is enabled."""
+
+
 # ---------------------------------------------------------------------------
 # Application factory
 # ---------------------------------------------------------------------------
@@ -808,6 +866,24 @@ def create_app() -> Flask:
             asyncio.run(_refresh_voice_cache())
         except Exception as exc:
             logger.error("Failed to initialise voice cache: %s", exc)
+
+    # Arm idle shutdown only when explicitly enabled (adapter-started backends)
+    global _IDLE_WATCHDOG
+    if _IDLE_WATCHDOG is None and TTS_IDLE_TIMEOUT > 0:
+        _IDLE_WATCHDOG = IdleShutdownWatchdog(
+            timeout=TTS_IDLE_TIMEOUT,
+            on_shutdown=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        )
+        watchdog = _IDLE_WATCHDOG
+
+        def _idle_supervisor() -> None:
+            while not watchdog.poll():
+                time.sleep(1.0)
+
+        threading.Thread(
+            target=_idle_supervisor, name="idle-shutdown", daemon=True
+        ).start()
+        logger.info("Idle shutdown armed: %ds.", TTS_IDLE_TIMEOUT)
 
     # -- Request logging -----------------------------------------------------
     @app.before_request
@@ -916,6 +992,8 @@ def create_app() -> Flask:
         cancel_event = (
             _register_cancel_token(request_id) if request_id is not None else None
         )
+        if _IDLE_WATCHDOG is not None:
+            _IDLE_WATCHDOG.begin_request()
         try:
             if _TTS_SEMAPHORE is not None:
                 acquired = _TTS_SEMAPHORE.acquire(timeout=TTS_QUEUE_TIMEOUT)
@@ -942,6 +1020,8 @@ def create_app() -> Flask:
             logger.exception("Unexpected TTS error")
             return jsonify({"error": _error_message(exc)}), 500  # type: ignore[return-value]
         finally:
+            if _IDLE_WATCHDOG is not None:
+                _IDLE_WATCHDOG.end_request()
             if request_id is not None:
                 _release_cancel_token(request_id)
 

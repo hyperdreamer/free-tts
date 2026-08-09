@@ -659,3 +659,91 @@ class TestCancellation:
         with mock.patch.object(server.edge_tts, "Communicate", return_value=_Comm()):
             with pytest.raises(server.CancelledError):
                 asyncio.run(server.generate_audio(req, cancel_event=token))
+
+
+class TestIdleShutdownWatchdog:
+    """Idle shutdown is opt-in and must never fire during synthesis."""
+
+    def _watchdog(self, timeout=300):
+        now = [1000.0]
+        calls = []
+        dog = server.IdleShutdownWatchdog(
+            timeout=timeout,
+            on_shutdown=lambda: calls.append("shutdown"),
+            clock=lambda: now[0],
+        )
+        return dog, now, calls
+
+    def test_does_not_fire_before_timeout(self):
+        dog, now, calls = self._watchdog()
+        now[0] += 299
+        assert dog.poll() is False
+        assert calls == []
+
+    def test_fires_after_timeout(self):
+        dog, now, calls = self._watchdog()
+        now[0] += 301
+        assert dog.poll() is True
+        assert calls == ["shutdown"]
+
+    def test_never_fires_while_request_active(self):
+        dog, now, calls = self._watchdog()
+        dog.begin_request()
+        now[0] += 100_000
+        assert dog.poll() is False
+        assert calls == []
+
+    def test_timer_restarts_after_request_ends(self):
+        dog, now, calls = self._watchdog()
+        dog.begin_request()
+        now[0] += 100_000
+        dog.end_request()
+        now[0] += 299
+        assert dog.poll() is False
+        now[0] += 2
+        assert dog.poll() is True
+
+    def test_fires_only_once(self):
+        dog, now, calls = self._watchdog()
+        now[0] += 301
+        assert dog.poll() is True
+        assert dog.poll() is False
+        assert calls == ["shutdown"]
+
+    def test_overlapping_requests_use_refcount(self):
+        dog, now, calls = self._watchdog()
+        dog.begin_request()
+        dog.begin_request()
+        dog.end_request()
+        now[0] += 100_000
+        assert dog.poll() is False
+        dog.end_request()
+        now[0] += 301
+        assert dog.poll() is True
+
+    def test_disabled_when_timeout_zero(self):
+        dog, now, calls = self._watchdog(timeout=0)
+        now[0] += 100_000
+        assert dog.poll() is False
+        assert calls == []
+
+    def test_health_check_does_not_extend_idle_window(self, monkeypatch):
+        """Only synthesis touches the watchdog; /health must not."""
+        dog, now, calls = self._watchdog()
+        monkeypatch.setattr(server, "_IDLE_WATCHDOG", dog)
+        with (
+            mock.patch.object(server, "_voice_cache_ready", True),
+            mock.patch.object(server, "_voice_cache", []),
+        ):
+            app = server.create_app()
+            app.config["TESTING"] = True
+            with app.test_client() as client:
+                now[0] += 200
+                client.get("/health")
+                now[0] += 101
+                assert dog.poll() is True
+
+    def test_default_idle_timeout_is_disabled(self, monkeypatch):
+        monkeypatch.delenv("TTS_IDLE_TIMEOUT", raising=False)
+        with mock.patch.object(server, "_CONFIG_CACHE", {}):
+            assert server._cfg_int("idle_timeout", "TTS_IDLE_TIMEOUT", 0, minimum=0) == 0
