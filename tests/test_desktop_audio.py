@@ -70,6 +70,57 @@ class _FakeProcess:
         self._released.set()
 
 
+class _OwnedPipe:
+    def __init__(self, release_io, *, wakes_io):
+        self.closed = False
+        self._release_io = release_io
+        self._wakes_io = wakes_io
+
+    def close(self):
+        self.closed = True
+        if self._wakes_io:
+            self._release_io.set()
+
+
+class _BlockedTransportProcess:
+    """Reaped child whose communicate call needs its parent pipes closed."""
+
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+        self.reaped = False
+        self.communicate_calls = 0
+        self.io_entered = threading.Event()
+        self._io_released = threading.Event()
+        self.stdin = _OwnedPipe(self._io_released, wakes_io=False)
+        self.stdout = _OwnedPipe(self._io_released, wakes_io=True)
+        self.stderr = _OwnedPipe(self._io_released, wakes_io=True)
+
+    def communicate(self, input=None, timeout=None):
+        self.communicate_calls += 1
+        self.io_entered.set()
+        if not self._io_released.wait(5):
+            raise AssertionError("owned decoder pipes were never closed")
+        return b"", b""
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
+        self.reaped = True
+        return self.returncode
+
+    def release_io(self):
+        self._io_released.set()
+
+
 class TestDecodeMp3:
     def test_returns_pcm_from_stdout(self):
         captured = {}
@@ -180,6 +231,47 @@ class TestDecodeMp3:
             for thread in threading.enumerate()
             if thread.name == "free-tts-decode-io"
         ]
+
+    def test_cancellation_closes_pipes_and_joins_blocked_decode_io(self):
+        process = _BlockedTransportProcess()
+        cancel = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        def decode():
+            try:
+                audio.decode_mp3(
+                    b"x", cancel=cancel, popen_factory=lambda *a, **k: process
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for assertion
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=decode, daemon=True)
+        worker.start()
+        assert process.io_entered.wait(2)
+        cancel.set()
+
+        try:
+            assert finished.wait(2)
+            assert worker.is_alive() is False
+            assert isinstance(errors[0], audio.DecodeCancelled)
+            assert process.terminated is True
+            assert process.killed is True
+            assert process.reaped is True
+            assert process.communicate_calls == 1
+            assert process.stdin.closed is True
+            assert process.stdout.closed is True
+            assert process.stderr.closed is True
+            assert not [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "free-tts-decode-io"
+            ]
+        finally:
+            process.release_io()
+            worker.join(3)
 
     def test_real_ffmpeg_decodes_generated_tone(self):
         """Integration guard: only runs when ffmpeg is actually installed."""

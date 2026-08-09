@@ -3,11 +3,12 @@
 import contextlib
 import dataclasses
 import io
+import json
 import threading
 
 import pytest
 
-from desktop import backend, module, settings, voices
+from desktop import backend, module, settings, synth, voices
 
 PAYLOAD = {
     "default_voice": "en-US-AvaMultilingualNeural",
@@ -582,6 +583,91 @@ class TestCancellationOwnership:
         finally:
             release_decode.set()
             post_cancelled.set()
+            engine.wait_idle(3)
+
+    def test_pause_interrupts_lookahead_retry_after_at_boundary(self):
+        retry_wait_entered = threading.Event()
+        pause_boundary_reached = threading.Event()
+        release_uninterruptible_wait = threading.Event()
+        retry_post_started = threading.Event()
+        decode_entered = threading.Event()
+        release_decode = threading.Event()
+        pause_emitted = threading.Event()
+
+        class TimelineIO(_FakeIO):
+            def event_pause(self):
+                super().event_pause()
+                pause_emitted.set()
+
+        class RetryTransport:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.post_calls = 0
+
+            def __call__(self, method, url, body, timeout):
+                if method == "GET":
+                    return 200, {}, json.dumps(PAYLOAD).encode("utf-8")
+                if method == "DELETE":
+                    return 200, {}, b'{"cancelled": true}'
+                assert method == "POST"
+                with self._lock:
+                    self.post_calls += 1
+                    post_call = self.post_calls
+                if post_call == 1:
+                    return 200, {}, b"current-mp3"
+                if post_call == 2:
+                    return 503, {"Retry-After": "5"}, b"{}"
+                retry_post_started.set()
+                return 200, {}, b"unexpected-retry-mp3"
+
+        def retry_sleep(seconds):
+            retry_wait_entered.set()
+            if seconds >= 1.0:
+                release_uninterruptible_wait.wait(3)
+            else:
+                pause_boundary_reached.wait(3)
+
+        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            decode_entered.set()
+            assert release_decode.wait(3)
+            return b"\x01\x00" * 8
+
+        class BoundaryObservedEngine(module.SpeechEngine):
+            def _reach_pause_boundary(self, generation):
+                reached = super()._reach_pause_boundary(generation)
+                pause_boundary_reached.set()
+                return reached
+
+        transport = RetryTransport()
+        client = synth.SynthClient(
+            settings.DEFAULTS, transport=transport, sleep=retry_sleep
+        )
+        fake_io = TimelineIO()
+        engine = BoundaryObservedEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            client,
+            decoder=gated_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert retry_wait_entered.wait(2)
+        assert decode_entered.wait(2)
+
+        try:
+            engine.handle_pause()
+            release_decode.set()
+            assert pause_emitted.wait(1)
+            assert engine.wait_idle(1)
+            assert retry_post_started.is_set() is False
+            assert transport.post_calls == 2
+            assert len(fake_io.audio) == 1
+            assert fake_io.lines.count("704 PAUSE") == 1
+            assert "702 END" not in fake_io.lines
+        finally:
+            release_decode.set()
+            pause_boundary_reached.set()
+            release_uninterruptible_wait.set()
             engine.wait_idle(3)
 
     def test_stale_worker_cannot_cancel_a_newer_generation(self, monkeypatch):

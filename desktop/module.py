@@ -68,6 +68,7 @@ class _GenerationToken:
     def __init__(self) -> None:
         self.cancelled = threading.Event()
         self.pause_requested = threading.Event()
+        self.pause_boundary_reached = threading.Event()
         self._lock = threading.Lock()
         self.requests: set[str] = set()
 
@@ -417,7 +418,11 @@ class SpeechEngine:
                     if generation.pause_requested.is_set() and (
                         chunk.mark or not _mark_ahead(chunks, index)
                     ):
-                        outcome = "pause"
+                        outcome = (
+                            "pause"
+                            if self._reach_pause_boundary(generation)
+                            else "stop"
+                        )
                         break
             except (Cancelled, DecodeCancelled):
                 outcome = "stop"
@@ -460,6 +465,25 @@ class SpeechEngine:
                 or generation.cancelled.is_set()
             )
 
+    def _should_abort_fetch(self, generation: _GenerationToken) -> bool:
+        with self._lock:
+            return (
+                generation is not self._generation
+                or generation.cancelled.is_set()
+                or generation.pause_boundary_reached.is_set()
+            )
+
+    def _reach_pause_boundary(self, generation: _GenerationToken) -> bool:
+        """Make discarded lookahead abortable once the current chunk is done."""
+        with self._lock:
+            if (
+                generation is not self._generation
+                or generation.cancelled.is_set()
+            ):
+                return False
+            generation.pause_boundary_reached.set()
+            return True
+
     def _register_request(self, generation: _GenerationToken) -> str:
         """Create and register a request id owned by ``generation``.
 
@@ -488,17 +512,17 @@ class SpeechEngine:
                 rate,
                 pitch,
                 request_id,
-                should_abort=lambda: self._should_abort(generation),
+                should_abort=lambda: self._should_abort_fetch(generation),
             )
         except Cancelled:
             raise
         except SynthError:
-            if self._should_abort(generation):
+            if self._should_abort_fetch(generation):
                 raise Cancelled("aborted instead of recovering backend")
             self.catalog = None
             self._controller.ensure_ready()  # type: ignore[attr-defined]
             self._refresh_catalog()
-            if self._should_abort(generation):
+            if self._should_abort_fetch(generation):
                 raise Cancelled("aborted before retrying synthesis")
             # A fresh id: the first POST's delivery is ambiguous, so reusing the
             # id could put two live requests under one name.
@@ -510,7 +534,7 @@ class SpeechEngine:
                     rate,
                     pitch,
                     retry_id,
-                    should_abort=lambda: self._should_abort(generation),
+                    should_abort=lambda: self._should_abort_fetch(generation),
                 )
             finally:
                 generation.discard_request(retry_id)

@@ -52,6 +52,15 @@ def _stop_process(process: object) -> None:
         process.wait(timeout=_TERMINATE_GRACE)  # type: ignore[attr-defined]
 
 
+def _close_process_streams(process: object) -> None:
+    """Close every parent pipe so a blocked communicate call can unwind."""
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
 def decode_mp3(
     data: bytes,
     ffmpeg_path: str = "ffmpeg",
@@ -96,11 +105,12 @@ def decode_mp3(
 
     if cancel is not None and cancel.is_set():
         _stop_process(process)
+        _close_process_streams(process)
         raise DecodeCancelled("cancelled before decoding started")
 
     # communicate() is called exactly once, on a thread this function owns and
-    # joins. Cancellation kills the process, which makes that call return, so no
-    # thread and no ffmpeg child can outlive this decode.
+    # joins. Cancellation kills the process and closes the parent pipe endpoints,
+    # so neither that I/O operation nor the ffmpeg child can outlive this decode.
     outcome: dict[str, object] = {}
 
     def pump() -> None:
@@ -109,36 +119,44 @@ def decode_mp3(
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
             outcome["error"] = exc
 
-    pump_thread = threading.Thread(target=pump, name="free-tts-decode-io")
-    pump_thread.start()
-    while pump_thread.is_alive():
+    pump_thread = threading.Thread(
+        target=pump, name="free-tts-decode-io", daemon=False
+    )
+    try:
+        pump_thread.start()
+        while pump_thread.is_alive():
+            if cancel is not None and cancel.is_set():
+                raise DecodeCancelled("cancelled while decoding")
+            pump_thread.join(_POLL_INTERVAL)
+
+        error = outcome.get("error")
+        if isinstance(error, OSError):
+            raise DecodeError(f"ffmpeg failed: {error}") from error
+        if isinstance(error, BaseException):
+            raise error
+        stdout, stderr = outcome["result"]  # type: ignore[misc]
+
         if cancel is not None and cancel.is_set():
+            raise DecodeCancelled("cancelled after decoding")
+        if getattr(process, "returncode", 1) != 0:
+            detail = stderr or b""
+            raise DecodeError(
+                f"ffmpeg failed: {detail.decode('utf-8', 'replace').strip()[:200]}"
+            )
+        pcm = stdout or b""
+        if not pcm:
+            raise DecodeError("ffmpeg produced no audio")
+        usable = len(pcm) - (len(pcm) % _FRAME_BYTES)
+        return pcm[:usable]
+    except BaseException:
+        if pump_thread.is_alive() or getattr(process, "returncode", None) is None:
             _stop_process(process)
-            pump_thread.join(_TERMINATE_GRACE * 2)
-            raise DecodeCancelled("cancelled while decoding")
-        pump_thread.join(_POLL_INTERVAL)
-
-    error = outcome.get("error")
-    if isinstance(error, OSError):
-        _stop_process(process)
-        raise DecodeError(f"ffmpeg failed: {error}") from error
-    if isinstance(error, BaseException):
-        _stop_process(process)
-        raise error
-    stdout, stderr = outcome["result"]  # type: ignore[misc]
-
-    if cancel is not None and cancel.is_set():
-        raise DecodeCancelled("cancelled after decoding")
-    if getattr(process, "returncode", 1) != 0:
-        detail = stderr or b""
-        raise DecodeError(
-            f"ffmpeg failed: {detail.decode('utf-8', 'replace').strip()[:200]}"
-        )
-    pcm = stdout or b""
-    if not pcm:
-        raise DecodeError("ffmpeg produced no audio")
-    usable = len(pcm) - (len(pcm) % _FRAME_BYTES)
-    return pcm[:usable]
+        _close_process_streams(process)
+        if pump_thread.is_alive():
+            pump_thread.join()
+        raise
+    finally:
+        _close_process_streams(process)
 
 
 def apply_gain(pcm: bytes, gain: float) -> bytes:

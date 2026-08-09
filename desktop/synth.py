@@ -15,6 +15,7 @@ from desktop.settings import AdapterConfig
 logger = logging.getLogger("free-tts.synth")
 
 _MAX_RETRY_DELAY = 5.0
+_RETRY_ABORT_POLL_INTERVAL = 0.05
 _CANCEL_TIMEOUT = 5.0
 _CANCEL_HANDOFF_SECONDS = 1.0
 _CANCEL_RETRY_INTERVAL = 0.05
@@ -137,14 +138,34 @@ class SynthClient:
             if status == 499:
                 raise Cancelled("backend reported the request as cancelled")
             if status == 503 and attempt == 1:
-                if should_abort is not None and should_abort():
-                    raise Cancelled("aborted instead of retrying")
-                self._sleep(self._retry_delay(headers))
+                self._wait_before_retry(self._retry_delay(headers), should_abort)
                 continue
             if status == 503:
                 raise SynthError("backend busy after retry")
             raise SynthError(self._error_detail(status, body))
         raise SynthError("backend busy after retry")
+
+    def _wait_before_retry(
+        self,
+        delay: float,
+        should_abort: Callable[[], bool] | None,
+    ) -> None:
+        """Wait for Retry-After while keeping STOP and discarded work prompt."""
+        if should_abort is None:
+            self._sleep(delay)
+            return
+
+        remaining = delay
+        while remaining > 0.0:
+            if should_abort():
+                raise Cancelled("aborted during retry wait")
+            interval = min(_RETRY_ABORT_POLL_INTERVAL, remaining)
+            self._sleep(interval)
+            if should_abort():
+                raise Cancelled("aborted during retry wait")
+            remaining = max(0.0, remaining - interval)
+        if should_abort():
+            raise Cancelled("aborted instead of retrying")
 
     def cancel(
         self,

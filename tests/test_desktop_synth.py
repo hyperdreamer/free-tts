@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import threading
 
 import pytest
 
@@ -142,6 +143,51 @@ class TestSynthesize:
                 "hi", "v", "+0%", "+0Hz", "req1", should_abort=should_abort
             )
         assert len(transport.calls) == 1
+
+    def test_stop_interrupts_retry_after_wait(self):
+        abort = threading.Event()
+        wait_entered = threading.Event()
+        release_uninterruptible_wait = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        def retry_sleep(seconds):
+            wait_entered.set()
+            if seconds >= 1.0:
+                release_uninterruptible_wait.wait(3)
+            else:
+                abort.wait(3)
+
+        client, transport = self._client(
+            [(503, {"Retry-After": "5"}, b"{}"), (200, {}, b"audio")]
+        )
+        client._sleep = retry_sleep
+
+        def synthesize():
+            try:
+                client.synthesize(
+                    "hi", "v", "+0%", "+0Hz", "req1", should_abort=abort.is_set
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for assertion
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=synthesize, daemon=True)
+        worker.start()
+        assert wait_entered.wait(2)
+        abort.set()
+
+        try:
+            assert finished.wait(1)
+            assert worker.is_alive() is False
+            assert len(errors) == 1
+            assert isinstance(errors[0], synth.Cancelled)
+            assert len(transport.calls) == 1
+        finally:
+            release_uninterruptible_wait.set()
+            abort.set()
+            worker.join(3)
 
     def test_error_body_message_surfaces(self):
         client, _ = self._client([(400, {}, b'{"error":"Unknown voice: v"}')])
