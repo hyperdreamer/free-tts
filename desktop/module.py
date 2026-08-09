@@ -41,14 +41,36 @@ _STRING_SETTINGS = (
     "spelling_mode",
     "cap_let_recogn",
 )
+_WORKER_RECLAIM_SECONDS = 10.0
 
 
 class _GenerationToken:
-    """Invalidatable state owned by one accepted speech generation."""
+    """Invalidatable state and request ownership for one speech generation."""
 
     def __init__(self) -> None:
         self.cancelled = threading.Event()
         self.pause_requested = threading.Event()
+        self._lock = threading.Lock()
+        self.requests: set[str] = set()
+
+    def add_request(self, request_id: str) -> None:
+        with self._lock:
+            self.requests.add(request_id)
+
+    def discard_request(self, request_id: str) -> None:
+        with self._lock:
+            self.requests.discard(request_id)
+
+    def take_requests(self) -> list[str]:
+        """Remove and return this generation's ids, so cleanup runs once."""
+        with self._lock:
+            taken = sorted(self.requests)
+            self.requests.clear()
+        return taken
+
+    def snapshot_requests(self) -> list[str]:
+        with self._lock:
+            return sorted(self.requests)
 
 
 def check_ffmpeg(
@@ -99,7 +121,6 @@ class SpeechEngine:
         self._language: str | None = None
         self._voice_type: str | None = None
         self._synthesis_voice: str | None = None
-        self._active_requests: set[str] = set()
 
     def apply_settings(self, settings: dict[str, str]) -> bool:
         """Apply a SET block. Return False if any parameter was invalid."""
@@ -166,7 +187,9 @@ class SpeechEngine:
             self._io.send(protocol.ERR_CANT_SPEAK)  # type: ignore[attr-defined]
             return
 
-        self._join_worker()
+        if not self._reclaim_worker():
+            self._io.send(protocol.ERR_CANT_SPEAK)  # type: ignore[attr-defined]
+            return
         generation = _GenerationToken()
         with self._lock:
             self._generation = generation
@@ -200,11 +223,11 @@ class SpeechEngine:
             if worker is None or not worker.is_alive() or generation is None:
                 return
             generation.cancelled.set()
-            outstanding = list(self._active_requests)
+        outstanding = generation.snapshot_requests()
         if outstanding:
             threading.Thread(
                 target=self._cancel_requests,
-                args=(outstanding,),
+                args=(generation, outstanding),
                 name="free-tts-cancel",
                 daemon=True,
             ).start()
@@ -244,14 +267,22 @@ class SpeechEngine:
         self.catalog = catalog
         return catalog
 
-    def _join_worker(self) -> None:
+    def _reclaim_worker(self) -> bool:
+        """Stop the previous generation. False if its worker is still alive."""
         with self._lock:
             worker = self._worker
-        if worker is not None and worker.is_alive():
+        if worker is None:
+            return True
+        if worker.is_alive():
             self.handle_stop()
-            worker.join(10.0)
+            worker.join(_WORKER_RECLAIM_SECONDS)
+        if worker.is_alive():
+            logger.error("Previous speech worker did not exit; refusing new message")
+            return False
         with self._lock:
-            self._worker = None
+            if self._worker is worker:
+                self._worker = None
+        return True
 
     def _emit(
         self,
@@ -323,7 +354,7 @@ class SpeechEngine:
                         outcome = "stop"
                         break
                     if pending is None:
-                        request_id = self._register_request()
+                        request_id = self._register_request(generation)
                         self._registered.set()
                         self._go.wait(5.0)
                         future = pool.submit(
@@ -346,7 +377,7 @@ class SpeechEngine:
                             voice_name,
                             rate,
                             pitch,
-                            self._register_request(),
+                            self._register_request(generation),
                         )
                     mp3 = future.result()
                     if self._should_abort(generation):
@@ -402,7 +433,7 @@ class SpeechEngine:
             finally:
                 if pending is not None:
                     pending.cancel()
-                self._cancel_outstanding()
+                self._cancel_outstanding(generation)
 
         def emit_stop() -> bool:
             return self._emit(
@@ -432,16 +463,15 @@ class SpeechEngine:
                 or generation.cancelled.is_set()
             )
 
-    def _register_request(self) -> str:
-        """Create and register a request id before it is submitted.
+    def _register_request(self, generation: _GenerationToken) -> str:
+        """Create and register a request id owned by ``generation``.
 
         Registration happens in the worker thread ahead of the first blocking
         call, so a STOP arriving right after handle_speak always finds the
         request already cancellable.
         """
         request_id = new_request_id()
-        with self._lock:
-            self._active_requests.add(request_id)
+        generation.add_request(request_id)
         return request_id
 
     def _fetch(
@@ -453,8 +483,7 @@ class SpeechEngine:
         pitch: str,
         request_id: str,
     ) -> bytes:
-        with self._lock:
-            self._active_requests.add(request_id)
+        generation.add_request(request_id)
         try:
             return self._client.synthesize(  # type: ignore[attr-defined]
                 text,
@@ -474,27 +503,34 @@ class SpeechEngine:
             self._refresh_catalog()
             if self._should_abort(generation):
                 raise Cancelled("aborted before retrying synthesis")
-            return self._client.synthesize(  # type: ignore[attr-defined]
-                text,
-                voice_name,
-                rate,
-                pitch,
-                request_id,
-                should_abort=lambda: self._should_abort(generation),
-            )
+            # A fresh id: the first POST's delivery is ambiguous, so reusing the
+            # id could put two live requests under one name.
+            retry_id = self._register_request(generation)
+            try:
+                return self._client.synthesize(  # type: ignore[attr-defined]
+                    text,
+                    voice_name,
+                    rate,
+                    pitch,
+                    retry_id,
+                    should_abort=lambda: self._should_abort(generation),
+                )
+            finally:
+                generation.discard_request(retry_id)
         finally:
-            with self._lock:
-                self._active_requests.discard(request_id)
+            generation.discard_request(request_id)
 
-    def _cancel_outstanding(self) -> None:
-        with self._lock:
-            outstanding = list(self._active_requests)
-            self._active_requests.clear()
-        self._cancel_requests(outstanding)
+    def _cancel_outstanding(self, generation: _GenerationToken) -> None:
+        self._cancel_requests(generation, generation.take_requests())
 
-    def _cancel_requests(self, request_ids: list[str]) -> None:
+    def _cancel_requests(
+        self, generation: _GenerationToken, request_ids: list[str]
+    ) -> None:
         for request_id in request_ids:
-            self._client.cancel(request_id)  # type: ignore[attr-defined]
+            self._client.cancel(  # type: ignore[attr-defined]
+                request_id,
+                still_wanted=lambda: generation.cancelled.is_set(),
+            )
 
 
 def _configure_logging() -> None:

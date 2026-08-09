@@ -16,6 +16,8 @@ logger = logging.getLogger("free-tts.synth")
 
 _MAX_RETRY_DELAY = 5.0
 _CANCEL_TIMEOUT = 5.0
+_CANCEL_HANDOFF_SECONDS = 1.0
+_CANCEL_RETRY_INTERVAL = 0.05
 _VOICES_TIMEOUT = 20.0
 
 SSML_TEMPLATE = (
@@ -144,13 +146,40 @@ class SynthClient:
             raise SynthError(self._error_detail(status, body))
         raise SynthError("backend busy after retry")
 
-    def cancel(self, request_id: str) -> None:
-        """Best-effort cancellation so the backend slot is freed promptly."""
+    def cancel(
+        self,
+        request_id: str,
+        *,
+        still_wanted: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Deliver cancellation, tolerating the pre-registration interval.
+
+        The adapter can send DELETE before the backend has registered the POST,
+        which answers 404. That is "not yet", not "unknown", so retry briefly
+        while this generation still wants the request cancelled.
+        """
         url = f"{self._config.backend_url}/tts-request/{request_id}"
-        try:
-            self._transport("DELETE", url, None, _CANCEL_TIMEOUT)
-        except OSError as exc:
-            logger.debug("Cancel for %s could not be delivered: %s", request_id, exc)
+        deadline = time.monotonic() + _CANCEL_HANDOFF_SECONDS
+        while True:
+            try:
+                status, _headers, _body = self._transport(
+                    "DELETE", url, None, _CANCEL_TIMEOUT
+                )
+            except OSError as exc:
+                logger.debug(
+                    "Cancel for %s could not be delivered: %s", request_id, exc
+                )
+                return False
+            if status != 404:
+                return True
+            if still_wanted is None or not still_wanted():
+                return False
+            if time.monotonic() >= deadline:
+                logger.debug(
+                    "Cancel for %s was never registered by the backend", request_id
+                )
+                return False
+            self._sleep(_CANCEL_RETRY_INTERVAL)
 
     @staticmethod
     def _retry_delay(headers: Mapping[str, str]) -> float:

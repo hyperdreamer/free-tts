@@ -90,7 +90,7 @@ class _FakeClient:
             raise self._error
         return self._audio
 
-    def cancel(self, request_id):
+    def cancel(self, request_id, *, still_wanted=None):
         self.cancelled.append(request_id)
 
 
@@ -453,6 +453,131 @@ class TestPause:
         engine.handle_pause()
         assert engine.wait_idle()
         assert "702 END" not in fake_io.lines
+
+
+class TestCancellationOwnership:
+    """Cancellation reaches the backend and never crosses generations."""
+
+    def test_delete_before_registration_is_retried_until_it_lands(self):
+        registered = threading.Event()
+        release_post = threading.Event()
+        allow_registration = threading.Event()
+
+        class RacingClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.statuses = []
+                self.post_entered = threading.Event()
+
+            def synthesize(
+                self, text, voice_name, rate, pitch, request_id, should_abort=None
+            ):
+                self.requests.append((text, voice_name, rate, pitch))
+                self.post_entered.set()
+                assert allow_registration.wait(2)
+                registered.set()
+                release_post.wait(2)
+                return self._audio
+
+            def cancel(self, request_id, *, still_wanted=None):
+                if not registered.is_set():
+                    self.statuses.append(404)
+                    allow_registration.set()
+                    if still_wanted is not None and still_wanted():
+                        assert registered.wait(2)
+                    else:
+                        return False
+                self.statuses.append(200)
+                self.cancelled.append(request_id)
+                release_post.set()
+                return True
+
+        client = RacingClient()
+        engine, fake_io = _engine(client=client)
+        engine.handle_speak(SSML)
+        assert client.post_entered.wait(2)
+
+        engine.handle_stop()
+        assert engine.wait_idle(3)
+        assert client.statuses[0] == 404
+        assert client.statuses[-1] == 200
+        assert client.cancelled
+        assert fake_io.lines.count("703 STOP") == 1
+
+    def test_stale_worker_cannot_cancel_a_newer_generation(self, monkeypatch):
+        monkeypatch.setattr(module, "_WORKER_RECLAIM_SECONDS", 0.0)
+
+        class SlowClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.first_entered = threading.Event()
+                self.release_first = threading.Event()
+                self.calls = 0
+
+            def synthesize(
+                self, text, voice_name, rate, pitch, request_id, should_abort=None
+            ):
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    self.ids_first = request_id
+                    self.first_entered.set()
+                    self.release_first.wait()
+                    return self._audio
+                self.ids_second = request_id
+                return self._audio
+
+            def cancel(self, request_id, *, still_wanted=None):
+                self.cancelled.append(request_id)
+                return True
+
+        client = SlowClient()
+        engine, fake_io = _engine(client=client)
+        engine.handle_speak(SSML)
+        assert client.first_entered.wait(2)
+
+        # The first worker is wedged, so the engine must refuse rather than
+        # start a second generation over shared cancellation state.
+        engine.handle_speak(SSML)
+        assert fake_io.lines.count(protocol_err_cant_speak()) == 1
+
+        client.release_first.set()
+        assert engine.wait_idle(3)
+        assert getattr(client, "ids_second", None) is None
+        assert client.cancelled == [] or client.cancelled == [client.ids_first]
+
+    def test_worker_cancels_only_its_own_request_ids(self):
+        engine, _ = _engine()
+        first = module._GenerationToken()
+        second = module._GenerationToken()
+        first.add_request("a1")
+        second.add_request("b1")
+        assert first.take_requests() == ["a1"]
+        assert first.take_requests() == []
+        assert second.take_requests() == ["b1"]
+
+    def test_recovery_uses_a_fresh_request_id(self):
+        engine, fake_io, client, state = _lifecycle_engine(fail_first_post=True)
+        seen: list[str] = []
+
+        original = client.synthesize
+
+        def record(text, voice_name, rate, pitch, request_id, should_abort=None):
+            seen.append(request_id)
+            return original(text, voice_name, rate, pitch, request_id, should_abort)
+
+        client.synthesize = record
+        engine.handle_speak(SSML)
+        assert engine.wait_idle(3)
+        assert len(seen) == 2
+        assert seen[0] != seen[1]
+        assert fake_io.lines[-1] == "702 END"
+
+
+def protocol_err_cant_speak():
+    from desktop import protocol
+
+    return protocol.ERR_CANT_SPEAK
 
 
 class TestCheckFfmpeg:

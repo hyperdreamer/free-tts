@@ -172,3 +172,43 @@ class TestCancel:
         transport = _Transport([OSError("down")])
         client = synth.SynthClient(_config(), transport=transport)
         client.cancel("req9")
+
+
+class TestCancelHandoff:
+    """DELETE tolerates the interval before the server registers the POST."""
+
+    def test_404_is_retried_while_the_generation_still_wants_it(self):
+        client, transport = self._client(
+            [
+                (404, {}, b'{"error": "Unknown request id."}'),
+                (404, {}, b'{"error": "Unknown request id."}'),
+                (200, {}, b'{"cancelled": true}'),
+            ]
+        )
+        assert client.cancel("req1", still_wanted=lambda: True) is True
+        assert len(transport.calls) == 3
+
+    def test_404_stops_when_the_generation_no_longer_wants_it(self):
+        client, transport = self._client(
+            [(404, {}, b'{"error": "Unknown request id."}')]
+        )
+        assert client.cancel("req1", still_wanted=lambda: False) is False
+        assert len(transport.calls) == 1
+
+    def test_success_needs_no_retry(self):
+        client, transport = self._client([(200, {}, b'{"cancelled": true}')])
+        assert client.cancel("req1", still_wanted=lambda: True) is True
+        assert len(transport.calls) == 1
+
+    def test_transport_failure_is_swallowed(self):
+        client, transport = self._client([OSError("refused")])
+        assert client.cancel("req1", still_wanted=lambda: True) is False
+
+    def _client(self, responses):
+        transport = _Transport(responses)
+        return (
+            synth.SynthClient(
+                settings.DEFAULTS, transport=transport, sleep=lambda _seconds: None
+            ),
+            transport,
+        )
