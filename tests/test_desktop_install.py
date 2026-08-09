@@ -108,17 +108,24 @@ class TestInstall:
         manifest = json.loads((paths["root"] / "install-manifest.json").read_text())
         assert manifest["root"] == str(paths["root"])
         assert manifest["launcher"].endswith(install.LAUNCHER_NAME)
+        assert manifest["speechd_conf_existed"] is False
+        assert manifest["speechd_conf_mode"] is None
 
     def test_backs_up_existing_speechd_conf_once(self, source_root, paths):
         paths["config_dir"].mkdir(parents=True)
         conf = paths["config_dir"] / "speechd.conf"
         conf.write_text("LogLevel 3\n")
+        conf.chmod(0o600)
         _install(source_root, paths)
         backup = paths["config_dir"] / "speechd.conf.free-tts.bak"
         assert backup.read_text() == "LogLevel 3\n"
+        assert backup.stat().st_mode & 0o777 == 0o600
+        assert conf.stat().st_mode & 0o777 == 0o600
         conf.write_text(conf.read_text() + "# later edit\n")
         _install(source_root, paths)
         assert backup.read_text() == "LogLevel 3\n"
+        assert backup.stat().st_mode & 0o777 == 0o600
+        assert conf.stat().st_mode & 0o777 == 0o600
 
     def test_upgrade_is_idempotent(self, source_root, paths):
         _install(source_root, paths)
@@ -172,9 +179,7 @@ class TestUninstall:
         self._uninstall(paths)
         assert not paths["root"].exists()
         assert not (paths["launcher"] / install.LAUNCHER_NAME).exists()
-        text = (paths["config_dir"] / "speechd.conf").read_text()
-        assert sc.BEGIN_MARKER not in text
-        assert "DefaultModule free-tts" not in text
+        assert not (paths["config_dir"] / "speechd.conf").exists()
 
     def test_preserves_unrelated_user_config(self, source_root, paths):
         paths["config_dir"].mkdir(parents=True)
@@ -194,6 +199,79 @@ class TestUninstall:
             (paths["config_dir"] / "speechd.conf").read_text()
             == "DefaultModule espeak-ng\n"
         )
+
+    def test_installer_created_config_is_removed_after_upgrade(
+        self, source_root, paths
+    ):
+        conf = paths["config_dir"] / "speechd.conf"
+        assert not conf.exists()
+
+        _install(source_root, paths)
+        _install(source_root, paths)
+        self._uninstall(paths)
+
+        assert not conf.exists()
+
+    def test_empty_config_round_trips_presence_and_mode(self, source_root, paths):
+        paths["config_dir"].mkdir(parents=True)
+        conf = paths["config_dir"] / "speechd.conf"
+        conf.write_bytes(b"")
+        conf.chmod(0o640)
+
+        _install(source_root, paths)
+        manifest = json.loads((paths["root"] / install.MANIFEST_NAME).read_text())
+        assert manifest["speechd_conf_existed"] is True
+        assert manifest["speechd_conf_mode"] == 0o640
+        assert conf.stat().st_mode & 0o777 == 0o640
+
+        _install(source_root, paths)
+        self._uninstall(paths)
+
+        assert conf.read_bytes() == b""
+        assert conf.stat().st_mode & 0o777 == 0o640
+
+    def test_private_config_and_backup_keep_mode_through_edit_and_upgrade(
+        self, source_root, paths
+    ):
+        paths["config_dir"].mkdir(parents=True)
+        conf = paths["config_dir"] / "speechd.conf"
+        backup = paths["config_dir"] / "speechd.conf.free-tts.bak"
+        conf.write_text("LogLevel 3\n")
+        conf.chmod(0o600)
+
+        _install(source_root, paths)
+        manifest = json.loads((paths["root"] / install.MANIFEST_NAME).read_text())
+        assert manifest["speechd_conf_existed"] is True
+        assert manifest["speechd_conf_mode"] == 0o600
+        assert conf.stat().st_mode & 0o777 == 0o600
+        assert backup.read_text() == "LogLevel 3\n"
+        assert backup.stat().st_mode & 0o777 == 0o600
+
+        conf.write_text(
+            conf.read_text().replace(
+                "LogLevel 3\n", "LogLevel 3\n# unrelated user edit\n", 1
+            )
+        )
+        _install(source_root, paths)
+        self._uninstall(paths)
+
+        assert conf.read_text() == "LogLevel 3\n# unrelated user edit\n"
+        assert conf.stat().st_mode & 0o777 == 0o600
+        assert backup.read_text() == "LogLevel 3\n"
+        assert backup.stat().st_mode & 0o777 == 0o600
+
+    def test_unrelated_edit_keeps_installer_created_config_and_user_mode(
+        self, source_root, paths
+    ):
+        conf = paths["config_dir"] / "speechd.conf"
+        _install(source_root, paths)
+        conf.write_text("# user setting\n" + conf.read_text())
+        conf.chmod(0o600)
+
+        self._uninstall(paths)
+
+        assert conf.read_text() == "# user setting\n"
+        assert conf.stat().st_mode & 0o777 == 0o600
 
     def test_is_idempotent(self, source_root, paths):
         _install(source_root, paths)
@@ -474,18 +552,80 @@ class TestPaths:
 
 
 class TestRestart:
-    def test_failure_is_tolerated(self):
-        def runner(*args, **kwargs):
-            raise OSError("pkill missing")
+    def test_missing_daemon_is_a_no_op(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        assert install.restart_speech_dispatcher() is False
 
-        install.restart_speech_dispatcher(runner=runner)
+    def test_malformed_pid_file_is_actionable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        pid_file = (
+            tmp_path
+            / "speech-dispatcher"
+            / "pid"
+            / "speech-dispatcher.pid"
+        )
+        pid_file.parent.mkdir(parents=True)
+        pid_file.write_text("not-a-pid\n")
 
-    def test_runs_a_command(self):
-        calls = []
+        with pytest.raises(install.InstallError, match="PID|pid"):
+            install.restart_speech_dispatcher()
 
-        def runner(command, **kwargs):
-            calls.append(command)
-            return type("R", (), {"returncode": 0})()
+    def test_signal_failure_is_actionable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        pid_file = (
+            tmp_path
+            / "speech-dispatcher"
+            / "pid"
+            / "speech-dispatcher.pid"
+        )
+        pid_file.parent.mkdir(parents=True)
+        pid_file.write_text(f"{os.getpid()}\n")
 
-        install.restart_speech_dispatcher(runner=runner)
-        assert calls
+        def deny_signal(_pid, _signal):
+            raise PermissionError("signal denied")
+
+        with pytest.raises(install.InstallError, match="reload|signal"):
+            install.restart_speech_dispatcher(kill=deny_signal)
+
+    def test_sends_real_sighup_to_pid_file_process(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        script = (
+            "import signal\n"
+            "def reload_config(_signum, _frame):\n"
+            "    print('RELOADED', flush=True)\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGHUP, reload_config)\n"
+            "print('READY', flush=True)\n"
+            "signal.pause()\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert process.stdout is not None
+            assert process.stdout.readline() == "READY\n"
+            pid_file = (
+                tmp_path
+                / "speech-dispatcher"
+                / "pid"
+                / "speech-dispatcher.pid"
+            )
+            pid_file.parent.mkdir(parents=True)
+            pid_file.write_text(f"{process.pid}\n")
+
+            reloaded = install.restart_speech_dispatcher()
+            try:
+                stdout, stderr = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                pytest.fail("Speech Dispatcher PID did not receive SIGHUP")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+
+        assert reloaded is True
+        assert process.returncode == 0, stderr
+        assert stdout == "RELOADED\n"

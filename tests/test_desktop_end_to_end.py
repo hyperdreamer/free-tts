@@ -382,6 +382,22 @@ class TestStdoutDiscipline:
 
 
 class TestMalformedConfiguration:
+    def test_malformed_ipv6_reports_exact_init_failure(self):
+        env = _module_env("http://127.0.0.1:9")
+        env["FREE_TTS_BACKEND_URL"] = "http://[::1"
+        result = subprocess.run(
+            [sys.executable, "-m", "desktop.module", "/dev/null"],
+            input=b"INIT\nQUIT\n",
+            capture_output=True,
+            env=env,
+            cwd=str(ROOT),
+            timeout=60,
+        )
+        assert result.returncode == 1
+        assert b"Invalid IPv6 URL" in result.stdout
+        assert result.stdout.splitlines()[-1] == b"399 ERR CANT INIT MODULE"
+        assert b"Traceback" not in result.stderr
+
     def test_invalid_backend_url_fails_init_without_crashing(self):
         if shutil.which("ffmpeg") is None:
             pytest.skip("ffmpeg not installed")

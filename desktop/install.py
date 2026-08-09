@@ -14,6 +14,8 @@ import os
 import pathlib
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -147,7 +149,7 @@ def _canonical(path: pathlib.Path) -> pathlib.Path:
 
 def _validate_manifest(
     payload: object, expected: dict[str, str]
-) -> dict[str, str]:
+) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise InstallOwnershipError("install manifest is not a JSON object")
     if payload.get("module") != MODULE_NAME:
@@ -162,7 +164,39 @@ def _validate_manifest(
             raise InstallOwnershipError(
                 f"install manifest path {key!r} is outside the expected user target"
             )
-    return {key: str(payload[key]) for key in expected}
+
+    validated: dict[str, object] = {
+        key: str(payload[key]) for key in expected
+    }
+    has_existence = "speechd_conf_existed" in payload
+    has_mode = "speechd_conf_mode" in payload
+    if has_existence != has_mode:
+        raise InstallOwnershipError(
+            "install manifest has incomplete speechd.conf provenance"
+        )
+    if has_existence:
+        existed = payload["speechd_conf_existed"]
+        mode = payload["speechd_conf_mode"]
+        if not isinstance(existed, bool):
+            raise InstallOwnershipError(
+                "install manifest has invalid speechd.conf existence provenance"
+            )
+        if existed:
+            if (
+                isinstance(mode, bool)
+                or not isinstance(mode, int)
+                or not 0 <= mode <= 0o7777
+            ):
+                raise InstallOwnershipError(
+                    "install manifest has invalid speechd.conf mode provenance"
+                )
+        elif mode is not None:
+            raise InstallOwnershipError(
+                "install manifest records a mode for a previously missing speechd.conf"
+            )
+        validated["speechd_conf_existed"] = existed
+        validated["speechd_conf_mode"] = mode
+    return validated
 
 
 def _load_manifest(
@@ -170,7 +204,7 @@ def _load_manifest(
     expected: dict[str, str],
     *,
     missing_ok: bool,
-) -> dict[str, str] | None:
+) -> dict[str, object] | None:
     path = root / MANIFEST_NAME
     if not os.path.lexists(path):
         if missing_ok:
@@ -190,11 +224,10 @@ def _load_manifest(
 def _check_install_ownership(
     root: pathlib.Path,
     expected: dict[str, str],
-) -> bool:
+) -> dict[str, object] | None:
     root_exists = os.path.lexists(root)
     if root_exists:
-        _load_manifest(root, expected, missing_ok=False)
-        return True
+        return _load_manifest(root, expected, missing_ok=False)
 
     for key in ("launcher", "module_conf"):
         path = pathlib.Path(expected[key])
@@ -210,7 +243,7 @@ def _check_install_ownership(
             "managed Speech Dispatcher block exists without an ownership "
             f"manifest at {speechd_conf}"
         )
-    return False
+    return None
 
 
 def _copy_preserved(source: pathlib.Path, target: pathlib.Path) -> None:
@@ -233,10 +266,27 @@ def _snapshot_path(path: pathlib.Path) -> _PathSnapshot:
     if path.is_symlink():
         return _PathSnapshot("symlink", os.readlink(path))
     if path.is_file():
-        return _PathSnapshot("file", path.read_bytes(), path.stat().st_mode & 0o777)
+        return _PathSnapshot(
+            "file", path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+        )
     if path.exists():
         raise InstallOwnershipError(f"owned file path became a directory: {path}")
     return _PathSnapshot("missing")
+
+
+def _speechd_provenance(
+    manifest: dict[str, object] | None,
+    snapshot: _PathSnapshot,
+) -> tuple[bool, int | None]:
+    if manifest is not None and "speechd_conf_existed" in manifest:
+        existed = manifest["speechd_conf_existed"] is True
+        mode = manifest["speechd_conf_mode"]
+        return existed, mode if isinstance(mode, int) else None
+
+    # Legacy manifests cannot distinguish an originally absent file from an
+    # originally empty one, so preserve the state seen during this upgrade.
+    existed = snapshot.kind == "file"
+    return existed, snapshot.mode if existed else None
 
 
 def _atomic_write(path: pathlib.Path, data: bytes, mode: int = 0o644) -> None:
@@ -348,7 +398,7 @@ def install(
     config_dir: pathlib.Path | None = None,
     venv_builder: Callable[[pathlib.Path], None] | None = None,
     preflight: Callable[[], None] | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Install or transactionally upgrade the per-user integration."""
     source_root = pathlib.Path(source_root)
     root = install_root() if root is None else pathlib.Path(root)
@@ -360,11 +410,12 @@ def install(
 
     (preflight or check_prerequisites)()
 
-    manifest = _expected_manifest(root, launcher_directory, config_directory)
-    upgrading = _check_install_ownership(root, manifest)
-    launcher_file = pathlib.Path(manifest["launcher"])
-    module_conf = pathlib.Path(manifest["module_conf"])
-    speechd_conf = pathlib.Path(manifest["speechd_conf"])
+    expected = _expected_manifest(root, launcher_directory, config_directory)
+    owned_manifest = _check_install_ownership(root, expected)
+    upgrading = owned_manifest is not None
+    launcher_file = pathlib.Path(expected["launcher"])
+    module_conf = pathlib.Path(expected["module_conf"])
+    speechd_conf = pathlib.Path(expected["speechd_conf"])
     backup = config_directory / "speechd.conf.free-tts.bak"
     if speechd_conf.is_symlink():
         raise InstallOwnershipError(
@@ -373,6 +424,21 @@ def install(
 
     external_paths = (launcher_file, module_conf, speechd_conf, backup)
     snapshots = {path: _snapshot_path(path) for path in external_paths}
+    speechd_conf_existed, speechd_conf_mode = _speechd_provenance(
+        owned_manifest, snapshots[speechd_conf]
+    )
+    manifest: dict[str, object] = {
+        **expected,
+        "speechd_conf_existed": speechd_conf_existed,
+        "speechd_conf_mode": speechd_conf_mode,
+    }
+    speechd_write_mode = (
+        snapshots[speechd_conf].mode
+        if snapshots[speechd_conf].kind == "file"
+        else speechd_conf_mode
+        if speechd_conf_mode is not None
+        else 0o644
+    )
     created_directories: list[pathlib.Path] = []
     _ensure_directory(root.parent, created_directories)
     staging = pathlib.Path(
@@ -420,11 +486,15 @@ def install(
             else ""
         )
         if original and snapshots[backup].kind == "missing":
-            _atomic_write(backup, original.encode("utf-8"))
+            _atomic_write(
+                backup, original.encode("utf-8"), speechd_write_mode
+            )
         managed = apply_managed_block(
             original, LAUNCHER_NAME, MODULE_CONF_NAME
         )
-        _atomic_write(speechd_conf, managed.encode("utf-8"))
+        _atomic_write(
+            speechd_conf, managed.encode("utf-8"), speechd_write_mode
+        )
     except BaseException:
         try:
             for path in reversed(external_paths):
@@ -497,13 +567,28 @@ def uninstall(
                 f"manifest-owned file path became a directory: {path}"
             )
 
+    speechd_snapshot = _snapshot_path(speechd_conf)
+    speechd_conf_existed, speechd_conf_mode = _speechd_provenance(
+        owned, speechd_snapshot
+    )
     removed: list[str] = []
     if speechd_conf.is_file():
         current = speechd_conf.read_text(encoding="utf-8")
         cleaned = remove_managed_block(current)
-        if cleaned != current:
-            _atomic_write(speechd_conf, cleaned.encode("utf-8"))
+        if not speechd_conf_existed and not cleaned:
+            speechd_conf.unlink()
             removed.append(str(speechd_conf))
+        else:
+            restored_mode = (
+                speechd_conf_mode
+                if speechd_conf_existed and speechd_conf_mode is not None
+                else speechd_snapshot.mode
+            )
+            if cleaned != current or restored_mode != speechd_snapshot.mode:
+                _atomic_write(
+                    speechd_conf, cleaned.encode("utf-8"), restored_mode
+                )
+                removed.append(str(speechd_conf))
 
     for path in (module_conf, launcher_file):
         if os.path.lexists(path):
@@ -515,16 +600,74 @@ def uninstall(
     return removed
 
 
-def restart_speech_dispatcher(runner: Callable[..., object] = subprocess.run) -> None:
-    """Ask the user's Speech Dispatcher to exit so it reloads configuration."""
+def _speechd_pid_path() -> pathlib.Path | None:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return None
+    return (
+        pathlib.Path(runtime)
+        / "speech-dispatcher"
+        / "pid"
+        / "speech-dispatcher.pid"
+    )
+
+
+def _read_speechd_pid(path: pathlib.Path) -> int | None:
     try:
-        runner(
-            ["pkill", "-u", str(os.getuid()), "-x", "speech-dispatcher"],
-            capture_output=True,
-            check=False,
-        )
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
     except OSError as exc:
-        logger.warning("Could not restart speech-dispatcher automatically: %s", exc)
+        raise InstallError(
+            f"could not inspect Speech Dispatcher PID file {path}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise InstallError(
+            f"Speech Dispatcher PID file is not a regular user-owned file: {path}"
+        )
+    try:
+        raw_pid = path.read_text(encoding="ascii").strip()
+        pid = int(raw_pid)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise InstallError(
+            f"Speech Dispatcher PID file is invalid at {path}: {exc}"
+        ) from exc
+    if pid <= 0:
+        raise InstallError(
+            f"Speech Dispatcher PID file contains an invalid PID at {path}: {pid}"
+        )
+    return pid
+
+
+def restart_speech_dispatcher(
+    kill: Callable[[int, int], None] = os.kill,
+) -> bool:
+    """Reload the user's running Speech Dispatcher with ``SIGHUP``.
+
+    A missing PID file or stale PID means no daemon is currently running; its
+    next start will read the updated configuration.
+    """
+    pid_path = _speechd_pid_path()
+    if pid_path is None:
+        logger.info(
+            "XDG_RUNTIME_DIR is unset; no running Speech Dispatcher to reload."
+        )
+        return False
+    pid = _read_speechd_pid(pid_path)
+    if pid is None:
+        logger.info("No running Speech Dispatcher to reload at %s.", pid_path)
+        return False
+    try:
+        kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        logger.info("Speech Dispatcher PID %d is no longer running.", pid)
+        return False
+    except (OSError, OverflowError, ValueError) as exc:
+        raise InstallError(
+            f"could not signal Speech Dispatcher PID {pid} to reload: {exc}"
+        ) from exc
+    logger.info("Reloaded Speech Dispatcher configuration for PID %d.", pid)
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:

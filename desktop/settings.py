@@ -61,25 +61,32 @@ def validate_backend_url(value: str) -> str:
     candidate = value.strip().rstrip("/")
     if not candidate:
         raise ConfigError("backend_url must not be empty")
-    parsed = urllib.parse.urlsplit(candidate)
-    if parsed.scheme not in _ALLOWED_SCHEMES:
-        raise ConfigError(
-            f"backend_url must use http or https, got {parsed.scheme!r}"
-        )
-    if not parsed.hostname:
-        raise ConfigError("backend_url must include a hostname")
-    if parsed.username or parsed.password:
-        raise ConfigError("backend_url must not contain credentials")
-    if parsed.query or parsed.fragment:
-        raise ConfigError("backend_url must not contain a query or fragment")
-    if parsed.path not in ("", "/"):
-        raise ConfigError(
-            f"backend_url must not include a path, got {parsed.path!r}"
-        )
     try:
+        parsed = urllib.parse.urlsplit(candidate)
+        scheme = parsed.scheme
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        query = parsed.query
+        fragment = parsed.fragment
+        path = parsed.path
         port = parsed.port
-    except ValueError as exc:
-        raise ConfigError(f"backend_url has an invalid port: {exc}") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise ConfigError(f"backend_url is malformed: {exc}") from exc
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ConfigError(
+            f"backend_url must use http or https, got {scheme!r}"
+        )
+    if not hostname:
+        raise ConfigError("backend_url must include a hostname")
+    if username or password:
+        raise ConfigError("backend_url must not contain credentials")
+    if query or fragment:
+        raise ConfigError("backend_url must not contain a query or fragment")
+    if path not in ("", "/"):
+        raise ConfigError(
+            f"backend_url must not include a path, got {path!r}"
+        )
     if port is not None and not 1 <= port <= 65535:
         raise ConfigError(f"backend_url port is out of range: {port}")
     return candidate

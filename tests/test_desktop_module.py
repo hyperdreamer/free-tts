@@ -504,6 +504,86 @@ class TestCancellationOwnership:
         assert client.cancelled
         assert fake_io.lines.count("703 STOP") == 1
 
+    def test_pause_retries_lookahead_cancel_after_registration_handoff(self):
+        lookahead_started = threading.Event()
+        decode_entered = threading.Event()
+        release_decode = threading.Event()
+        allow_registration = threading.Event()
+        registered = threading.Event()
+        post_cancelled = threading.Event()
+        pause_emitted = threading.Event()
+
+        class TimelineIO(_FakeIO):
+            def event_pause(self):
+                super().event_pause()
+                pause_emitted.set()
+
+        class RacingLookaheadClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.lookahead_id = None
+                self.statuses = []
+
+            def synthesize(
+                self, text, voice_name, rate, pitch, request_id, should_abort=None
+            ):
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    return self._audio
+                self.lookahead_id = request_id
+                lookahead_started.set()
+                assert allow_registration.wait(3)
+                registered.set()
+                assert post_cancelled.wait(3)
+                raise module.Cancelled("lookahead request cancelled")
+
+            def cancel(self, request_id, *, still_wanted=None):
+                assert request_id == self.lookahead_id
+                if not registered.is_set():
+                    self.statuses.append(404)
+                    allow_registration.set()
+                    if still_wanted is None or not still_wanted():
+                        return False
+                    assert registered.wait(3)
+                self.statuses.append(200)
+                self.cancelled.append(request_id)
+                post_cancelled.set()
+                return True
+
+        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            decode_entered.set()
+            assert release_decode.wait(3)
+            return b"\x01\x00" * 8
+
+        client = RacingLookaheadClient()
+        fake_io = TimelineIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            client,
+            decoder=gated_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert lookahead_started.wait(3)
+        assert decode_entered.wait(3)
+
+        try:
+            engine.handle_pause()
+            release_decode.set()
+            assert pause_emitted.wait(1)
+            assert engine.wait_idle(1)
+            assert client.statuses == [404, 200]
+            assert client.cancelled == [client.lookahead_id]
+            assert fake_io.lines.count("704 PAUSE") == 1
+            assert "702 END" not in fake_io.lines
+        finally:
+            release_decode.set()
+            post_cancelled.set()
+            engine.wait_idle(3)
+
     def test_stale_worker_cannot_cancel_a_newer_generation(self, monkeypatch):
         monkeypatch.setattr(module, "_WORKER_RECLAIM_SECONDS", 0.0)
 
@@ -705,6 +785,38 @@ class TestDecoderLifetime:
         assert engine.wait_idle(3)
         assert isinstance(seen["cancel"], threading.Event)
         assert fake_io.lines[-1] == "702 END"
+
+
+class TestMalformedBackendConfiguration:
+    """Direct configs still produce protocol errors at command boundaries."""
+
+    @staticmethod
+    def _config():
+        return dataclasses.replace(
+            settings.DEFAULTS,
+            backend_url="http://127.0.0.1:notaport",
+            autostart=False,
+        )
+
+    def test_list_voices_reports_unavailable_for_invalid_http_url(self):
+        config = self._config()
+        engine, fake_io = _engine(
+            config=config, controller=backend.BackendController(config)
+        )
+
+        engine.list_voices()
+
+        assert fake_io.lines == ["304 CANT LIST VOICES"]
+
+    def test_speak_reports_unavailable_for_invalid_http_url(self):
+        config = self._config()
+        engine, fake_io = _engine(
+            config=config, controller=backend.BackendController(config)
+        )
+
+        engine.handle_speak(SSML)
+
+        assert fake_io.lines == ["301 ERROR CANT SPEAK"]
 
 
 class TestCheckFfmpeg:

@@ -237,6 +237,15 @@ class TestMalformedBackendUrl:
         assert health.ready is False
         assert health.detail
 
+    def test_probe_reports_unreachable_for_an_invalid_http_port(self):
+        config = dataclasses.replace(
+            settings.DEFAULTS, backend_url="http://127.0.0.1:notaport"
+        )
+        health = backend.BackendController(config).probe()
+        assert health.reachable is False
+        assert health.ready is False
+        assert "invalid backend_url" in health.detail
+
     def test_ensure_ready_raises_backend_unavailable(self):
         config = dataclasses.replace(
             settings.DEFAULTS, backend_url="", autostart=False

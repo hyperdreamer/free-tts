@@ -520,13 +520,22 @@ class SpeechEngine:
     def _cancel_outstanding(self, generation: _GenerationToken) -> None:
         self._cancel_requests(generation, generation.take_requests())
 
+    def _cancellation_still_wanted(self, generation: _GenerationToken) -> bool:
+        with self._lock:
+            return generation is self._generation and (
+                generation.cancelled.is_set()
+                or generation.pause_requested.is_set()
+            )
+
     def _cancel_requests(
         self, generation: _GenerationToken, request_ids: list[str]
     ) -> None:
         for request_id in request_ids:
             self._client.cancel(  # type: ignore[attr-defined]
                 request_id,
-                still_wanted=lambda: generation.cancelled.is_set(),
+                still_wanted=lambda: self._cancellation_still_wanted(
+                    generation
+                ),
             )
 
 

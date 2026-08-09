@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import http.client
 import json
 import logging
 import os
@@ -22,7 +23,11 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from desktop.settings import AdapterConfig
+from desktop.settings import (
+    AdapterConfig,
+    ConfigError,
+    validate_backend_url,
+)
 
 logger = logging.getLogger("free-tts.backend")
 
@@ -162,9 +167,9 @@ class BackendController:
             payload = self._fetch(url, _PROBE_TIMEOUT)
         except OSError as exc:
             return Health(False, False, False, str(exc))
-        except (ValueError, UnicodeError) as exc:
-            # A malformed backend_url reaches urllib as ValueError; report it as
-            # an unusable backend instead of killing the command loop.
+        except (ValueError, UnicodeError, http.client.InvalidURL) as exc:
+            # URL construction can fail below urllib.parse, including while
+            # http.client converts the port.
             return Health(False, False, False, f"invalid backend_url: {exc}")
         if not isinstance(payload, dict):
             return Health(True, False, False, "health response was not an object")
@@ -201,6 +206,10 @@ class BackendController:
     def ensure_ready(self) -> None:
         """Guarantee a usable backend, revalidating it on every boundary."""
         self._ready = False
+        try:
+            validate_backend_url(self._config.backend_url)
+        except ConfigError as exc:
+            raise BackendUnavailable(f"invalid backend_url: {exc}") from exc
         health = self.probe()
         if health.ready:
             logger.info("Reusing the backend already running; leaving it alone.")

@@ -108,6 +108,43 @@ class TestBackendUrlValidation:
         with pytest.raises(settings.ConfigError):
             settings.load_config(path, env={})
 
+    def test_malformed_ipv6_is_reported_as_a_config_error(self):
+        with pytest.raises(settings.ConfigError, match="Invalid IPv6 URL"):
+            settings.validate_backend_url("http://[::1")
+
+    @pytest.mark.parametrize(
+        "property_name,error",
+        [
+            ("hostname", ValueError("invalid hostname")),
+            ("username", UnicodeError("invalid username")),
+            ("password", ValueError("invalid password")),
+        ],
+    )
+    def test_parser_property_errors_are_reported_as_config_errors(
+        self, monkeypatch, property_name, error
+    ):
+        class ParsedUrl:
+            scheme = "http"
+            hostname = "localhost"
+            username = None
+            password = None
+            query = ""
+            fragment = ""
+            path = ""
+            port = 5000
+
+            def __getattribute__(self, name):
+                if name == property_name:
+                    raise error
+                return super().__getattribute__(name)
+
+        monkeypatch.setattr(
+            settings.urllib.parse, "urlsplit", lambda _value: ParsedUrl()
+        )
+
+        with pytest.raises(settings.ConfigError):
+            settings.validate_backend_url("http://localhost:5000")
+
     @pytest.mark.parametrize(
         "raw,expected",
         [
