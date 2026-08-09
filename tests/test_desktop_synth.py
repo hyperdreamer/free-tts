@@ -189,6 +189,26 @@ class TestSynthesize:
             abort.set()
             worker.join(3)
 
+    def test_denied_retry_reservation_prevents_second_post(self):
+        reservations = []
+        client, transport = self._client(
+            [(503, {"Retry-After": "0"}, b"{}")]
+        )
+
+        with pytest.raises(synth.Cancelled, match="retry"):
+            client.synthesize(
+                "hi",
+                "v",
+                "+0%",
+                "+0Hz",
+                "req1",
+                should_abort=lambda: False,
+                reserve_retry=lambda: reservations.append("attempt-2") or False,
+            )
+
+        assert reservations == ["attempt-2"]
+        assert len(transport.calls) == 1
+
     def test_error_body_message_surfaces(self):
         client, _ = self._client([(400, {}, b'{"error":"Unknown voice: v"}')])
         with pytest.raises(synth.SynthError, match="Unknown voice"):

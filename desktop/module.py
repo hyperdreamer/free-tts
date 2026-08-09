@@ -80,6 +80,10 @@ class _GenerationToken:
         with self._lock:
             self.requests.discard(request_id)
 
+    def owns_request(self, request_id: str) -> bool:
+        with self._lock:
+            return request_id in self.requests
+
     def take_requests(self) -> list[str]:
         """Remove and return this generation's ids, so cleanup runs once."""
         with self._lock:
@@ -484,6 +488,20 @@ class SpeechEngine:
             generation.pause_boundary_reached.set()
             return True
 
+    def _reserve_retry(
+        self,
+        generation: _GenerationToken,
+        request_id: str,
+    ) -> bool:
+        """Atomically admit attempt 2 against STOP and the PAUSE boundary."""
+        with self._lock:
+            return (
+                generation is self._generation
+                and not generation.cancelled.is_set()
+                and not generation.pause_boundary_reached.is_set()
+                and generation.owns_request(request_id)
+            )
+
     def _register_request(self, generation: _GenerationToken) -> str:
         """Create and register a request id owned by ``generation``.
 
@@ -513,6 +531,9 @@ class SpeechEngine:
                 pitch,
                 request_id,
                 should_abort=lambda: self._should_abort_fetch(generation),
+                reserve_retry=lambda: self._reserve_retry(
+                    generation, request_id
+                ),
             )
         except Cancelled:
             raise
@@ -535,6 +556,9 @@ class SpeechEngine:
                     pitch,
                     retry_id,
                     should_abort=lambda: self._should_abort_fetch(generation),
+                    reserve_retry=lambda: self._reserve_retry(
+                        generation, retry_id
+                    ),
                 )
             finally:
                 generation.discard_request(retry_id)

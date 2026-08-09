@@ -113,6 +113,7 @@ class SynthClient:
         pitch: str,
         request_id: str,
         should_abort: Callable[[], bool] | None = None,
+        reserve_retry: Callable[[], bool] | None = None,
     ) -> bytes:
         """Return MP3 bytes for one chunk, retrying a single 503."""
         url = f"{self._config.backend_url}/generate-and-download-tts"
@@ -124,7 +125,10 @@ class SynthClient:
         ).encode("utf-8")
 
         for attempt in (1, 2):
-            if should_abort is not None and should_abort():
+            if attempt == 2 and reserve_retry is not None:
+                if not reserve_retry():
+                    raise Cancelled("retry no longer admitted")
+            elif should_abort is not None and should_abort():
                 raise Cancelled("aborted before request")
             try:
                 status, headers, body = self._transport(

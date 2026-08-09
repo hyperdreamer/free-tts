@@ -85,7 +85,16 @@ class _FakeClient:
             raise self._payload
         return self._payload
 
-    def synthesize(self, text, voice_name, rate, pitch, request_id, should_abort=None):
+    def synthesize(
+        self,
+        text,
+        voice_name,
+        rate,
+        pitch,
+        request_id,
+        should_abort=None,
+        reserve_retry=None,
+    ):
         self.requests.append((text, voice_name, rate, pitch))
         if self._error is not None:
             raise self._error
@@ -353,7 +362,16 @@ class _LifecycleClient(_FakeClient):
             raise SynthError("backend disappeared")
         return super().voices()
 
-    def synthesize(self, text, voice_name, rate, pitch, request_id, should_abort=None):
+    def synthesize(
+        self,
+        text,
+        voice_name,
+        rate,
+        pitch,
+        request_id,
+        should_abort=None,
+        reserve_retry=None,
+    ):
         from desktop.synth import SynthError
 
         self.attempts += 1
@@ -471,7 +489,14 @@ class TestCancellationOwnership:
                 self.post_entered = threading.Event()
 
             def synthesize(
-                self, text, voice_name, rate, pitch, request_id, should_abort=None
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
             ):
                 self.requests.append((text, voice_name, rate, pitch))
                 self.post_entered.set()
@@ -527,7 +552,14 @@ class TestCancellationOwnership:
                 self.statuses = []
 
             def synthesize(
-                self, text, voice_name, rate, pitch, request_id, should_abort=None
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
             ):
                 self.calls += 1
                 self.requests.append((text, voice_name, rate, pitch))
@@ -670,6 +702,198 @@ class TestCancellationOwnership:
             release_uninterruptible_wait.set()
             engine.wait_idle(3)
 
+    def test_pause_boundary_wins_before_retry_reservation(self):
+        reservation_entered = threading.Event()
+        allow_reservation = threading.Event()
+        pause_boundary_reached = threading.Event()
+        retry_post_started = threading.Event()
+        decode_entered = threading.Event()
+        release_decode = threading.Event()
+        pause_emitted = threading.Event()
+
+        class TimelineIO(_FakeIO):
+            def event_pause(self):
+                super().event_pause()
+                pause_emitted.set()
+
+        class RetryTransport:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.post_calls = 0
+
+            def __call__(self, method, url, body, timeout):
+                if method == "GET":
+                    return 200, {}, json.dumps(PAYLOAD).encode("utf-8")
+                if method == "DELETE":
+                    return 200, {}, b'{"cancelled": true}'
+                assert method == "POST"
+                with self._lock:
+                    self.post_calls += 1
+                    call = self.post_calls
+                if call == 1:
+                    return 200, {}, b"current-mp3"
+                if call == 2:
+                    return 503, {"Retry-After": "0"}, b"{}"
+                retry_post_started.set()
+                return 200, {}, b"unexpected-retry"
+
+        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            decode_entered.set()
+            assert release_decode.wait(3)
+            return b"\x01\x00" * 8
+
+        class ReservationGatedEngine(module.SpeechEngine):
+            def _reserve_retry(self, generation, request_id):
+                reservation_entered.set()
+                assert allow_reservation.wait(3)
+                return super()._reserve_retry(generation, request_id)
+
+            def _reach_pause_boundary(self, generation):
+                reached = super()._reach_pause_boundary(generation)
+                pause_boundary_reached.set()
+                return reached
+
+        transport = RetryTransport()
+        client = synth.SynthClient(
+            settings.DEFAULTS, transport=transport, sleep=lambda _seconds: None
+        )
+        fake_io = TimelineIO()
+        engine = ReservationGatedEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            client,
+            decoder=gated_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert reservation_entered.wait(2)
+        assert decode_entered.wait(2)
+
+        try:
+            engine.handle_pause()
+            release_decode.set()
+            assert pause_boundary_reached.wait(2)
+            allow_reservation.set()
+            assert pause_emitted.wait(1)
+            assert engine.wait_idle(1)
+            assert retry_post_started.is_set() is False
+            assert transport.post_calls == 2
+            assert len(fake_io.audio) == 1
+            assert fake_io.lines.count("704 PAUSE") == 1
+            assert "702 END" not in fake_io.lines
+        finally:
+            release_decode.set()
+            pause_boundary_reached.set()
+            allow_reservation.set()
+            engine.wait_idle(3)
+
+    def test_retry_reservation_wins_then_pause_cancels_it(self):
+        retry_reserved = threading.Event()
+        allow_transport = threading.Event()
+        registered = threading.Event()
+        allow_registration = threading.Event()
+        post_cancelled = threading.Event()
+        decode_entered = threading.Event()
+        release_decode = threading.Event()
+        pause_boundary_reached = threading.Event()
+        pause_emitted = threading.Event()
+
+        class TimelineIO(_FakeIO):
+            def event_pause(self):
+                super().event_pause()
+                pause_emitted.set()
+
+        class RetryTransport:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.post_calls = 0
+                self.retry_post_calls = 0
+                self.statuses = []
+
+            def __call__(self, method, url, body, timeout):
+                if method == "GET":
+                    return 200, {}, json.dumps(PAYLOAD).encode("utf-8")
+                if method == "DELETE":
+                    with self._lock:
+                        status = 200 if registered.is_set() else 404
+                        self.statuses.append(status)
+                    if status == 404:
+                        allow_registration.set()
+                        assert registered.wait(3)
+                    else:
+                        post_cancelled.set()
+                    return status, {}, b'{"cancelled": true}'
+
+                assert method == "POST"
+                with self._lock:
+                    self.post_calls += 1
+                    call = self.post_calls
+                if call == 1:
+                    return 200, {}, b"current-mp3"
+                if call == 2:
+                    return 503, {"Retry-After": "0"}, b"{}"
+
+                with self._lock:
+                    self.retry_post_calls += 1
+                assert allow_registration.wait(3)
+                registered.set()
+                assert post_cancelled.wait(3)
+                return 499, {}, b'{"error": "Request cancelled."}'
+
+        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            decode_entered.set()
+            assert release_decode.wait(3)
+            return b"\x01\x00" * 8
+
+        class ReservationGatedEngine(module.SpeechEngine):
+            def _reserve_retry(self, generation, request_id):
+                reserved = super()._reserve_retry(generation, request_id)
+                assert reserved is True
+                retry_reserved.set()
+                assert allow_transport.wait(3)
+                return reserved
+
+            def _reach_pause_boundary(self, generation):
+                reached = super()._reach_pause_boundary(generation)
+                pause_boundary_reached.set()
+                return reached
+
+        transport = RetryTransport()
+        client = synth.SynthClient(
+            settings.DEFAULTS, transport=transport, sleep=lambda _seconds: None
+        )
+        fake_io = TimelineIO()
+        engine = ReservationGatedEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            client,
+            decoder=gated_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert retry_reserved.wait(2)
+        assert decode_entered.wait(2)
+
+        try:
+            engine.handle_pause()
+            release_decode.set()
+            assert pause_boundary_reached.wait(2)
+            allow_transport.set()
+            assert post_cancelled.wait(2)
+            assert pause_emitted.wait(1)
+            assert engine.wait_idle(1)
+            assert transport.statuses == [404, 200]
+            assert transport.retry_post_calls == 1
+            assert fake_io.lines.count("704 PAUSE") == 1
+            assert "702 END" not in fake_io.lines
+        finally:
+            release_decode.set()
+            allow_transport.set()
+            allow_registration.set()
+            registered.set()
+            post_cancelled.set()
+            engine.wait_idle(3)
+
     def test_stale_worker_cannot_cancel_a_newer_generation(self, monkeypatch):
         monkeypatch.setattr(module, "_WORKER_RECLAIM_SECONDS", 0.0)
 
@@ -681,7 +905,14 @@ class TestCancellationOwnership:
                 self.calls = 0
 
             def synthesize(
-                self, text, voice_name, rate, pitch, request_id, should_abort=None
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
             ):
                 self.calls += 1
                 self.requests.append((text, voice_name, rate, pitch))
@@ -728,9 +959,25 @@ class TestCancellationOwnership:
 
         original = client.synthesize
 
-        def record(text, voice_name, rate, pitch, request_id, should_abort=None):
+        def record(
+            text,
+            voice_name,
+            rate,
+            pitch,
+            request_id,
+            should_abort=None,
+            reserve_retry=None,
+        ):
             seen.append(request_id)
-            return original(text, voice_name, rate, pitch, request_id, should_abort)
+            return original(
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=should_abort,
+                reserve_retry=reserve_retry,
+            )
 
         client.synthesize = record
         engine.handle_speak(SSML)
@@ -756,7 +1003,14 @@ class TestPauseFallback:
             self.release = threading.Event()
 
         def synthesize(
-            self, text, voice_name, rate, pitch, request_id, should_abort=None
+            self,
+            text,
+            voice_name,
+            rate,
+            pitch,
+            request_id,
+            should_abort=None,
+            reserve_retry=None,
         ):
             self.requests.append((text, voice_name, rate, pitch))
             self.entered.set()
