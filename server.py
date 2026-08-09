@@ -12,7 +12,7 @@ Architecture:
     - SSML size limit to prevent DoS via oversized payloads.
     - TTS generation timeout to prevent hung connections.
     - Graceful shutdown on SIGTERM/SIGINT.
-    - Production WSGI: Waitress (default) or Gunicorn (via TTS_SERVER=gunicorn).
+    - Production WSGI: single-process Waitress.
     - CORS enabled for cross-origin frontend requests.
     - Health-check endpoint with voice-cache readiness indicator.
     - Error messages sanitised in production mode.
@@ -20,12 +20,12 @@ Architecture:
 Usage:
     python server.py                      # production (Waitress, port 5000)
     FLASK_DEBUG=1 python server.py        # development (Flask built-in)
-    TTS_SERVER=gunicorn python server.py   # production (Gunicorn, port 5000)
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -177,7 +177,7 @@ TTS_QUEUE_TIMEOUT: int = _cfg_int("queue_timeout", "TTS_QUEUE_TIMEOUT", 30, mini
 _TTS_SEMAPHORE: threading.BoundedSemaphore | None = (
     threading.BoundedSemaphore(TTS_MAX_CONCURRENT) if TTS_MAX_CONCURRENT > 0 else None
 )
-"""Per-worker thread-safe limiter for concurrent TTS generation."""
+"""Process-wide thread-safe limiter for concurrent TTS generation."""
 
 TTS_IDLE_TIMEOUT: int = _cfg_int("idle_timeout", "TTS_IDLE_TIMEOUT", 0, minimum=0)
 """Seconds of inactivity before self-shutdown. 0 = never (the default).
@@ -191,18 +191,18 @@ WAITRESS_THREADS: int = _cfg_int(
 )
 """Number of Waitress worker threads."""
 
-GUNICORN_WORKERS: int = _cfg_int(
-    "gunicorn_workers", "TTS_GUNICORN_WORKERS", 2, minimum=1
-)
-"""Number of Gunicorn worker processes."""
-
-GUNICORN_THREADS: int = _cfg_int(
-    "gunicorn_threads", "TTS_GUNICORN_THREADS", 4, minimum=1
-)
-"""Threads per Gunicorn worker."""
-
 WSGI_SERVER: str = _cfg("wsgi_server", "TTS_SERVER", "waitress").lower()
-"""Which WSGI server to use: 'waitress' or 'gunicorn'."""
+"""Only the single-process Waitress server is supported."""
+
+
+def _validate_process_model(server_name: str) -> None:
+    """Reject process-local coordination behind a multi-process server."""
+    if server_name != "waitress":
+        raise RuntimeError(
+            "The cancellation and idle-lifecycle contract requires a "
+            "single-process server; use TTS_SERVER=waitress."
+        )
+
 
 CORS_ORIGINS: list[str] = _cfg_list(
     "cors_origins",
@@ -232,13 +232,62 @@ class CancelledError(Exception):
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 """Adapter-supplied request ids: opaque, bounded, log- and route-safe."""
 
-_CANCEL_REGISTRY: dict[str, threading.Event] = {}
 _CANCEL_LOCK = threading.Lock()
 
 
-def _register_cancel_token(request_id: str) -> threading.Event:
+class _CancellationToken:
+    """Thread-safe cancellation state that can also be awaited by asyncio."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._waiters: set[
+            tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]
+        ] = set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def set(self) -> None:
+        with self._lock:
+            if self._event.is_set():
+                return
+            self._event.set()
+            waiters = tuple(self._waiters)
+        for loop, future in waiters:
+            try:
+                loop.call_soon_threadsafe(self._resolve, future)
+            except RuntimeError:
+                pass
+
+    async def wait(self) -> None:
+        if self._event.is_set():
+            return
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        waiter = (loop, future)
+        with self._lock:
+            if self._event.is_set():
+                return
+            self._waiters.add(waiter)
+        try:
+            await future
+        finally:
+            with self._lock:
+                self._waiters.discard(waiter)
+
+    @staticmethod
+    def _resolve(future: asyncio.Future[None]) -> None:
+        if not future.done():
+            future.set_result(None)
+
+
+_CANCEL_REGISTRY: dict[str, _CancellationToken] = {}
+
+
+def _register_cancel_token(request_id: str) -> _CancellationToken:
     """Create and store a cancellation token for an in-flight request."""
-    event = threading.Event()
+    event = _CancellationToken()
     with _CANCEL_LOCK:
         _CANCEL_REGISTRY[request_id] = event
     return event
@@ -258,6 +307,7 @@ def _cancel_request(request_id: str) -> bool:
         return False
     event.set()
     return True
+
 
 # ---------------------------------------------------------------------------
 # Voice cache (populated at startup from edge-tts)
@@ -695,24 +745,33 @@ def extract_tts_params(ssml: str) -> TTSRequest:
 # ---------------------------------------------------------------------------
 # TTS generation
 # ---------------------------------------------------------------------------
+async def _wait_for_cancel(
+    cancel_event: _CancellationToken | threading.Event,
+) -> None:
+    if isinstance(cancel_event, _CancellationToken):
+        await cancel_event.wait()
+        return
+    while not cancel_event.is_set():
+        await asyncio.sleep(0.01)
+
+
+async def _close_stream(stream: Any) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await stream.aclose()
+
+
+async def _cancel_stream_read(stream: Any, read_task: asyncio.Task[Any]) -> None:
+    read_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await read_task
+    await _close_stream(stream)
+
+
 async def generate_audio(
-    req: TTSRequest, cancel_event: threading.Event | None = None
+    req: TTSRequest,
+    cancel_event: _CancellationToken | threading.Event | None = None,
 ) -> bytes:
-    """Synthesise speech via edge-tts and return MP3 bytes.
-
-    Args:
-        req: Normalised TTS parameters.
-        cancel_event: Optional token checked each loop iteration; when set,
-            generation aborts with :class:`CancelledError`.
-
-    Returns:
-        Raw MP3 audio bytes.
-
-    Raises:
-        RuntimeError: If edge-tts fails (e.g. invalid voice name).
-        TimeoutError: If no data received from edge-tts for TTS_STALL_TIMEOUT seconds.
-        CancelledError: If ``cancel_event`` is set mid-stream.
-    """
+    """Synthesise speech, racing every blocked stream read with cancellation."""
     try:
         communicate = edge_tts.Communicate(
             req.text,
@@ -725,38 +784,93 @@ async def generate_audio(
 
     buf = BytesIO()
     stream = communicate.stream()
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
+    cancel_task = (
+        asyncio.create_task(_wait_for_cancel(cancel_event))
+        if cancel_event is not None
+        else None
+    )
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                await _close_stream(stream)
+                raise CancelledError("Generation cancelled by client.")
+
+            read_task = asyncio.create_task(stream.__anext__())
+            wait_for = {read_task}
+            if cancel_task is not None:
+                wait_for.add(cancel_task)
+            timeout = TTS_STALL_TIMEOUT if TTS_STALL_TIMEOUT > 0 else None
             try:
-                await stream.aclose()
-            except Exception:
-                pass
-            raise CancelledError("Generation cancelled by client.")
-        try:
-            if TTS_STALL_TIMEOUT > 0:
-                chunk = await asyncio.wait_for(
-                    stream.__anext__(), timeout=TTS_STALL_TIMEOUT
+                done, _pending = await asyncio.wait(
+                    wait_for,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            else:
-                chunk = await stream.__anext__()
-        except StopAsyncIteration:
-            break
-        except asyncio.TimeoutError:
+            except BaseException:
+                await _cancel_stream_read(stream, read_task)
+                raise
+
+            if cancel_task is not None and cancel_task in done:
+                await _cancel_stream_read(stream, read_task)
+                raise CancelledError("Generation cancelled by client.")
+            if read_task not in done:
+                await _cancel_stream_read(stream, read_task)
+                raise TimeoutError(
+                    f"No data from TTS service for {TTS_STALL_TIMEOUT}s "
+                    "(stall detected)"
+                )
+
             try:
-                await stream.aclose()
-            except Exception:
-                pass
-            raise TimeoutError(
-                f"No data from TTS service for {TTS_STALL_TIMEOUT}s (stall detected)"
-            )
-        if chunk.get("type") == "audio":
-            buf.write(chunk.get("data", b""))
+                chunk = read_task.result()
+            except StopAsyncIteration:
+                break
+            except BaseException:
+                await _close_stream(stream)
+                raise
+            if chunk.get("type") == "audio":
+                buf.write(chunk.get("data", b""))
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_task
 
     if buf.tell() == 0:
         raise RuntimeError("edge-tts returned no audio data.")
 
-    buf.seek(0)
-    return buf.read()
+    return buf.getvalue()
+
+
+async def _acquire_tts_slot(
+    semaphore: threading.BoundedSemaphore,
+    cancel_event: _CancellationToken | None,
+    timeout: float,
+) -> bool:
+    """Wait asynchronously for one process-local slot or cancellation."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Request cancelled while waiting for a TTS slot.")
+        if semaphore.acquire(blocking=False):
+            if cancel_event is not None and cancel_event.is_set():
+                semaphore.release()
+                raise CancelledError(
+                    "Request cancelled while waiting for a TTS slot."
+                )
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        delay = min(0.05, remaining)
+        if cancel_event is None:
+            await asyncio.sleep(delay)
+            continue
+        try:
+            await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+        except TimeoutError:
+            continue
+        raise CancelledError("Request cancelled while waiting for a TTS slot.")
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +999,24 @@ def create_app() -> Flask:
         ).start()
         logger.info("Idle shutdown armed: %ds.", TTS_IDLE_TIMEOUT)
 
+    # -- Process contract ----------------------------------------------------
+    @app.before_request
+    def _enforce_process_contract():
+        software = request.environ.get("SERVER_SOFTWARE", "").lower()
+        if "gunicorn" in software:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "Gunicorn is unsupported: cancellation and idle "
+                            "lifecycle require a single-process Waitress server."
+                        )
+                    }
+                ),
+                503,
+            )
+        return None
+
     # -- Request logging -----------------------------------------------------
     @app.before_request
     def _before_request() -> None:
@@ -992,21 +1124,20 @@ def create_app() -> Flask:
         cancel_event = (
             _register_cancel_token(request_id) if request_id is not None else None
         )
+        semaphore = _TTS_SEMAPHORE
+        slot_acquired = False
         if _IDLE_WATCHDOG is not None:
             _IDLE_WATCHDOG.begin_request()
         try:
-            if _TTS_SEMAPHORE is not None:
-                acquired = _TTS_SEMAPHORE.acquire(timeout=TTS_QUEUE_TIMEOUT)
-                if not acquired:
+            if semaphore is not None:
+                slot_acquired = await _acquire_tts_slot(
+                    semaphore, cancel_event, TTS_QUEUE_TIMEOUT
+                )
+                if not slot_acquired:
                     resp = jsonify({"error": "Server busy, try again later."})
                     resp.headers["Retry-After"] = str(TTS_QUEUE_TIMEOUT)
                     return resp, 503  # type: ignore[return-value]
-                try:
-                    audio = await generate_audio(tts_req, cancel_event=cancel_event)
-                finally:
-                    _TTS_SEMAPHORE.release()
-            else:
-                audio = await generate_audio(tts_req, cancel_event=cancel_event)
+            audio = await generate_audio(tts_req, cancel_event=cancel_event)
         except CancelledError:
             logger.info("TTS request cancelled by client.")
             return jsonify({"error": "Request cancelled."}), 499  # type: ignore[return-value]
@@ -1020,6 +1151,8 @@ def create_app() -> Flask:
             logger.exception("Unexpected TTS error")
             return jsonify({"error": _error_message(exc)}), 500  # type: ignore[return-value]
         finally:
+            if slot_acquired and semaphore is not None:
+                semaphore.release()
             if _IDLE_WATCHDOG is not None:
                 _IDLE_WATCHDOG.end_request()
             if request_id is not None:
@@ -1053,6 +1186,13 @@ signal.signal(signal.SIGINT, _handle_shutdown)
 # Main entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    if not os.environ.get("FLASK_DEBUG"):
+        try:
+            _validate_process_model(WSGI_SERVER)
+        except RuntimeError as exc:
+            logger.critical("%s", exc)
+            sys.exit(1)
+
     application = create_app()
 
     if not _voice_cache_ready:
@@ -1066,80 +1206,24 @@ if __name__ == "__main__":
             "Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT
         )
         application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
-    elif WSGI_SERVER == "gunicorn":
+    else:
         try:
-            from gunicorn.app.base import BaseApplication
-
-            class StandaloneApplication(BaseApplication):
-                def __init__(self, app: Flask, options: dict[str, Any]) -> None:
-                    self.application = app
-                    self.options = options
-                    super().__init__()
-
-                def load_config(self) -> None:
-                    for key, value in self.options.items():
-                        if key in self.cfg.settings and value is not None:
-                            self.cfg.set(key.lower(), value)
-
-                def load(self) -> Flask:
-                    return self.application  # type: ignore[return-value]
-
-            options = {
-                "bind": f"{SERVER_HOST}:{SERVER_PORT}",
-                "workers": GUNICORN_WORKERS,
-                "threads": GUNICORN_THREADS,
-                "worker_class": "gthread",
-                "graceful_timeout": 30,
-                "timeout": 0,  # no limit — stall detection handles timeouts
-                "accesslog": "-",
-                "errorlog": "-",
-                "loglevel": "info",
-                "preload_app": True,
-            }
-            logger.info(
-                "Starting Gunicorn on %s:%d (workers=%d, threads=%d)",
-                SERVER_HOST,
-                SERVER_PORT,
-                GUNICORN_WORKERS,
-                GUNICORN_THREADS,
-            )
-            StandaloneApplication(application, options).run()
+            from waitress import serve  # type: ignore[import-untyped]
         except ImportError:
             logger.critical(
-                "Gunicorn requested but not installed. Install with: pip install gunicorn"
+                "Waitress not installed in production. Install with: pip install waitress"
             )
             sys.exit(1)
-    elif WSGI_SERVER == "waitress":
-        if PRODUCTION:
-            try:
-                from waitress import serve  # type: ignore[import-untyped]
-            except ImportError:
-                logger.critical(
-                    "Waitress not installed in production. Install with: pip install waitress"
-                )
-                sys.exit(1)
-            logger.info(
-                "Starting Waitress on %s:%d (threads=%d)",
-                SERVER_HOST,
-                SERVER_PORT,
-                WAITRESS_THREADS,
-            )
-            serve(
-                application,
-                host=SERVER_HOST,
-                port=SERVER_PORT,
-                threads=WAITRESS_THREADS,
-                _quiet=True,
-            )
-        else:
-            # FLASK_DEBUG mode: use Flask dev server
-            logger.info(
-                "Starting Flask development server on %s:%d", SERVER_HOST, SERVER_PORT
-            )
-            application.run(host=SERVER_HOST, port=SERVER_PORT, debug=True)
-    else:
-        logger.critical(
-            "Unsupported TTS_SERVER value %r. Use 'waitress' or 'gunicorn'.",
-            WSGI_SERVER,
+        logger.info(
+            "Starting Waitress on %s:%d (threads=%d)",
+            SERVER_HOST,
+            SERVER_PORT,
+            WAITRESS_THREADS,
         )
-        sys.exit(1)
+        serve(
+            application,
+            host=SERVER_HOST,
+            port=SERVER_PORT,
+            threads=WAITRESS_THREADS,
+            _quiet=True,
+        )

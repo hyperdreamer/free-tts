@@ -64,13 +64,20 @@ def _as_bool(raw: object, default: bool) -> bool:
     return default
 
 
-def _as_int(raw: object, default: int) -> int:
+def _as_int(raw: object, default: int, *, minimum: int) -> int:
     try:
         value = int(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         logger.warning("Invalid integer %r; using %d.", raw, default)
         return default
-    return max(0, value)
+    if minimum == 0:
+        return max(0, value)
+    if value < minimum:
+        logger.warning(
+            "Integer %r is below the minimum %d; using %d.", raw, minimum, default
+        )
+        return default
+    return value
 
 
 def load_config(
@@ -100,7 +107,10 @@ def load_config(
     for field in _INT_FIELDS:
         value = env.get(f"FREE_TTS_{field.upper()}", raw.get(field))
         if value is not None:
-            updates[field] = _as_int(value, getattr(DEFAULTS, field))
+            minimum = 0 if field == "idle_timeout" else 1
+            updates[field] = _as_int(
+                value, getattr(DEFAULTS, field), minimum=minimum
+            )
     autostart = env.get("FREE_TTS_AUTOSTART", raw.get("autostart"))
     if autostart is not None:
         updates["autostart"] = _as_bool(autostart, DEFAULTS.autostart)

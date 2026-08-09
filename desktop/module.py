@@ -43,6 +43,14 @@ _STRING_SETTINGS = (
 )
 
 
+class _GenerationToken:
+    """Invalidatable state owned by one accepted speech generation."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self.pause_requested = threading.Event()
+
+
 def check_ffmpeg(
     ffmpeg_path: str, runner: Callable[..., object] = subprocess.run
 ) -> None:
@@ -81,9 +89,7 @@ class SpeechEngine:
         self.catalog: VoiceCatalog | None = None
 
         self._lock = threading.Lock()
-        self._token = 0
-        self._stop_requested = False
-        self._pause_requested = False
+        self._generation: _GenerationToken | None = None
         self._worker: threading.Thread | None = None
         self._registered = threading.Event()
         self._go = threading.Event()
@@ -161,11 +167,9 @@ class SpeechEngine:
             return
 
         self._join_worker()
+        generation = _GenerationToken()
         with self._lock:
-            self._token += 1
-            token = self._token
-            self._stop_requested = False
-            self._pause_requested = False
+            self._generation = generation
         rate = map_rate(self._rate)
         pitch = map_pitch(self._pitch)
         gain = map_volume(self._volume)
@@ -175,7 +179,7 @@ class SpeechEngine:
         self._io.send(protocol.OK_SPEAKING)  # type: ignore[attr-defined]
         worker = threading.Thread(
             target=self._speak_worker,
-            args=(token, chunks, voice.name, rate, pitch, gain),
+            args=(generation, chunks, voice.name, rate, pitch, gain),
             name="free-tts-speak",
             daemon=True,
         )
@@ -189,17 +193,29 @@ class SpeechEngine:
         self._go.set()
 
     def handle_stop(self) -> None:
-        """Ask the worker to abandon the message. Returns immediately."""
+        """Invalidate active speech and cancel its backend requests."""
         with self._lock:
-            self._stop_requested = True
+            worker = self._worker
+            generation = self._generation
+            if worker is None or not worker.is_alive() or generation is None:
+                return
+            generation.cancelled.set()
             outstanding = list(self._active_requests)
-        for request_id in outstanding:
-            self._client.cancel(request_id)  # type: ignore[attr-defined]
+        if outstanding:
+            threading.Thread(
+                target=self._cancel_requests,
+                args=(outstanding,),
+                name="free-tts-cancel",
+                daemon=True,
+            ).start()
 
     def handle_pause(self) -> None:
         """Ask the worker to stop at the next index mark."""
         with self._lock:
-            self._pause_requested = True
+            worker = self._worker
+            generation = self._generation
+            if worker is not None and worker.is_alive() and generation is not None:
+                generation.pause_requested.set()
 
     def wait_idle(self, timeout: float = 5.0) -> bool:
         """Wait for the current message to finish. True if the worker is done."""
@@ -216,10 +232,13 @@ class SpeechEngine:
         self.wait_idle()
 
     def _ensure_catalog(self) -> VoiceCatalog:
-        if self.catalog is not None and len(self.catalog):
-            return self.catalog
+        self.catalog = None
         self._controller.ensure_ready()  # type: ignore[attr-defined]
-        catalog = VoiceCatalog.from_payload(self._client.voices())  # type: ignore[attr-defined]
+        return self._refresh_catalog()
+
+    def _refresh_catalog(self) -> VoiceCatalog:
+        payload = self._client.voices()  # type: ignore[attr-defined]
+        catalog = VoiceCatalog.from_payload(payload)
         if not len(catalog):
             raise SynthError("backend returned no voices")
         self.catalog = catalog
@@ -228,19 +247,63 @@ class SpeechEngine:
     def _join_worker(self) -> None:
         with self._lock:
             worker = self._worker
-            self._stop_requested = True
         if worker is not None and worker.is_alive():
+            self.handle_stop()
             worker.join(10.0)
         with self._lock:
             self._worker = None
 
-    def _is_current(self, token: int) -> bool:
+    def _emit(
+        self,
+        generation: _GenerationToken,
+        action: Callable[[], None],
+        *,
+        allow_cancelled: bool = False,
+    ) -> bool:
+        """Check generation state and emit atomically with STOP invalidation."""
         with self._lock:
-            return token == self._token
+            if generation is not self._generation:
+                return False
+            if generation.cancelled.is_set() and not allow_cancelled:
+                return False
+            action()
+            return True
+
+    def _decode_interruptibly(
+        self, generation: _GenerationToken, mp3: bytes
+    ) -> bytes:
+        """Stop waiting for a decoder as soon as this generation is cancelled."""
+        done = threading.Event()
+        result: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def decode() -> None:
+            try:
+                result.append(
+                    self._decode(mp3, self._config.ffmpeg_path, SAMPLE_RATE)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=decode,
+            name="free-tts-decode",
+            daemon=True,
+        ).start()
+        while not done.wait(0.02):
+            if self._should_abort(generation):
+                raise Cancelled("aborted while decoding")
+        if self._should_abort(generation):
+            raise Cancelled("aborted after decoding")
+        if errors:
+            raise errors[0]
+        return result[0]
 
     def _speak_worker(
         self,
-        token: int,
+        generation: _GenerationToken,
         chunks: list[object],
         voice_name: str,
         rate: str,
@@ -250,11 +313,13 @@ class SpeechEngine:
         """Synthesise every chunk with one-chunk lookahead, then report."""
         outcome = "end"
         began = False
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="free-tts-pre") as pool:
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="free-tts-pre"
+        ) as pool:
             pending = None
             try:
                 for index, chunk in enumerate(chunks):
-                    if self._should_abort(token):
+                    if self._should_abort(generation):
                         outcome = "stop"
                         break
                     if pending is None:
@@ -263,7 +328,7 @@ class SpeechEngine:
                         self._go.wait(5.0)
                         future = pool.submit(
                             self._fetch,
-                            token,
+                            generation,
                             chunk.text,
                             voice_name,
                             rate,
@@ -273,10 +338,10 @@ class SpeechEngine:
                     else:
                         future = pending
                         pending = None
-                    if index + 1 < len(chunks) and not self._should_abort(token):
+                    if index + 1 < len(chunks) and not self._should_abort(generation):
                         pending = pool.submit(
                             self._fetch,
-                            token,
+                            generation,
                             chunks[index + 1].text,
                             voice_name,
                             rate,
@@ -284,27 +349,48 @@ class SpeechEngine:
                             self._register_request(),
                         )
                     mp3 = future.result()
-                    if self._should_abort(token):
+                    if self._should_abort(generation):
                         outcome = "stop"
                         break
                     pcm = apply_gain(
-                        self._decode(mp3, self._config.ffmpeg_path, SAMPLE_RATE), gain
+                        self._decode_interruptibly(generation, mp3), gain
                     )
-                    if not self._is_current(token):
-                        return
+                    if self._should_abort(generation):
+                        outcome = "stop"
+                        break
                     if not began:
-                        began = True
-                        self._io.event_begin()  # type: ignore[attr-defined]
-                    self._io.send_audio(pcm, SAMPLE_RATE)  # type: ignore[attr-defined]
-                    if chunk.mark and self._is_current(token):
-                        self._io.index_mark(chunk.mark)  # type: ignore[attr-defined]
-                    with self._lock:
-                        if self._stop_requested:
+                        if not self._emit(
+                            generation,
+                            lambda: self._io.event_begin(),  # type: ignore[attr-defined]
+                        ):
                             outcome = "stop"
                             break
-                        if self._pause_requested:
-                            outcome = "pause"
+                        began = True
+                    for offset in range(
+                        0, len(pcm), protocol.MAX_AUDIO_CHUNK_BYTES
+                    ):
+                        frame = pcm[
+                            offset : offset + protocol.MAX_AUDIO_CHUNK_BYTES
+                        ]
+                        if not self._emit(
+                            generation,
+                            lambda frame=frame: self._io.send_audio(  # type: ignore[attr-defined]
+                                frame, SAMPLE_RATE
+                            ),
+                        ):
+                            outcome = "stop"
                             break
+                    if outcome == "stop":
+                        break
+                    if chunk.mark and not self._emit(
+                        generation,
+                        lambda: self._io.index_mark(chunk.mark),  # type: ignore[attr-defined]
+                    ):
+                        outcome = "stop"
+                        break
+                    if chunk.mark and generation.pause_requested.is_set():
+                        outcome = "pause"
+                        break
             except Cancelled:
                 outcome = "stop"
             except (SynthError, DecodeError) as exc:
@@ -318,18 +404,33 @@ class SpeechEngine:
                     pending.cancel()
                 self._cancel_outstanding()
 
-        if not self._is_current(token):
-            return
-        if outcome == "stop":
-            self._io.event_stop()  # type: ignore[attr-defined]
-        elif outcome == "pause":
-            self._io.event_pause()  # type: ignore[attr-defined]
-        else:
-            self._io.event_end()  # type: ignore[attr-defined]
+        def emit_stop() -> bool:
+            return self._emit(
+                generation,
+                lambda: self._io.event_stop(),  # type: ignore[attr-defined]
+                allow_cancelled=True,
+            )
 
-    def _should_abort(self, token: int) -> bool:
+        if outcome == "stop":
+            emit_stop()
+        elif outcome == "pause":
+            if not self._emit(
+                generation,
+                lambda: self._io.event_pause(),  # type: ignore[attr-defined]
+            ):
+                emit_stop()
+        elif not self._emit(
+            generation,
+            lambda: self._io.event_end(),  # type: ignore[attr-defined]
+        ):
+            emit_stop()
+
+    def _should_abort(self, generation: _GenerationToken) -> bool:
         with self._lock:
-            return self._stop_requested or token != self._token
+            return (
+                generation is not self._generation
+                or generation.cancelled.is_set()
+            )
 
     def _register_request(self) -> str:
         """Create and register a request id before it is submitted.
@@ -345,7 +446,7 @@ class SpeechEngine:
 
     def _fetch(
         self,
-        token: int,
+        generation: _GenerationToken,
         text: str,
         voice_name: str,
         rate: str,
@@ -361,7 +462,25 @@ class SpeechEngine:
                 rate,
                 pitch,
                 request_id,
-                should_abort=lambda: self._should_abort(token),
+                should_abort=lambda: self._should_abort(generation),
+            )
+        except Cancelled:
+            raise
+        except SynthError:
+            if self._should_abort(generation):
+                raise Cancelled("aborted instead of recovering backend")
+            self.catalog = None
+            self._controller.ensure_ready()  # type: ignore[attr-defined]
+            self._refresh_catalog()
+            if self._should_abort(generation):
+                raise Cancelled("aborted before retrying synthesis")
+            return self._client.synthesize(  # type: ignore[attr-defined]
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=lambda: self._should_abort(generation),
             )
         finally:
             with self._lock:
@@ -371,8 +490,12 @@ class SpeechEngine:
         with self._lock:
             outstanding = list(self._active_requests)
             self._active_requests.clear()
-        for request_id in outstanding:
+        self._cancel_requests(outstanding)
+
+    def _cancel_requests(self, request_ids: list[str]) -> None:
+        for request_id in request_ids:
             self._client.cancel(request_id)  # type: ignore[attr-defined]
+
 
 def _configure_logging() -> None:
     """Log to stderr only: stdout belongs to the protocol."""

@@ -55,6 +55,10 @@ def _mp3_tone() -> bytes:
 class _Handler(http.server.BaseHTTPRequestHandler):
     audio = b""
     seen: list[str] = []
+    control_mode: str | None = None
+    post_started = threading.Event()
+    release_post = threading.Event()
+    control_events: list[str] = []
 
     def log_message(self, *args):
         return
@@ -69,6 +73,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            if (
+                type(self).control_mode == "pause"
+                and type(self).post_started.is_set()
+            ):
+                type(self).control_events.append("PAUSE_BOUNDARY")
+                type(self).release_post.set()
             self._json(
                 200,
                 {
@@ -87,6 +97,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
         type(self).seen.append(payload.get("ssml", ""))
+        if type(self).control_mode is not None:
+            type(self).control_events.append("POST_STARTED")
+            type(self).post_started.set()
+            if not type(self).release_post.wait(5):
+                type(self).control_events.append("POST_TIMEOUT")
+                self._json(500, {"error": "control barrier timed out"})
+                return
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
         self.send_header("Content-Length", str(len(type(self).audio)))
@@ -94,6 +111,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(type(self).audio)
 
     def do_DELETE(self):
+        if type(self).control_mode == "stop":
+            if not type(self).post_started.wait(5):
+                type(self).control_events.append("DELETE_BEFORE_POST_TIMEOUT")
+                self._json(500, {"error": "POST did not start"})
+                return
+            type(self).control_events.append("DELETE_RECEIVED")
+            type(self).release_post.set()
         self._json(200, {"cancelled": True})
 
 
@@ -103,6 +127,10 @@ def backend():
         pytest.skip("ffmpeg not installed")
     _Handler.audio = _mp3_tone()
     _Handler.seen = []
+    _Handler.control_mode = None
+    _Handler.post_started = threading.Event()
+    _Handler.release_post = threading.Event()
+    _Handler.control_events = []
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -113,9 +141,8 @@ def backend():
         server.server_close()
 
 
-def _session(backend_url, script, timeout=60):
-    """Feed ``script`` to the module and return its stdout bytes."""
-    env = {
+def _module_env(backend_url):
+    return {
         "PATH": "/usr/bin:/bin",
         "PYTHONPATH": str(ROOT),
         "FREE_TTS_BACKEND_URL": backend_url,
@@ -123,15 +150,38 @@ def _session(backend_url, script, timeout=60):
         "HOME": "/nonexistent-free-tts-home",
         "XDG_CONFIG_HOME": "/nonexistent-free-tts-config",
     }
+
+
+def _session(backend_url, script, timeout=60):
+    """Feed ``script`` to the module and return its stdout bytes."""
     result = subprocess.run(
         [sys.executable, "-m", "desktop.module", "/dev/null"],
         input=script,
         capture_output=True,
-        env=env,
+        env=_module_env(backend_url),
         cwd=str(ROOT),
         timeout=timeout,
     )
     return result.stdout
+
+
+def _start_session(backend_url):
+    return subprocess.Popen(
+        [sys.executable, "-m", "desktop.module", "/dev/null"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_module_env(backend_url),
+        cwd=str(ROOT),
+    )
+
+
+def _finish_session(process, commands, timeout=60):
+    process.stdin.write(commands)
+    process.stdin.close()
+    process.stdin = None
+    stdout, _stderr = process.communicate(timeout=timeout)
+    return stdout
 
 
 class TestFullSession:
@@ -230,6 +280,54 @@ class TestFullSession:
         out = _session(backend, b"INIT\nSTOP\nQUIT\n")
         assert b"210 OK QUIT" in out
         assert b"703 STOP" not in out
+
+    def test_active_stop_emits_one_stop_and_no_audio_or_marks(self, backend):
+        _Handler.control_mode = "stop"
+        process = _start_session(backend)
+        try:
+            process.stdin.write(
+                b"INIT\nSPEAK\n"
+                b'<speak>Stop here. <mark name="__spd_0"/></speak>\n.\n'
+            )
+            process.stdin.flush()
+            assert _Handler.post_started.wait(5)
+            out = _finish_session(process, b"STOP\nQUIT\n")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        assert _Handler.control_events[:2] == ["POST_STARTED", "DELETE_RECEIVED"]
+        assert "POST_TIMEOUT" not in _Handler.control_events
+        assert out.count(b"703 STOP") == 1
+        assert b"701 BEGIN" not in out
+        assert b"705-AUDIO\x00" not in out
+        assert b"700-__spd_0" not in out
+        assert b"702 END" not in out
+
+    def test_active_pause_stops_after_mark_and_emits_one_pause(self, backend):
+        _Handler.control_mode = "pause"
+        process = _start_session(backend)
+        try:
+            process.stdin.write(
+                b"INIT\nSPEAK\n"
+                b'<speak>Pause here. <mark name="__spd_0"/></speak>\n.\n'
+            )
+            process.stdin.flush()
+            assert _Handler.post_started.wait(5)
+            out = _finish_session(process, b"PAUSE\nLIST VOICES\nQUIT\n")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        assert _Handler.control_events[:2] == ["POST_STARTED", "PAUSE_BOUNDARY"]
+        assert "POST_TIMEOUT" not in _Handler.control_events
+        assert b"705-AUDIO\x00" in out
+        assert b"700-__spd_0" in out
+        assert out.count(b"704 PAUSE") == 1
+        assert out.index(b"700-__spd_0") < out.index(b"704 PAUSE")
+        assert b"702 END" not in out
 
     def test_eof_without_quit_exits_cleanly(self, backend):
         out = _session(backend, b"INIT\n")

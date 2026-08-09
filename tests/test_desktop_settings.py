@@ -51,9 +51,28 @@ class TestLoadConfig:
         path.write_text(json.dumps({"idle_timeout": "soon"}))
         assert settings.load_config(path, env={}).idle_timeout == 300
 
-    def test_negative_int_clamped_to_zero(self, tmp_path):
+    @pytest.mark.parametrize(
+        "field,raw,expected",
+        [
+            ("startup_timeout", 0, settings.DEFAULTS.startup_timeout),
+            ("startup_timeout", -1, settings.DEFAULTS.startup_timeout),
+            ("request_timeout", 0, settings.DEFAULTS.request_timeout),
+            ("request_timeout", -1, settings.DEFAULTS.request_timeout),
+            ("max_chunk_chars", 0, settings.DEFAULTS.max_chunk_chars),
+            ("max_chunk_chars", -1, settings.DEFAULTS.max_chunk_chars),
+        ],
+    )
+    def test_positive_integer_fields_reject_zero_and_negative(
+        self, tmp_path, field, raw, expected
+    ):
         path = tmp_path / "config.json"
-        path.write_text(json.dumps({"idle_timeout": -5}))
+        path.write_text(json.dumps({field: raw}))
+        assert getattr(settings.load_config(path, env={}), field) == expected
+
+    @pytest.mark.parametrize("raw", [0, -5])
+    def test_idle_timeout_alone_allows_zero(self, tmp_path, raw):
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"idle_timeout": raw}))
         assert settings.load_config(path, env={}).idle_timeout == 0
 
     def test_config_path_respects_xdg(self, monkeypatch, tmp_path):

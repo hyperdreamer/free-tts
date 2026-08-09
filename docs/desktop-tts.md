@@ -30,9 +30,13 @@ This is a per-user install. It writes to:
 | `~/.config/speech-dispatcher/modules/free-tts.conf` | module config |
 | `~/.config/speech-dispatcher/speechd.conf` | one marked block registering the module |
 
-Nothing outside your home directory is touched. Your existing `speechd.conf` is
-backed up once to `speechd.conf.free-tts.bak`, and only the marked block is ever
-rewritten.
+Nothing outside your home directory is touched. The installer verifies Python,
+Speech Dispatcher, libspeechd, and ffmpeg before writing anything, and refuses
+to overwrite conventional paths unless its ownership manifest proves they came
+from an earlier free-tts install. Upgrades retain a rollback tree until the new
+runtime and Speech Dispatcher files are fully published. Your existing
+`speechd.conf` is backed up once to `speechd.conf.free-tts.bak`, and only the
+marked block is ever rewritten.
 
 Restart open Qt applications afterwards: Qt reads the voice list once when its
 TTS engine starts.
@@ -70,12 +74,13 @@ limitation below.
 
 ## How the backend starts
 
-On first use the adapter checks `GET /health`.
+Before every voice listing or speech request, the adapter checks `GET /health`.
 
 - A healthy free-tts backend already running is reused and never stopped or
   reconfigured, including on uninstall.
-- Otherwise the adapter starts one and gives it a 5 minute idle timeout, so it
-  exits on its own after you stop reading.
+- If no backend is running, or an adapter-started backend has exited after its
+  idle timeout, the adapter starts it and refreshes the voice catalog before
+  continuing.
 - If something else answers on that port, the adapter refuses to start a second
   backend and reports an error rather than speaking to an unknown service.
 
@@ -95,6 +100,9 @@ and each has a `FREE_TTS_*` environment override.
 | `request_timeout` | `120` | per-sentence synthesis timeout |
 | `max_chunk_chars` | `400` | cap for long unpunctuated segments |
 | `ffmpeg_path` | `ffmpeg` | decoder executable |
+
+`startup_timeout`, `request_timeout`, and `max_chunk_chars` must be positive.
+Only `idle_timeout` accepts `0`.
 
 Voice, rate, pitch, and volume come from the calling application, not from this
 file. Rate maps to -50%..+200%, pitch to -50Hz..+50Hz, and volume to a PCM gain.
@@ -119,5 +127,8 @@ Set `FREE_TTS_DEBUG=1` for verbose module logging. Spoken text is never logged.
 python -m desktop.install uninstall
 ```
 
-Removes only what was installed, restores any `DefaultModule` it displaced, and
-leaves Speech Dispatcher, unrelated config, and running backends alone.
+Removes only paths recorded in a valid ownership manifest, restores any
+`DefaultModule` the managed block displaced, and leaves Speech Dispatcher,
+unrelated config, and running backends alone. If the manifest is missing or
+invalid, uninstall leaves the conventional paths untouched rather than guessing
+that they belong to free-tts.

@@ -78,7 +78,22 @@ class TestProbe:
         assert health.service_ok is True
         assert health.voice_cache_ready is True
 
-    def test_unreachable_backend(self):
+    def test_backend_identity_is_not_readiness(self):
+        ctrl, _ = _controller(
+            [
+                {
+                    "status": "starting",
+                    "service": "free-tts",
+                    "api_version": 1,
+                    "voice_cache_ready": False,
+                }
+            ]
+        )
+        health = ctrl.probe()
+        assert health.service_ok is True
+        assert health.voice_cache_ready is False
+        assert health.ready is False
+
         ctrl, _ = _controller([OSError("connection refused")])
         health = ctrl.probe()
         assert health.reachable is False
@@ -140,12 +155,26 @@ class TestEnsureReady:
         assert calls["spawn"] == []
         assert ctrl.started_by_adapter is False
 
-    def test_second_call_skips_probe_once_ready(self):
-        ctrl, calls = _controller([HEALTHY])
+    def test_second_call_reprobes_and_restarts_a_disappeared_backend(self):
+        ctrl, calls = _controller(
+            [HEALTHY, OSError("refused"), OSError("refused"), HEALTHY]
+        )
         ctrl.ensure_ready()
-        first = calls["fetch"]
         ctrl.ensure_ready()
-        assert calls["fetch"] == first
+        assert calls["fetch"] == 4
+        assert len(calls["spawn"]) == 1
+
+    def test_waits_for_matching_service_to_become_ready_without_spawning(self):
+        starting = {
+            "status": "starting",
+            "service": "free-tts",
+            "api_version": 1,
+            "voice_cache_ready": False,
+        }
+        ctrl, calls = _controller([starting, starting, HEALTHY])
+        ctrl.ensure_ready()
+        assert calls["fetch"] == 3
+        assert calls["spawn"] == []
 
     def test_recheck_under_lock_adopts_backend_started_by_racer(self):
         """Unreachable before the lock, healthy inside it: do not spawn."""

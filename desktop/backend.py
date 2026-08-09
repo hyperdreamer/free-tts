@@ -44,6 +44,12 @@ class Health:
     service_ok: bool
     voice_cache_ready: bool
     detail: str = ""
+    status_ok: bool = False
+
+    @property
+    def ready(self) -> bool:
+        """True only when the expected service is ready to serve voices."""
+        return self.service_ok and self.status_ok and self.voice_cache_ready
 
 
 def install_root() -> pathlib.Path:
@@ -173,29 +179,50 @@ class BackendController:
             return Health(
                 True, False, False, f"unsupported api_version {version!r}"
             )
-        return Health(True, True, bool(payload.get("voice_cache_ready")), "")
+        status_ok = payload.get("status") == "ok"
+        voice_cache_ready = payload.get("voice_cache_ready") is True
+        detail = ""
+        if not status_ok:
+            detail = f"backend status is {payload.get('status')!r}"
+        elif not voice_cache_ready:
+            detail = "backend voice cache is not ready"
+        return Health(
+            True,
+            True,
+            voice_cache_ready,
+            detail,
+            status_ok=status_ok,
+        )
 
     def ensure_ready(self) -> None:
-        """Guarantee a usable backend, starting one only when necessary."""
-        if self._ready:
-            return
+        """Guarantee a usable backend, revalidating it on every boundary."""
+        self._ready = False
         health = self.probe()
-        if health.service_ok:
+        if health.ready:
             logger.info("Reusing the backend already running; leaving it alone.")
             self._ready = True
             return
+        if not health.reachable:
+            self._started_by_adapter = False
         self._reject_if_occupied(health)
-        if not self._config.autostart:
+        if not self._config.autostart and not health.service_ok:
             raise BackendUnavailable(
                 "backend is not running and autostart is disabled"
             )
         with self._lock_factory():  # type: ignore[union-attr]
             health = self.probe()
-            if health.service_ok:
+            if health.ready:
                 logger.info("Backend appeared while waiting for the lock.")
                 self._ready = True
                 return
             self._reject_if_occupied(health)
+            if health.service_ok:
+                self._wait_until_ready(process=None, started_by_adapter=False)
+                return
+            if not self._config.autostart:
+                raise BackendUnavailable(
+                    "backend is not running and autostart is disabled"
+                )
             self._start_and_wait()
 
     def _reject_if_occupied(self, health: Health) -> None:
@@ -227,19 +254,28 @@ class BackendController:
         command = self._server_command()
         logger.info("Starting backend on demand: %s", " ".join(command))
         process = self._spawn(command, self._spawn_env(), log_path)
+        self._wait_until_ready(process=process, started_by_adapter=True)
+
+    def _wait_until_ready(
+        self, *, process: object | None, started_by_adapter: bool
+    ) -> None:
+        log_path = runtime_log_path()
         deadline = self._clock() + self._config.startup_timeout
         while self._clock() < deadline:
-            exit_code = process.poll()  # type: ignore[attr-defined]
-            if exit_code is not None:
-                raise BackendUnavailable(
-                    f"backend exited with code {exit_code} during startup; "
-                    f"see log {log_path}"
-                )
-            if self.probe().service_ok:
+            if process is not None:
+                exit_code = process.poll()  # type: ignore[attr-defined]
+                if exit_code is not None:
+                    raise BackendUnavailable(
+                        f"backend exited with code {exit_code} during startup; "
+                        f"see log {log_path}"
+                    )
+            health = self.probe()
+            if health.ready:
                 self._ready = True
-                self._started_by_adapter = True
+                self._started_by_adapter = started_by_adapter
                 logger.info("Backend ready; idle shutdown handled by the backend.")
                 return
+            self._reject_if_occupied(health)
             self._sleep(0.25)
         raise BackendUnavailable(
             f"backend did not become ready within "

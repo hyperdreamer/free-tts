@@ -89,6 +89,9 @@ def split_marked(ssml: str, max_chars: int = 400) -> list[Chunk]:
     after sentence-ending punctuation. Reporting a chunk's mark therefore means
     "everything up to here has been spoken".
     """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be greater than zero")
+
     chunks: list[Chunk] = []
     cursor = 0
     for match in MARK_PATTERN.finditer(ssml):

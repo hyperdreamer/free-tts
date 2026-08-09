@@ -1,5 +1,7 @@
 """Speech Dispatcher SSML is split at __spd_ index marks, without an XML parser."""
 
+import pytest
+
 from desktop.chunks import Chunk, split_marked, strip_ssml
 
 
@@ -81,6 +83,11 @@ class TestSplitMarked:
         chunks = split_marked(f"<speak>{run}</speak>", max_chars=40)
         assert all(len(chunk.text) <= 40 for chunk in chunks)
         assert "".join(chunk.text for chunk in chunks) == run
+
+    @pytest.mark.parametrize("max_chars", [0, -1])
+    def test_nonpositive_max_chars_is_rejected(self, max_chars):
+        with pytest.raises(ValueError, match="max_chars"):
+            split_marked("<speak>must make progress</speak>", max_chars=max_chars)
 
     def test_non_spd_marks_are_not_split_points(self):
         ssml = '<speak>A <mark name="custom"/> B. <mark name="__spd_0"/></speak>'

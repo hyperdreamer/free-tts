@@ -14,7 +14,7 @@ paste SSML or use the visual **Text Input** builder to pick a voice, set speed/p
   - **Sentence-by-sentence preview** with pre-caching — plays full text, no 30s limit
   - Live SSML preview panel
 - **SSML tab** — raw SSML editing with live template pre-fill
-- **Server** — Flask + Waitress/Gunicorn, `/voices` endpoint auto-populated from edge-tts on startup
+- **Server** — Flask + single-process Waitress, `/voices` endpoint auto-populated from edge-tts on startup
 - **Production-ready** — configurable CORS origins, SSML size limits, concurrency control, request logging, stall detection, graceful shutdown
 
 ### Chrome Extension
@@ -89,7 +89,7 @@ All settings can be set via `config.json` or environment variables. Env vars tak
 | `default_pitch` | `TTS_DEFAULT_PITCH` | `+0Hz` | Default pitch when `<prosody pitch>` is missing. Signed Hz format (`+0Hz`, `-5Hz`, `+10Hz`). Named presets (`x-low`, `high`) pass through unchanged. |
 | `max_ssml_length` | `TTS_MAX_SSML_LENGTH` | `200000` | Max SSML payload in bytes. Set `0` to disable the limit. |
 | `tts_stall_timeout` | `TTS_STALL_TIMEOUT` | `60` | Seconds of silence from Microsoft before aborting. `0` = disable stall detection. |
-| `max_concurrent` | `TTS_MAX_CONCURRENT` | `2` | Max concurrent TTS generation requests per worker process. `0` = unlimited. |
+| `max_concurrent` | `TTS_MAX_CONCURRENT` | `2` | Max concurrent TTS generation requests in the server process. `0` = unlimited. |
 | `queue_timeout` | `TTS_QUEUE_TIMEOUT` | `30` | Seconds to wait for a TTS slot before returning HTTP 503. Minimum 5s. |
 
 ### CORS
@@ -100,12 +100,15 @@ All settings can be set via `config.json` or environment variables. Env vars tak
 
 ### WSGI server
 
+The cancellation registry and idle-lifecycle accounting require one server
+process. Waitress is the supported production server. `server.py` rejects
+non-Waitress `TTS_SERVER` values, and requests arriving through Gunicorn are
+rejected rather than receiving a partial cancellation contract.
+
 | config.json | Env var | Default | Description |
 |---|---|---|---|
-| `wsgi_server` | `TTS_SERVER` | `waitress` | WSGI server: `waitress` or `gunicorn`. |
+| `wsgi_server` | `TTS_SERVER` | `waitress` | Must remain `waitress` for the single-process lifecycle contract. |
 | `waitress_threads` | `TTS_WAITRESS_THREADS` | `4` | Waitress worker threads. |
-| `gunicorn_workers` | `TTS_GUNICORN_WORKERS` | `2` | Gunicorn worker processes. |
-| `gunicorn_threads` | `TTS_GUNICORN_THREADS` | `4` | Threads per Gunicorn worker. |
 
 ### Development
 
@@ -119,7 +122,7 @@ All settings can be set via `config.json` or environment variables. Env vars tak
 ### `GET /health`
 
 ```json
-{"status": "ok", "voice_cache_ready": true}
+{"status": "ok", "service": "free-tts", "api_version": 1, "voice_cache_ready": true}
 ```
 
 ### `GET /voices`
@@ -153,11 +156,8 @@ curl -X POST http://localhost:5000/generate-and-download-tts \
 ## Deployment
 
 ```bash
-# Production with Waitress (default)
+# Production with single-process Waitress
 python server.py
-
-# Production with Gunicorn
-TTS_SERVER=gunicorn TTS_GUNICORN_WORKERS=4 python server.py
 
 # Development with auto-reload
 FLASK_DEBUG=1 python server.py
@@ -168,4 +168,4 @@ FLASK_DEBUG=1 python server.py
 - Python ≥ 3.11
 - [edge-tts](https://github.com/rany2/edge-tts) — Microsoft Edge TTS client
 - Flask + flask-cors — HTTP API
-- Waitress or Gunicorn — production WSGI server
+- Waitress — production WSGI server

@@ -16,7 +16,5 @@
         "^https?://192\\.168\\..*$"
     ],
     "wsgi_server": "waitress",
-    "waitress_threads": 4,
-    "gunicorn_workers": 2,
-    "gunicorn_threads": 4
+    "waitress_threads": 4
 }

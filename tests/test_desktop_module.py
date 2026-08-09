@@ -1,11 +1,13 @@
 """Engine state machine: acceptance, events, stop, pause, and settings."""
 
+import contextlib
 import dataclasses
 import io
+import threading
 
 import pytest
 
-from desktop import module, settings, voices
+from desktop import backend, module, settings, voices
 
 PAYLOAD = {
     "default_voice": "en-US-AvaMultilingualNeural",
@@ -72,10 +74,12 @@ class _FakeClient:
         self._payload = PAYLOAD if payload is None else payload
         self._audio = audio
         self._error = error
+        self.voice_calls = 0
         self.requests = []
         self.cancelled = []
 
     def voices(self):
+        self.voice_calls += 1
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
@@ -119,6 +123,15 @@ class TestListVoices:
         engine, _ = _engine(controller=controller)
         engine.list_voices()
         assert controller.calls == 1
+
+    def test_revalidates_backend_and_catalog_on_every_listing(self):
+        controller = _FakeController()
+        client = _FakeClient()
+        engine, _ = _engine(client=client, controller=controller)
+        engine.list_voices()
+        engine.list_voices()
+        assert controller.calls == 2
+        assert client.voice_calls == 2
 
     def test_backend_failure_reports_cannot_list(self):
         from desktop.backend import BackendUnavailable
@@ -269,6 +282,43 @@ class TestStop:
         assert fake_io.lines.count("703 STOP") == 1
         assert "702 END" not in fake_io.lines
 
+    def test_stop_during_decode_suppresses_every_later_emission(self):
+        entered_decode = threading.Event()
+        release_decode = threading.Event()
+
+        class TimelineIO(_FakeIO):
+            def send_audio(self, pcm, sample_rate=24000):
+                self.lines.append("AUDIO")
+                super().send_audio(pcm, sample_rate)
+
+        def blocked_decoder(mp3, ffmpeg_path, sample_rate):
+            entered_decode.set()
+            release_decode.wait()
+            return b"\x01\x00" * 8
+
+        fake_io = TimelineIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            _FakeClient(),
+            decoder=blocked_decoder,
+        )
+        engine.handle_speak(SSML)
+        assert entered_decode.wait(1)
+
+        engine.handle_stop()
+        fake_io.lines.append("STOP_RETURNED")
+        release_decode.set()
+
+        assert engine.wait_idle()
+        boundary = fake_io.lines.index("STOP_RETURNED")
+        assert not any(
+            line in {"701 BEGIN", "AUDIO"} or line.startswith("700:")
+            for line in fake_io.lines[boundary + 1 :]
+        )
+        assert fake_io.lines.count("703 STOP") == 1
+
     def test_stop_cancels_outstanding_requests(self):
         client = _FakeClient()
         engine, _ = _engine(client=client)
@@ -285,6 +335,100 @@ class TestStop:
         fake_io.lines.clear()
         engine.handle_speak(SSML)
         assert engine.wait_idle()
+        assert fake_io.lines[-1] == "702 END"
+
+
+class _LifecycleClient(_FakeClient):
+    def __init__(self, state, *, fail_first_post=False):
+        super().__init__()
+        self._state = state
+        self._fail_first_post = fail_first_post
+        self.attempts = 0
+
+    def voices(self):
+        if not self._state["alive"]:
+            from desktop.synth import SynthError
+
+            raise SynthError("backend disappeared")
+        return super().voices()
+
+    def synthesize(self, text, voice_name, rate, pitch, request_id, should_abort=None):
+        from desktop.synth import SynthError
+
+        self.attempts += 1
+        self.requests.append((text, voice_name, rate, pitch))
+        if self._fail_first_post and self.attempts == 1:
+            self._state["alive"] = False
+            raise SynthError("connection refused")
+        if not self._state["alive"]:
+            raise SynthError("connection refused")
+        return self._audio
+
+
+def _lifecycle_engine(*, fail_first_post=False):
+    state = {"alive": True, "spawns": 0}
+
+    def fetch(_url, _timeout):
+        if not state["alive"]:
+            raise OSError("connection refused")
+        return {
+            "status": "ok",
+            "service": "free-tts",
+            "api_version": 1,
+            "voice_cache_ready": True,
+        }
+
+    def spawn(_command, _env, _log_path):
+        state["alive"] = True
+        state["spawns"] += 1
+        return type("Proc", (), {"poll": lambda self: None})()
+
+    @contextlib.contextmanager
+    def lock():
+        yield
+
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 0.1
+        return ticks[0]
+
+    controller = backend.BackendController(
+        dataclasses.replace(settings.DEFAULTS, startup_timeout=3),
+        fetch=fetch,
+        spawn=spawn,
+        sleep=lambda _seconds: None,
+        clock=clock,
+        lock_factory=lock,
+    )
+    client = _LifecycleClient(state, fail_first_post=fail_first_post)
+    engine, fake_io = _engine(client=client, controller=controller)
+    return engine, fake_io, client, state
+
+
+class TestBackendRecovery:
+    def test_later_speak_restarts_backend_after_idle_exit(self):
+        engine, fake_io, client, state = _lifecycle_engine()
+        engine.handle_speak(SSML)
+        assert engine.wait_idle()
+
+        state["alive"] = False
+        fake_io.lines.clear()
+        engine.handle_speak(SSML)
+
+        assert engine.wait_idle()
+        assert state["spawns"] == 1
+        assert client.voice_calls == 2
+        assert fake_io.lines[-1] == "702 END"
+
+    def test_health_to_post_race_restarts_refreshes_and_retries_once(self):
+        engine, fake_io, client, state = _lifecycle_engine(fail_first_post=True)
+        engine.handle_speak(SSML)
+
+        assert engine.wait_idle()
+        assert state["spawns"] == 1
+        assert client.voice_calls == 2
+        assert client.attempts == 2
         assert fake_io.lines[-1] == "702 END"
 
 

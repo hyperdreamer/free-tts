@@ -5,6 +5,10 @@ No network access. No real server. Mock edge_tts and related I/O.
 """
 
 import asyncio
+import os
+import pathlib
+import subprocess
+import sys
 import threading
 from io import BytesIO
 from unittest import mock
@@ -124,6 +128,44 @@ class TestConfigHelpers:
             result = server._cfg("temp_key", "TTS_TEMP", 0, coerce=int)
         assert result == 42
         assert isinstance(result, int)
+
+
+class TestProcessContract:
+    def test_waitress_satisfies_single_process_contract(self):
+        server._validate_process_model("waitress")
+
+    def test_embedded_gunicorn_mode_is_rejected(self):
+        with pytest.raises(RuntimeError, match="single-process"):
+            server._validate_process_model("gunicorn")
+
+    def test_embedded_gunicorn_entrypoint_exits_before_app_startup(self):
+        env = dict(os.environ)
+        env["TTS_SERVER"] = "gunicorn"
+        env["TTS_CONFIG"] = "/nonexistent-free-tts-config.json"
+        env.pop("FLASK_DEBUG", None)
+
+        result = subprocess.run(
+            [sys.executable, str(pathlib.Path(server.__file__))],
+            env=env,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+        assert result.returncode == 1
+        assert b"single-process" in result.stderr
+
+    def test_external_gunicorn_request_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(server, "_voice_cache_ready", True)
+        app = server.create_app()
+        app.config["TESTING"] = True
+        with app.test_client() as client:
+            response = client.get(
+                "/health",
+                environ_overrides={"SERVER_SOFTWARE": "gunicorn/23.0.0"},
+            )
+        assert response.status_code == 503
+        assert "single-process" in response.get_json()["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +701,156 @@ class TestCancellation:
         with mock.patch.object(server.edge_tts, "Communicate", return_value=_Comm()):
             with pytest.raises(server.CancelledError):
                 asyncio.run(server.generate_audio(req, cancel_event=token))
+
+    def test_mid_await_cancellation_closes_stream_promptly(self):
+        req = server.TTSRequest(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hello."
+        )
+        token = server._register_cancel_token("blocked-read")
+
+        async def scenario():
+            entered = asyncio.Event()
+            closed = asyncio.Event()
+
+            class _Stream:
+                async def __anext__(self):
+                    entered.set()
+                    await asyncio.Future()
+
+                async def aclose(self):
+                    closed.set()
+
+            class _Comm:
+                def stream(self):
+                    return _Stream()
+
+            with mock.patch.object(
+                server.edge_tts, "Communicate", return_value=_Comm()
+            ):
+                task = asyncio.create_task(
+                    server.generate_audio(req, cancel_event=token)
+                )
+                await entered.wait()
+                token.set()
+                with pytest.raises(server.CancelledError):
+                    await asyncio.wait_for(task, 0.5)
+                assert closed.is_set()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            server._release_cancel_token("blocked-read")
+
+    def test_mid_await_delete_returns_499_and_releases_slot(
+        self, monkeypatch
+    ):
+        entered = threading.Event()
+        closed = threading.Event()
+
+        class _Stream:
+            async def __anext__(self):
+                entered.set()
+                await asyncio.Future()
+
+            async def aclose(self):
+                closed.set()
+
+        class _Comm:
+            def stream(self):
+                return _Stream()
+
+        guard = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(server, "_TTS_SEMAPHORE", guard)
+        monkeypatch.setattr(server, "TTS_STALL_TIMEOUT", 0)
+        monkeypatch.setattr(server, "_voice_cache_ready", True)
+        monkeypatch.setattr(
+            server, "_voice_cache", [{"ShortName": "en-US-AriaNeural"}]
+        )
+        monkeypatch.setattr(server.edge_tts, "Communicate", lambda *a, **k: _Comm())
+        app = server.create_app()
+        app.config["TESTING"] = True
+        responses = []
+
+        def post_request():
+            with app.test_client() as post_client:
+                responses.append(
+                    post_client.post(
+                        "/generate-and-download-tts",
+                        json={
+                            "ssml": VALID_SSML_TEMPLATE.format(
+                                voice="en-US-AriaNeural",
+                                rate="+0%",
+                                pitch="+0Hz",
+                                text="Hello.",
+                            ),
+                            "request_id": "midawait",
+                        },
+                    )
+                )
+
+        thread = threading.Thread(target=post_request, daemon=True)
+        thread.start()
+        assert entered.wait(1)
+        with app.test_client() as cancel_client:
+            assert cancel_client.delete("/tts-request/midawait").status_code == 200
+        thread.join(1)
+
+        assert not thread.is_alive()
+        assert responses[0].status_code == 499
+        assert closed.is_set()
+        assert guard.acquire(blocking=False)
+
+    def test_delete_cancels_wait_for_concurrency_slot(self, monkeypatch):
+        guard = threading.BoundedSemaphore(1)
+        assert guard.acquire(blocking=False)
+        registered = threading.Event()
+        real_register = server._register_cancel_token
+
+        def register(request_id):
+            token = real_register(request_id)
+            registered.set()
+            return token
+
+        monkeypatch.setattr(server, "_register_cancel_token", register)
+        monkeypatch.setattr(server, "_TTS_SEMAPHORE", guard)
+        monkeypatch.setattr(server, "TTS_QUEUE_TIMEOUT", 60)
+        monkeypatch.setattr(server, "_voice_cache_ready", True)
+        monkeypatch.setattr(
+            server, "_voice_cache", [{"ShortName": "en-US-AriaNeural"}]
+        )
+        app = server.create_app()
+        app.config["TESTING"] = True
+        responses = []
+
+        def post_request():
+            with app.test_client() as post_client:
+                responses.append(
+                    post_client.post(
+                        "/generate-and-download-tts",
+                        json={
+                            "ssml": VALID_SSML_TEMPLATE.format(
+                                voice="en-US-AriaNeural",
+                                rate="+0%",
+                                pitch="+0Hz",
+                                text="Queued.",
+                            ),
+                            "request_id": "queued",
+                        },
+                    )
+                )
+
+        thread = threading.Thread(target=post_request, daemon=True)
+        thread.start()
+        try:
+            assert registered.wait(1)
+            with app.test_client() as cancel_client:
+                assert cancel_client.delete("/tts-request/queued").status_code == 200
+            thread.join(1)
+            assert not thread.is_alive()
+            assert responses[0].status_code == 499
+        finally:
+            guard.release()
+            thread.join(1)
 
 
 class TestIdleShutdownWatchdog:
