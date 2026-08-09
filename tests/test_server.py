@@ -398,6 +398,19 @@ class TestFlaskErrorResponses:
         assert "languages" in data
         assert data["default_voice"] == server.DEFAULT_VOICE
 
+    def test_health_reports_service_identity(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["service"] == "free-tts"
+        assert data["api_version"] == 1
+        assert data["status"] == "ok"
+        assert data["voice_cache_ready"] is True
+
+    def test_health_identity_constants_exported(self):
+        assert server.SERVICE_NAME == "free-tts"
+        assert server.API_VERSION == 1
+
     def test_successful_tts_request(self, client):
         ssml = VALID_SSML_TEMPLATE.format(
             voice="en-US-AriaNeural",

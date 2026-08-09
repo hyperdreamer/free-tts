@@ -211,6 +211,12 @@ CORS_ORIGINS: list[str] = _cfg_list(
 SSML_NAMESPACE: str = "http://www.w3.org/2001/10/synthesis"
 """XML namespace URI for the SSML <speak> element."""
 
+SERVICE_NAME: str = "free-tts"
+"""Stable service identity so clients can detect a port conflict."""
+
+API_VERSION: int = 1
+"""Incremented only on a breaking change to the adapter-facing HTTP contract."""
+
 # ---------------------------------------------------------------------------
 # Voice cache (populated at startup from edge-tts)
 # ---------------------------------------------------------------------------
@@ -782,6 +788,8 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "status": "ok",
+                "service": SERVICE_NAME,
+                "api_version": API_VERSION,
                 "voice_cache_ready": _voice_cache_ready,
             }
         )
