@@ -706,6 +706,9 @@ class TestCancellationOwnership:
         reservation_entered = threading.Event()
         allow_reservation = threading.Event()
         pause_boundary_reached = threading.Event()
+        allow_boundary_return = threading.Event()
+        reservation_finished = threading.Event()
+        reservation_results = []
         retry_post_started = threading.Event()
         decode_entered = threading.Event()
         release_decode = threading.Event()
@@ -746,11 +749,15 @@ class TestCancellationOwnership:
             def _reserve_retry(self, generation, request_id):
                 reservation_entered.set()
                 assert allow_reservation.wait(3)
-                return super()._reserve_retry(generation, request_id)
+                result = super()._reserve_retry(generation, request_id)
+                reservation_results.append(result)
+                reservation_finished.set()
+                return result
 
             def _reach_pause_boundary(self, generation):
                 reached = super()._reach_pause_boundary(generation)
                 pause_boundary_reached.set()
+                assert allow_boundary_return.wait(3)
                 return reached
 
         transport = RetryTransport()
@@ -774,6 +781,9 @@ class TestCancellationOwnership:
             release_decode.set()
             assert pause_boundary_reached.wait(2)
             allow_reservation.set()
+            assert reservation_finished.wait(2)
+            assert reservation_results == [False]
+            allow_boundary_return.set()
             assert pause_emitted.wait(1)
             assert engine.wait_idle(1)
             assert retry_post_started.is_set() is False
@@ -785,6 +795,8 @@ class TestCancellationOwnership:
             release_decode.set()
             pause_boundary_reached.set()
             allow_reservation.set()
+            allow_boundary_return.set()
+            reservation_finished.set()
             engine.wait_idle(3)
 
     def test_retry_reservation_wins_then_pause_cancels_it(self):
