@@ -329,6 +329,26 @@ class TestFullSession:
         assert out.index(b"700-__spd_0") < out.index(b"704 PAUSE")
         assert b"702 END" not in out
 
+    def test_active_pause_without_marks_emits_one_pause(self, backend):
+        _Handler.control_mode = "pause"
+        process = _start_session(backend)
+        try:
+            process.stdin.write(
+                b"INIT\nSPEAK\n<speak>No marks here at all.</speak>\n.\n"
+            )
+            process.stdin.flush()
+            assert _Handler.post_started.wait(5)
+            out = _finish_session(process, b"PAUSE\nLIST VOICES\nQUIT\n")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        assert "POST_TIMEOUT" not in _Handler.control_events
+        assert out.count(b"704 PAUSE") == 1
+        assert b"700-__spd_" not in out
+        assert b"702 END" not in out
+
     def test_eof_without_quit_exits_cleanly(self, backend):
         out = _session(backend, b"INIT\n")
         assert b"299 OK LOADED SUCCESSFULLY" in out

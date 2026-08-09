@@ -580,6 +580,75 @@ def protocol_err_cant_speak():
     return protocol.ERR_CANT_SPEAK
 
 
+class TestPauseFallback:
+    """PAUSE is honoured even when no index mark is available."""
+
+    class _GatedClient(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def synthesize(
+            self, text, voice_name, rate, pitch, request_id, should_abort=None
+        ):
+            self.requests.append((text, voice_name, rate, pitch))
+            self.entered.set()
+            self.release.wait(3)
+            return self._audio
+
+    def test_unmarked_message_pauses_at_a_chunk_boundary(self):
+        client = self._GatedClient()
+        config = dataclasses.replace(settings.DEFAULTS, max_chunk_chars=12)
+        engine, fake_io = _engine(client=client, config=config)
+        engine.handle_speak("<speak>alpha bravo charlie delta echo</speak>")
+        assert client.entered.wait(2)
+
+        engine.handle_pause()
+        client.release.set()
+        assert engine.wait_idle(3)
+        assert fake_io.lines.count("704 PAUSE") == 1
+        assert "702 END" not in fake_io.lines
+        assert not any(line.startswith("700:") for line in fake_io.lines)
+
+    def test_single_unmarked_chunk_still_reports_pause(self):
+        client = self._GatedClient()
+        engine, fake_io = _engine(client=client)
+        engine.handle_speak("<speak>Just one piece.</speak>")
+        assert client.entered.wait(2)
+
+        engine.handle_pause()
+        client.release.set()
+        assert engine.wait_idle(3)
+        assert fake_io.lines.count("704 PAUSE") == 1
+        assert "702 END" not in fake_io.lines
+
+    def test_pause_waits_for_a_mark_that_is_still_coming(self):
+        client = self._GatedClient()
+        config = dataclasses.replace(settings.DEFAULTS, max_chunk_chars=12)
+        engine, fake_io = _engine(client=client, config=config)
+        engine.handle_speak(
+            '<speak>alpha bravo charlie delta. <mark name="__spd_0"/></speak>'
+        )
+        assert client.entered.wait(2)
+
+        engine.handle_pause()
+        client.release.set()
+        assert engine.wait_idle(3)
+        assert "700:__spd_0" in fake_io.lines
+        assert fake_io.lines.count("704 PAUSE") == 1
+        assert fake_io.lines.index("700:__spd_0") < fake_io.lines.index("704 PAUSE")
+        assert "702 END" not in fake_io.lines
+
+    def test_mark_ahead_reports_remaining_marks(self):
+        from desktop.chunks import Chunk
+
+        chunks = [Chunk("a", None), Chunk("b", "__spd_0"), Chunk("c", None)]
+        assert module._mark_ahead(chunks, 0) is True
+        assert module._mark_ahead(chunks, 1) is False
+        assert module._mark_ahead(chunks, 2) is False
+
+
 class TestCheckFfmpeg:
     def test_passes_when_ffmpeg_runs(self):
         module.check_ffmpeg(

@@ -41,6 +41,17 @@ _STRING_SETTINGS = (
     "spelling_mode",
     "cap_let_recogn",
 )
+
+
+def _mark_ahead(chunks: list[object], index: int) -> bool:
+    """True when a later chunk still carries a reportable index mark.
+
+    PAUSE prefers a real index mark so the client can resume exactly there. When
+    none remains, the next chunk boundary is the only honest place to stop.
+    """
+    return any(chunk.mark for chunk in chunks[index + 1 :])  # type: ignore[attr-defined]
+
+
 _WORKER_RECLAIM_SECONDS = 10.0
 
 
@@ -419,7 +430,9 @@ class SpeechEngine:
                     ):
                         outcome = "stop"
                         break
-                    if chunk.mark and generation.pause_requested.is_set():
+                    if generation.pause_requested.is_set() and (
+                        chunk.mark or not _mark_ahead(chunks, index)
+                    ):
                         outcome = "pause"
                         break
             except Cancelled:
