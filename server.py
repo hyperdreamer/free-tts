@@ -217,6 +217,41 @@ SERVICE_NAME: str = "free-tts"
 API_VERSION: int = 1
 """Incremented only on a breaking change to the adapter-facing HTTP contract."""
 
+
+class CancelledError(Exception):
+    """Raised inside generation when its cancellation token is set."""
+
+
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+"""Adapter-supplied request ids: opaque, bounded, log- and route-safe."""
+
+_CANCEL_REGISTRY: dict[str, threading.Event] = {}
+_CANCEL_LOCK = threading.Lock()
+
+
+def _register_cancel_token(request_id: str) -> threading.Event:
+    """Create and store a cancellation token for an in-flight request."""
+    event = threading.Event()
+    with _CANCEL_LOCK:
+        _CANCEL_REGISTRY[request_id] = event
+    return event
+
+
+def _release_cancel_token(request_id: str) -> None:
+    """Drop a token once its request finished, however it finished."""
+    with _CANCEL_LOCK:
+        _CANCEL_REGISTRY.pop(request_id, None)
+
+
+def _cancel_request(request_id: str) -> bool:
+    """Set the token for ``request_id``. Return False if it is not live."""
+    with _CANCEL_LOCK:
+        event = _CANCEL_REGISTRY.get(request_id)
+    if event is None:
+        return False
+    event.set()
+    return True
+
 # ---------------------------------------------------------------------------
 # Voice cache (populated at startup from edge-tts)
 # ---------------------------------------------------------------------------
@@ -653,11 +688,15 @@ def extract_tts_params(ssml: str) -> TTSRequest:
 # ---------------------------------------------------------------------------
 # TTS generation
 # ---------------------------------------------------------------------------
-async def generate_audio(req: TTSRequest) -> bytes:
+async def generate_audio(
+    req: TTSRequest, cancel_event: threading.Event | None = None
+) -> bytes:
     """Synthesise speech via edge-tts and return MP3 bytes.
 
     Args:
         req: Normalised TTS parameters.
+        cancel_event: Optional token checked each loop iteration; when set,
+            generation aborts with :class:`CancelledError`.
 
     Returns:
         Raw MP3 audio bytes.
@@ -665,6 +704,7 @@ async def generate_audio(req: TTSRequest) -> bytes:
     Raises:
         RuntimeError: If edge-tts fails (e.g. invalid voice name).
         TimeoutError: If no data received from edge-tts for TTS_STALL_TIMEOUT seconds.
+        CancelledError: If ``cancel_event`` is set mid-stream.
     """
     try:
         communicate = edge_tts.Communicate(
@@ -679,6 +719,12 @@ async def generate_audio(req: TTSRequest) -> bytes:
     buf = BytesIO()
     stream = communicate.stream()
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+            raise CancelledError("Generation cancelled by client.")
         try:
             if TTS_STALL_TIMEOUT > 0:
                 chunk = await asyncio.wait_for(
@@ -745,7 +791,7 @@ def create_app() -> Flask:
     CORS(
         app,
         resources={r"/*": {"origins": cors_origins}},
-        methods=["GET", "POST", "OPTIONS"],
+        methods=["GET", "POST", "OPTIONS", "DELETE"],
         allow_headers=["Content-Type"],
         max_age=3600,
     )
@@ -793,6 +839,15 @@ def create_app() -> Flask:
                 "voice_cache_ready": _voice_cache_ready,
             }
         )
+
+    @app.route("/tts-request/<request_id>", methods=["DELETE"])
+    def cancel_tts_request(request_id: str) -> Response:
+        """Cancel an in-flight generation so its concurrency slot is released."""
+        if not _REQUEST_ID_RE.match(request_id):
+            return jsonify({"error": "Unknown request id."}), 404  # type: ignore[return-value]
+        if _cancel_request(request_id):
+            return jsonify({"cancelled": True})
+        return jsonify({"error": "Unknown request id."}), 404  # type: ignore[return-value]
 
     @app.errorhandler(413)
     def request_entity_too_large(exc: Exception) -> Response:
@@ -842,6 +897,11 @@ def create_app() -> Flask:
         if not ssml.strip():
             return jsonify({"error": "Empty SSML string."}), 400  # type: ignore[return-value]
 
+        request_id = body.get("request_id")
+        if request_id is not None:
+            if not isinstance(request_id, str) or not _REQUEST_ID_RE.match(request_id):
+                return jsonify({"error": "Invalid 'request_id'."}), 400  # type: ignore[return-value]
+
         # 1. Parse
         try:
             tts_req = extract_tts_params(ssml)
@@ -853,6 +913,9 @@ def create_app() -> Flask:
             return jsonify({"error": f"Unknown voice: {tts_req.voice}"}), 400  # type: ignore[return-value]
 
         # 2. Synthesise (stall timeout handled inside generate_audio)
+        cancel_event = (
+            _register_cancel_token(request_id) if request_id is not None else None
+        )
         try:
             if _TTS_SEMAPHORE is not None:
                 acquired = _TTS_SEMAPHORE.acquire(timeout=TTS_QUEUE_TIMEOUT)
@@ -861,11 +924,14 @@ def create_app() -> Flask:
                     resp.headers["Retry-After"] = str(TTS_QUEUE_TIMEOUT)
                     return resp, 503  # type: ignore[return-value]
                 try:
-                    audio = await generate_audio(tts_req)
+                    audio = await generate_audio(tts_req, cancel_event=cancel_event)
                 finally:
                     _TTS_SEMAPHORE.release()
             else:
-                audio = await generate_audio(tts_req)
+                audio = await generate_audio(tts_req, cancel_event=cancel_event)
+        except CancelledError:
+            logger.info("TTS request cancelled by client.")
+            return jsonify({"error": "Request cancelled."}), 499  # type: ignore[return-value]
         except TimeoutError as exc:
             logger.error("TTS stall detected after %ds", TTS_STALL_TIMEOUT)
             return jsonify({"error": _error_message(exc)}), 504  # type: ignore[return-value]
@@ -875,6 +941,9 @@ def create_app() -> Flask:
         except Exception as exc:
             logger.exception("Unexpected TTS error")
             return jsonify({"error": _error_message(exc)}), 500  # type: ignore[return-value]
+        finally:
+            if request_id is not None:
+                _release_cancel_token(request_id)
 
         # 3. Respond
         return Response(

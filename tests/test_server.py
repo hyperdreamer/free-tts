@@ -4,6 +4,7 @@ semaphore timeout, and known-voice behavior.
 No network access. No real server. Mock edge_tts and related I/O.
 """
 
+import asyncio
 import threading
 from io import BytesIO
 from unittest import mock
@@ -420,7 +421,7 @@ class TestFlaskErrorResponses:
         )
         mock_audio = BytesIO(b"\xff\xfb\x90\x00fake mp3 data")
 
-        async def _mock_generate(_req):
+        async def _mock_generate(_req, cancel_event=None):
             return mock_audio.getvalue()
 
         with mock.patch.object(server, "generate_audio", side_effect=_mock_generate):
@@ -470,7 +471,7 @@ class TestSemaphoreGuard:
 
         generate_called = False
 
-        async def _fake_generate(_req):
+        async def _fake_generate(_req, cancel_event=None):
             nonlocal generate_called
             generate_called = True
             return b"audio"
@@ -499,7 +500,7 @@ class TestSemaphoreGuard:
 
         raised = False
 
-        async def _failing_generate(_req):
+        async def _failing_generate(_req, cancel_event=None):
             nonlocal raised
             raised = True
             raise RuntimeError("synthesis failure")
@@ -543,3 +544,118 @@ class TestErrorMessage:
         monkeypatch.setattr(server, "PRODUCTION", False)
         msg = server._error_message(RuntimeError("trace me"), is_client_error=False)
         assert msg == "trace me"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation registry and the DELETE endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestCancellation:
+    """Cancellation registry and the DELETE endpoint."""
+
+    @pytest.fixture
+    def client(self):
+        with (
+            mock.patch.object(server, "_voice_cache_ready", True),
+            mock.patch.object(
+                server, "_voice_cache", [{"ShortName": "en-US-AriaNeural"}]
+            ),
+        ):
+            app = server.create_app()
+            app.config["TESTING"] = True
+            app.config["PROPAGATE_EXCEPTIONS"] = False
+            with app.test_client() as c:
+                yield c
+
+    def test_cancel_unknown_id_returns_404(self, client):
+        resp = client.delete("/tts-request/does-not-exist")
+        assert resp.status_code == 404
+
+    def test_cancel_live_request_returns_200(self, client):
+        token = server._register_cancel_token("abc123")
+        try:
+            resp = client.delete("/tts-request/abc123")
+            assert resp.status_code == 200
+            assert resp.get_json()["cancelled"] is True
+            assert token.is_set()
+        finally:
+            server._release_cancel_token("abc123")
+
+    def test_cancel_is_idempotent_until_released(self, client):
+        server._register_cancel_token("dup")
+        try:
+            assert client.delete("/tts-request/dup").status_code == 200
+            assert client.delete("/tts-request/dup").status_code == 200
+        finally:
+            server._release_cancel_token("dup")
+        assert client.delete("/tts-request/dup").status_code == 404
+
+    def test_released_token_is_gone(self, client):
+        server._register_cancel_token("gone")
+        server._release_cancel_token("gone")
+        assert client.delete("/tts-request/gone").status_code == 404
+
+    def test_malformed_request_id_rejected(self, client):
+        ssml = VALID_SSML_TEMPLATE.format(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hi."
+        )
+        resp = client.post(
+            "/generate-and-download-tts",
+            json={"ssml": ssml, "request_id": "bad id!"},
+        )
+        assert resp.status_code == 400
+
+    def test_cancelled_generation_returns_499(self, client):
+        ssml = VALID_SSML_TEMPLATE.format(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hi."
+        )
+
+        async def _cancelled(_req, cancel_event=None):
+            raise server.CancelledError("cancelled")
+
+        with mock.patch.object(server, "generate_audio", side_effect=_cancelled):
+            resp = client.post(
+                "/generate-and-download-tts",
+                json={"ssml": ssml, "request_id": "tok1"},
+            )
+        assert resp.status_code == 499
+
+    def test_registry_cleared_after_request(self, client):
+        ssml = VALID_SSML_TEMPLATE.format(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hi."
+        )
+
+        async def _ok(_req, cancel_event=None):
+            assert cancel_event is not None
+            return b"\xff\xfbaudio"
+
+        with mock.patch.object(server, "generate_audio", side_effect=_ok):
+            resp = client.post(
+                "/generate-and-download-tts",
+                json={"ssml": ssml, "request_id": "tok2"},
+            )
+        assert resp.status_code == 200
+        assert client.delete("/tts-request/tok2").status_code == 404
+
+    def test_generate_audio_raises_when_token_set(self):
+        req = server.TTSRequest(
+            voice="en-US-AriaNeural", rate="+0%", pitch="+0Hz", text="Hello."
+        )
+        token = threading.Event()
+        token.set()
+
+        class _Stream:
+            async def __anext__(self):
+                return {"type": "audio", "data": b"\x00\x01"}
+
+            async def aclose(self):
+                return None
+
+        class _Comm:
+            def stream(self):
+                return _Stream()
+
+        with mock.patch.object(server.edge_tts, "Communicate", return_value=_Comm()):
+            with pytest.raises(server.CancelledError):
+                asyncio.run(server.generate_audio(req, cancel_event=token))
