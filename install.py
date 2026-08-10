@@ -1263,38 +1263,6 @@ def _describe_enablement(snapshot: _PathSnapshot) -> str:
     return snapshot.kind
 
 
-def _validate_enablement_link(
-    path: pathlib.Path, unit_path: pathlib.Path
-) -> bool:
-    """Observe and validate an owned enablement symlink without mutation."""
-    observed = _observe_enablement(path)
-    if observed.kind == "missing":
-        return False
-    if not _snapshot_is_owned_enablement(path, unit_path, observed):
-        if observed.kind == "symlink":
-            raise OwnershipError(
-                f"enablement symlink targets a foreign unit: {path}"
-            )
-        raise OwnershipError(f"enablement path is not an owned symlink: {path}")
-    return True
-
-
-def _snapshot_enablement(
-    path: pathlib.Path, unit_path: pathlib.Path
-) -> _PathSnapshot:
-    """Take a stable missing-or-owned snapshot of the wants path."""
-    _validate_enablement_link(path, unit_path)
-    observed = _observe_enablement(path)
-    if observed.kind == "missing":
-        return observed
-    if not _snapshot_is_owned_enablement(path, unit_path, observed):
-        raise OwnershipError(
-            f"enablement path changed during observation: {path}; retained "
-            f"{_describe_enablement(observed)}"
-        )
-    return observed
-
-
 _ENABLEMENT_OBSERVATION_ATTEMPTS = 3
 
 
@@ -1405,6 +1373,33 @@ class _SystemdArtifacts:
             unit,
             enablement,
             "install",
+        )
+
+    @classmethod
+    def capture_for_uninstall(
+        cls,
+        unit_path: pathlib.Path,
+        enablement_path: pathlib.Path,
+    ) -> "_SystemdArtifacts":
+        unit_path = pathlib.Path(unit_path)
+        enablement_path = pathlib.Path(enablement_path)
+        unit = _observe_unit(unit_path)
+        enablement = _observe_enablement(enablement_path)
+        if enablement.kind != "missing" and not _snapshot_is_owned_enablement(
+            enablement_path, unit_path, enablement
+        ):
+            raise OwnershipError(
+                f"enablement path is foreign: {enablement_path}; retained "
+                f"{_describe_enablement(enablement)}"
+            )
+        return cls(
+            unit_path,
+            enablement_path,
+            unit,
+            enablement,
+            unit,
+            enablement,
+            "uninstall",
         )
 
     def _assert_unit_expected(self) -> None:
@@ -1578,6 +1573,58 @@ class _SystemdArtifacts:
 
     def restore(self) -> list[str]:
         errors = []
+        if self.operation == "uninstall":
+            try:
+                current_unit = _observe_unit(self.unit_path)
+                if not _snapshot_matches(self.unit_initial, current_unit):
+                    raise InstallError(
+                        f"service unit changed during failed uninstall: "
+                        f"{self.unit_path}"
+                    )
+                current = _observe_enablement(self.enablement_path)
+                if self.enablement_initial.kind == "missing":
+                    if current.kind == "missing":
+                        return errors
+                    if not _snapshot_is_owned_enablement(
+                        self.enablement_path,
+                        self.unit_path,
+                        current,
+                    ):
+                        raise InstallError(
+                            f"foreign enablement retained at "
+                            f"{self.enablement_path}: "
+                            f"{_describe_enablement(current)}"
+                        )
+                    self.enablement_expected = current
+                    self.enablement_path.unlink()
+                    self.enablement_expected = _PathSnapshot("missing")
+                    return errors
+                target = self.enablement_initial.data
+                if (
+                    current.kind == "symlink"
+                    and current.data == target
+                    and _snapshot_is_owned_enablement(
+                        self.enablement_path,
+                        self.unit_path,
+                        current,
+                    )
+                ):
+                    self.enablement_expected = current
+                    return errors
+                if current.kind != "missing":
+                    raise InstallError(
+                        f"foreign or changed enablement retained at "
+                        f"{self.enablement_path}: "
+                        f"{_describe_enablement(current)}"
+                    )
+                self.enablement_expected = current
+                self._restore_initial_enablement()
+            except BaseException as exc:
+                errors.append(
+                    f"could not restore service enablement "
+                    f"{self.enablement_path}: {exc}"
+                )
+            return errors
         if self.operation != "install":
             raise InstallError(
                 f"artifact restore mode is not implemented: {self.operation}"
@@ -1610,185 +1657,38 @@ class _SystemdArtifacts:
         _remove_empty_directories(self.created_directories)
         return errors
 
-
-_ENABLEMENT_QUARANTINE_PREFIX = f".{UNIT_NAME}.enablement-quarantine-"
-
-
-def _remove_owned_enablement(
-    path: pathlib.Path,
-    unit_path: pathlib.Path,
-    *,
-    expected_identity: tuple[int, int] | None = None,
-) -> bool:
-    """Move the wants entry aside, verify that inode, then remove only ours."""
-    # This observation is deliberately non-authoritative. The rename below
-    # moves whatever inode is current, and the moved inode is checked again.
-    _validate_enablement_link(path, unit_path)
-    if not path.parent.exists():
-        return False
-    quarantine = _reserve_sibling(path.parent, _ENABLEMENT_QUARANTINE_PREFIX)
-    try:
-        os.rename(path, quarantine)
-    except FileNotFoundError:
-        observed = _observe_enablement(path)
-        if observed.kind == "missing":
-            return False
-        raise InstallError(
-            f"incomplete cleanup for service enablement {path}: an entry "
-            f"appeared during removal; retained {_describe_enablement(observed)}"
-        )
-    except OSError as exc:
-        raise InstallError(
-            f"could not quarantine service enablement {path}: {exc}"
-        ) from exc
-
-    try:
-        moved = _observe_enablement(quarantine)
-        replacement = _observe_enablement(path)
-    except BaseException as exc:
-        raise InstallError(
-            f"incomplete cleanup for service enablement {path}: moved entry "
-            f"retained at {quarantine}; {exc}"
-        ) from exc
-
-    moved_is_owned = _snapshot_is_owned_enablement(path, unit_path, moved)
-    identity_matches = (
-        expected_identity is None or moved.identity == expected_identity
-    )
-    if not moved_is_owned or not identity_matches:
-        detail = _describe_enablement(moved)
-        if moved_is_owned and not identity_matches:
-            detail = "owned symlink with an unexpected inode"
-        if replacement.kind != "missing":
-            detail += (
-                f"; original path also retains "
-                f"{_describe_enablement(replacement)}"
-            )
-        raise InstallError(
-            f"incomplete cleanup for service enablement {path}: {detail} "
-            f"retained at {quarantine}"
-        )
-
-    try:
-        quarantine.unlink()
-    except OSError as exc:
-        raise InstallError(
-            f"could not remove verified service enablement; retained at "
-            f"{quarantine}: {exc}"
-        ) from exc
-
-    if replacement.kind != "missing":
-        raise InstallError(
-            f"incomplete cleanup for service enablement {path}: another entry "
-            f"appeared at the original path and was retained as "
-            f"{_describe_enablement(replacement)}"
-        )
-    return True
-
-
-def _restore_enablement_snapshot(
-    path: pathlib.Path,
-    unit_path: pathlib.Path,
-    snapshot: _PathSnapshot,
-    *,
-    created_identity: tuple[int, int] | None = None,
-) -> None:
-    """Restore exact missing-or-symlink state without replacing an entry."""
-    if snapshot.kind not in {"missing", "symlink"}:
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: "
-            f"unexpected snapshot kind {snapshot.kind!r}"
-        )
-
-    if snapshot.kind == "missing":
-        observed = _observe_enablement(path)
-        if observed.kind == "missing":
-            return
-        if created_identity is None:
+    def remove_for_uninstall(self) -> list[str]:
+        if self.operation != "uninstall":
             raise InstallError(
-                f"incomplete compensation for service enablement {path}: "
-                f"expected an absent path, observed "
-                f"{_describe_enablement(observed)}"
+                f"artifact removal mode is not uninstall: {self.operation}"
             )
-        try:
-            _remove_owned_enablement(
-                path, unit_path, expected_identity=created_identity
+        current_enablement = _observe_enablement(self.enablement_path)
+        if current_enablement.kind != "missing" and not (
+            _snapshot_is_owned_enablement(
+                self.enablement_path,
+                self.unit_path,
+                current_enablement,
             )
-        except BaseException as exc:
+        ):
+            raise OwnershipError(
+                f"enablement path became foreign before cleanup: "
+                f"{self.enablement_path}; retained "
+                f"{_describe_enablement(current_enablement)}"
+            )
+        current_unit = _observe_unit(self.unit_path)
+        if not _snapshot_matches(self.unit_initial, current_unit):
             raise InstallError(
-                f"incomplete compensation for service enablement {path}: {exc}"
-            ) from exc
-        return
+                f"service unit changed before cleanup: {self.unit_path}"
+            )
 
-    try:
-        _validate_enablement_link(path, unit_path)
-    except OwnershipError as exc:
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: {exc}"
-        ) from exc
-    observed = _observe_enablement(path)
-    target = snapshot.data
-    if not isinstance(target, str):
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: "
-            "saved symlink target is invalid"
-        )
-    if (
-        observed.kind == "symlink"
-        and observed.data == target
-        and _snapshot_is_owned_enablement(path, unit_path, observed)
-    ):
-        return
-    if observed.kind != "missing":
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: "
-            f"expected symlink target {target!r}, observed "
-            f"{_describe_enablement(observed)}"
-        )
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(target, path)
-    except FileExistsError as exc:
-        try:
-            replacement = _observe_enablement(path)
-        except InstallError as observation_error:
-            raise InstallError(
-                f"incomplete compensation for service enablement {path}: "
-                f"an entry appeared during symlink creation ({observation_error})"
-            ) from exc
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: "
-            f"an entry appeared during symlink creation; observed "
-            f"{_describe_enablement(replacement)}"
-        ) from exc
-    except OSError as exc:
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: "
-            f"could not recreate symlink: {exc}"
-        ) from exc
-
-    restored = _observe_enablement(path)
-    if (
-        restored.kind == "symlink"
-        and restored.data == target
-        and _snapshot_is_owned_enablement(path, unit_path, restored)
-    ):
-        return
-    raise InstallError(
-        f"incomplete compensation for service enablement {path}: created "
-        f"symlink was not stable at the saved target; observed "
-        f"{_describe_enablement(restored)}"
-    )
-
-
-def _restore_enablement_after_failed_disable(
-    path: pathlib.Path,
-    unit_path: pathlib.Path,
-    snapshot: _PathSnapshot,
-) -> None:
-    """Restore the exact pre-disable wants state without replacement."""
-    _restore_enablement_snapshot(path, unit_path, snapshot)
+        removed = []
+        if current_enablement.kind != "missing":
+            self.enablement_path.unlink()
+            removed.append(str(self.enablement_path))
+        if current_unit.kind != "missing":
+            self.unit_path.unlink()
+            removed.append(str(self.unit_path))
+        return removed
 
 
 def _remove_owned_root(root: pathlib.Path, manifest: dict) -> None:
@@ -1864,14 +1764,10 @@ def uninstall_server(
         )
         return removed
 
-    unit_path = pathlib.Path(owned["unit"])
-    if os.path.lexists(unit_path):
-        if unit_path.is_symlink() or not unit_path.is_file():
-            raise OwnershipError(
-                f"owned service unit must be a regular non-symlink file: {unit_path}"
-            )
-    enablement = _enablement_path(unit_dir)
-    enablement_snapshot = _snapshot_enablement(enablement, unit_path)
+    artifacts = _SystemdArtifacts.capture_for_uninstall(
+        pathlib.Path(owned["unit"]),
+        _enablement_path(unit_dir),
+    )
     stop_sleeper = time.sleep if sleeper is None else sleeper
 
     disable_failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
@@ -1883,43 +1779,23 @@ def uninstall_server(
             sleeper=stop_sleeper,
         )
     except BaseException as stop_error:
-        compensation = None
         try:
-            _restore_enablement_after_failed_disable(
-                enablement, unit_path, enablement_snapshot
-            )
+            compensation = artifacts.restore()
         except BaseException as exc:
-            compensation = exc
+            compensation = [
+                f"could not restore service enablement "
+                f"{artifacts.enablement_path}: {exc}"
+            ]
         detail = f"server uninstall failed:\n- {stop_error}"
         if disable_failure is not None:
             detail += f"\n- {disable_failure}"
-        if compensation is not None:
-            detail += (
-                f"\n- could not restore service enablement {enablement}: "
-                f"{compensation}"
-            )
+        if compensation:
+            detail += "\n- " + "\n- ".join(compensation)
         else:
             detail += "\n- service enablement restored for retry"
         raise InstallError(detail) from stop_error
 
-    enablement_removed = _remove_owned_enablement(enablement, unit_path)
-    if enablement_removed:
-        removed.append(str(enablement))
-
-    if disable_failure is not None and os.path.lexists(enablement):
-        raise InstallError(
-            "server uninstall failed:\n- "
-            f"{disable_failure}\n- enablement path remains at {enablement}"
-        )
-
-    if os.path.lexists(unit_path):
-        try:
-            unit_path.unlink()
-        except OSError as exc:
-            raise InstallError(
-                f"server uninstall failed:\n- could not remove {unit_path}: {exc}"
-            ) from exc
-        removed.append(str(unit_path))
+    removed.extend(artifacts.remove_for_uninstall())
 
     failure = _systemctl_error(runner, ["daemon-reload"])
     if failure is not None:

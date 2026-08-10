@@ -3,7 +3,6 @@
 Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 """
 
-import errno
 import json
 import http.client
 import os
@@ -2045,75 +2044,7 @@ def assert_owned_enablement_restored(link, target):
     assert os.readlink(link) == target
 
 
-def test_uninstall_compensation_retains_replacement_after_validation(
-    checkout, tmp_path, monkeypatch
-):
-    _install_server(checkout, tmp_path)
-    root = tmp_path / "share" / "free-tts-server"
-    unit_dir = tmp_path / "config" / "systemd" / "user"
-    unit = unit_dir / install.UNIT_NAME
-    link = write_enablement_link(unit_dir)
-    runner = DisableLeavesActiveSystemctl()
-    validations = 0
-    real_validate = install._validate_enablement_link
-
-    def validate_then_replace(path, unit_path):
-        nonlocal validations
-        result = real_validate(path, unit_path)
-        validations += 1
-        if validations == 2:
-            path.unlink()
-            path.write_text("foreign replacement after validation\n")
-        return result
-
-    monkeypatch.setattr(install, "_validate_enablement_link", validate_then_replace)
-    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
-
-    with pytest.raises(install.InstallError) as excinfo:
-        install.uninstall_server(
-            root=root,
-            unit_dir=unit_dir,
-            systemctl=runner,
-        )
-
-    assert link.read_text() == "foreign replacement after validation\n"
-    assert "incomplete compensation" in str(excinfo.value)
-    assert root.is_dir() and unit.is_file()
-
-
-def test_uninstall_compensation_retains_foreign_creation_race(
-    checkout, tmp_path, monkeypatch
-):
-    _install_server(checkout, tmp_path)
-    root = tmp_path / "share" / "free-tts-server"
-    unit_dir = tmp_path / "config" / "systemd" / "user"
-    unit = unit_dir / install.UNIT_NAME
-    link = write_enablement_link(unit_dir)
-    runner = DisableActivitySequenceSystemctl(link, ["active"])
-    real_symlink = install.os.symlink
-
-    def foreign_before_create(target, destination, *args, **kwargs):
-        if pathlib.Path(destination) == link:
-            link.write_text("foreign creation race\n")
-            raise FileExistsError("foreign entry appeared")
-        return real_symlink(target, destination, *args, **kwargs)
-
-    monkeypatch.setattr(install.os, "symlink", foreign_before_create)
-    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
-
-    with pytest.raises(install.InstallError) as excinfo:
-        install.uninstall_server(
-            root=root,
-            unit_dir=unit_dir,
-            systemctl=runner,
-        )
-
-    assert link.read_text() == "foreign creation race\n"
-    assert "incomplete compensation" in str(excinfo.value)
-    assert root.is_dir() and unit.is_file()
-
-
-def test_uninstall_compensation_retains_unexpected_enablement_from_missing_snapshot(
+def test_uninstall_failed_stop_restores_missing_snapshot_after_disable_creates_link(
     checkout, tmp_path, monkeypatch
 ):
     _install_server(checkout, tmp_path)
@@ -2122,21 +2053,18 @@ def test_uninstall_compensation_retains_unexpected_enablement_from_missing_snaps
     unit = unit_dir / install.UNIT_NAME
     link = install._enablement_path(unit_dir)
     link.unlink()
-    link.parent.mkdir(parents=True, exist_ok=True)
-    assert not os.path.lexists(link)
     runner = DisableCreatesOwnedEnablementSystemctl(link)
     monkeypatch.setattr(install.time, "sleep", lambda delay: None)
 
-    with pytest.raises(install.InstallError) as excinfo:
+    with pytest.raises(install.InstallError, match="did not become inactive") as exc:
         install.uninstall_server(
             root=root,
             unit_dir=unit_dir,
             systemctl=runner,
         )
 
-    assert link.is_symlink()
-    assert os.readlink(link) == str(pathlib.Path("..") / install.UNIT_NAME)
-    assert "incomplete compensation" in str(excinfo.value)
+    assert not os.path.lexists(link)
+    assert "service enablement restored for retry" in str(exc.value)
     assert root.is_dir() and unit.is_file()
 
 
@@ -2228,44 +2156,54 @@ def test_uninstall_rejects_replaced_enablement_after_disable(checkout, tmp_path)
     assert root.is_dir()
 
 
-def test_uninstall_quarantines_replacement_after_removal_observation(
-    checkout, tmp_path, monkeypatch
+def test_systemd_artifacts_uninstall_validates_both_before_removal(
+    checkout, tmp_path
 ):
     _install_server(checkout, tmp_path)
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit = unit_dir / install.UNIT_NAME
     link = write_enablement_link(unit_dir)
-    runner = StatefulSystemctl(active=True, enabled=True)
-    validations = 0
-    real_validate = install._validate_enablement_link
+    artifacts = install._SystemdArtifacts.capture_for_uninstall(unit, link)
+    unit.write_text("changed before removal\n")
 
-    def validate_then_replace(path, unit_path):
-        nonlocal validations
-        result = real_validate(path, unit_path)
-        validations += 1
-        if validations == 2:
-            path.unlink()
-            path.write_text("foreign successful-uninstall replacement\n")
-        return result
+    with pytest.raises(install.InstallError, match="service unit changed"):
+        artifacts.remove_for_uninstall()
 
-    monkeypatch.setattr(install, "_validate_enablement_link", validate_then_replace)
+    assert link.is_symlink()
+    assert unit.read_text() == "changed before removal\n"
+    assert root.is_dir()
 
-    with pytest.raises(install.InstallError) as excinfo:
+
+def test_uninstall_retains_unit_changed_during_disable_before_cleanup(
+    checkout, tmp_path
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+
+    class UnitChangingDisable(StatefulSystemctl):
+        def __call__(self, args, check=False):
+            result = super().__call__(args, check=check)
+            if args == ["disable", "--now", install.UNIT_NAME]:
+                unit.write_text("changed during disable\n")
+            return result
+
+    runner = UnitChangingDisable(active=True, enabled=True)
+
+    with pytest.raises(install.InstallError, match="service unit changed"):
         install.uninstall_server(
             root=root, unit_dir=unit_dir, systemctl=runner
         )
 
-    quarantined = list(link.parent.glob(".*enablement-quarantine-*"))
-    assert len(quarantined) == 1
-    assert quarantined[0].read_text() == "foreign successful-uninstall replacement\n"
-    assert str(quarantined[0]) in str(excinfo.value)
-    assert unit.is_file()
+    assert unit.read_text() == "changed during disable\n"
     assert root.is_dir()
 
 
-def test_uninstall_retains_original_path_collision_after_quarantine_move(
-    checkout, tmp_path, monkeypatch
+def test_uninstall_artifact_removal_reports_enablement_unit_and_root(
+    checkout, tmp_path
 ):
     _install_server(checkout, tmp_path)
     root = tmp_path / "share" / "free-tts-server"
@@ -2273,52 +2211,15 @@ def test_uninstall_retains_original_path_collision_after_quarantine_move(
     unit = unit_dir / install.UNIT_NAME
     link = write_enablement_link(unit_dir)
     runner = StatefulSystemctl(active=True, enabled=True)
-    real_rename = install.os.rename
-
-    def rename_then_collide(source, target):
-        result = real_rename(source, target)
-        if pathlib.Path(source) == link:
-            link.write_text("foreign original-path collision\n")
-        return result
-
-    monkeypatch.setattr(install.os, "rename", rename_then_collide)
-
-    with pytest.raises(install.InstallError, match="incomplete cleanup"):
-        install.uninstall_server(
-            root=root, unit_dir=unit_dir, systemctl=runner
-        )
-
-    assert link.read_text() == "foreign original-path collision\n"
-    assert unit.is_file()
-    assert root.is_dir()
-
-
-def test_uninstall_tolerates_enablement_enoent_during_quarantine_move(
-    checkout, tmp_path, monkeypatch
-):
-    _install_server(checkout, tmp_path)
-    root = tmp_path / "share" / "free-tts-server"
-    unit_dir = tmp_path / "config" / "systemd" / "user"
-    unit = unit_dir / install.UNIT_NAME
-    link = write_enablement_link(unit_dir)
-    runner = StatefulSystemctl(active=True, enabled=True)
-    real_rename = install.os.rename
-
-    def disappear_before_rename(source, target):
-        if pathlib.Path(source) == link:
-            link.unlink()
-            raise FileNotFoundError(errno.ENOENT, "injected disappearance", str(link))
-        return real_rename(source, target)
-
-    monkeypatch.setattr(install.os, "rename", disappear_before_rename)
 
     removed = install.uninstall_server(
         root=root, unit_dir=unit_dir, systemctl=runner
     )
 
+    assert removed == [str(link), str(unit), str(root)]
     assert not os.path.lexists(link)
-    assert str(unit) in removed
-    assert str(root) in removed
+    assert not unit.exists()
+    assert not root.exists()
 
 
 @pytest.mark.parametrize("kind", ("file", "directory", "foreign-symlink"))
