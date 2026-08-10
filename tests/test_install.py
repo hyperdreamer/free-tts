@@ -1454,6 +1454,33 @@ class MissingFragmentSystemctl:
         return FakeCompleted()
 
 
+class DisableRemovesEnablementSystemctl(StatefulSystemctl):
+    """Real systemd semantics: a successful disable deletes the .wants link."""
+
+    def __init__(self, link):
+        super().__init__(active=True, enabled=True)
+        self.link = link
+
+    def __call__(self, args, check=True):
+        if args[0] == "disable" and os.path.lexists(self.link):
+            self.link.unlink()
+        return super().__call__(args, check=check)
+
+
+class DisableReplacesEnablementSystemctl(StatefulSystemctl):
+    """Hostile disable that swaps the owned link for a foreign entry."""
+
+    def __init__(self, link):
+        super().__init__(active=True, enabled=True)
+        self.link = link
+
+    def __call__(self, args, check=True):
+        if args[0] == "disable" and os.path.lexists(self.link):
+            self.link.unlink()
+            self.link.write_text("foreign replacement\n")
+        return super().__call__(args, check=check)
+
+
 def test_uninstall_removes_dangling_owned_enablement_without_fragment(
     checkout, tmp_path
 ):
@@ -1474,6 +1501,43 @@ def test_uninstall_removes_dangling_owned_enablement_without_fragment(
     assert not os.path.lexists(link)
     assert not root.exists()
     assert ["disable", "--now", install.UNIT_NAME] in runner.calls
+
+
+def test_uninstall_succeeds_when_disable_removes_enablement(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = DisableRemovesEnablementSystemctl(link)
+
+    removed = install.uninstall_server(
+        root=root, unit_dir=unit_dir, systemctl=runner
+    )
+
+    assert not os.path.lexists(link)
+    assert not unit.exists()
+    assert not root.exists()
+    assert str(unit) in removed
+    assert str(root) in removed
+
+
+def test_uninstall_rejects_replaced_enablement_after_disable(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = DisableReplacesEnablementSystemctl(link)
+
+    with pytest.raises(install.OwnershipError, match="enablement"):
+        install.uninstall_server(
+            root=root, unit_dir=unit_dir, systemctl=runner
+        )
+
+    assert link.read_text() == "foreign replacement\n"
+    assert unit.exists()
+    assert root.is_dir()
 
 
 @pytest.mark.parametrize("kind", ("file", "directory", "foreign-symlink"))

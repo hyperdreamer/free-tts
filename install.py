@@ -1191,7 +1191,7 @@ def uninstall_server(
                 f"owned service unit must be a regular non-symlink file: {unit_path}"
             )
     enablement = _enablement_path(unit_dir)
-    has_link = _validate_enablement_link(enablement, unit_path)
+    _validate_enablement_link(enablement, unit_path)
 
     failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
     if failure is not None and os.path.lexists(unit_path):
@@ -1204,9 +1204,15 @@ def uninstall_server(
                 detail = f"{detail}\n- {failure}"
             raise InstallError(f"server uninstall failed:\n- {detail}")
 
-    if has_link:
+    if os.path.lexists(enablement):
+        # A successful disable normally removes the link itself; only a
+        # still-present entry needs removal. Revalidate before unlinking so a
+        # foreign replacement is never tolerated or deleted.
+        _validate_enablement_link(enablement, unit_path)
         try:
             enablement.unlink()
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             detail = f"could not remove {enablement}: {exc}"
             if failure is not None:
