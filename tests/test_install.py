@@ -1,6 +1,10 @@
-"""Per-user server installer: paths, ownership, staging, unit, and CLI."""
+"""Per-user server installer: paths, ownership, staging, unit, and CLI.
+
+Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+"""
 
 import json
+import os
 
 import pytest
 
@@ -74,6 +78,43 @@ def test_publish_runtime_preserves_venv_and_config_on_upgrade(checkout, tmp_path
     assert (root / "server.py").read_text() == "# server v2\n"
     assert (root / "config.json").read_text() == '{"port": 6000}\n'
     assert (root / ".venv" / "bin" / "python").exists()
+
+
+def test_publish_runtime_keeps_previous_install_when_restore_fails(
+    checkout, tmp_path, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    install.publish_runtime(checkout, root)
+    (root / install.MANIFEST_NAME).write_text(
+        json.dumps({"component": "server", "root": str(root)}), encoding="utf-8"
+    )
+    (root / "config.json").write_text('{"port": 6000}\n')
+
+    real_replace = os.replace
+    calls = {"count": 0}
+
+    def failing_replace(src, dst):
+        # First rename moves the old root aside; the staging swap and the
+        # compensating restore both fail afterwards.
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise OSError("simulated rename failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(install.os, "replace", failing_replace)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.publish_runtime(checkout, root)
+
+    rollback_dirs = [
+        p
+        for p in root.parent.iterdir()
+        if p.name.startswith(".free-tts-server-rollback-")
+    ]
+    assert len(rollback_dirs) == 1
+    assert str(rollback_dirs[0]) in str(excinfo.value)
+    assert (rollback_dirs[0] / "config.json").read_text() == '{"port": 6000}\n'
+    assert (rollback_dirs[0] / install.MANIFEST_NAME).exists()
 
 
 def test_publish_runtime_rejects_incomplete_checkout(tmp_path):

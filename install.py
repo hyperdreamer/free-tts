@@ -148,6 +148,7 @@ def publish_runtime(source_root: pathlib.Path, root: pathlib.Path) -> bool:
         tempfile.mkdtemp(prefix=".free-tts-server-stage-", dir=root.parent)
     )
     rollback: pathlib.Path | None = None
+    root_in_place = False
     try:
         _stage_runtime(source_root, staging)
         if existing is not None:
@@ -161,15 +162,28 @@ def publish_runtime(source_root: pathlib.Path, root: pathlib.Path) -> bool:
             os.replace(root, rollback)
         try:
             os.replace(staging, root)
+            root_in_place = True
         except BaseException:
             if rollback is not None and os.path.lexists(rollback):
-                os.replace(rollback, root)
+                try:
+                    os.replace(rollback, root)
+                except BaseException as restore_error:
+                    logger.error(
+                        "publish failed and the previous install could not be "
+                        "restored; it is kept at %s",
+                        rollback,
+                    )
+                    raise InstallError(
+                        f"publish failed and the previous install could not be "
+                        f"restored; it is kept at {rollback}"
+                    ) from restore_error
                 rollback = None
+                root_in_place = True
             raise
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        if rollback is not None and os.path.lexists(rollback):
+        if root_in_place and rollback is not None and os.path.lexists(rollback):
             shutil.rmtree(rollback, ignore_errors=True)
     logger.info("Published server runtime into %s", root)
     return existing is not None
