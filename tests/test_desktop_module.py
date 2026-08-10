@@ -452,6 +452,117 @@ class TestBackendRecovery:
         assert fake_io.lines[-1] == "702 END"
 
 
+class TestRecoveryIsCancellable:
+    """STOP and PAUSE must reclaim the worker during backend recovery."""
+
+    def _recovering_engine(
+        self, recovery_entered, release_recovery, decoder=None
+    ):
+        from desktop.synth import SynthError
+
+        class RecoveringClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    return self._audio
+                raise SynthError("backend vanished mid-utterance")
+
+        class WedgedController(_FakeController):
+            def ensure_ready(self):
+                self.calls += 1
+                if self.calls > 1:
+                    recovery_entered.set()
+                    assert release_recovery.wait(10)
+
+        fake_io = _FakeIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            WedgedController(),
+            RecoveringClient(),
+            decoder=decoder
+            or (lambda mp3, ffmpeg_path, sample_rate, cancel: b"\x01\x00" * 8),
+        )
+        return engine, fake_io
+
+    def test_stop_during_recovery_reclaims_the_worker(self):
+        recovery_entered = threading.Event()
+        release_recovery = threading.Event()
+        engine, fake_io = self._recovering_engine(
+            recovery_entered, release_recovery
+        )
+
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert recovery_entered.wait(3)
+
+        try:
+            engine.handle_stop()
+            assert engine.wait_idle(3), "worker waited for wedged recovery"
+            assert fake_io.lines.count("703 STOP") == 1
+            assert "702 END" not in fake_io.lines
+        finally:
+            release_recovery.set()
+            engine.wait_idle(3)
+
+    def test_pause_during_recovery_reclaims_the_worker(self):
+        recovery_entered = threading.Event()
+        release_recovery = threading.Event()
+        decode_entered = threading.Event()
+        release_decode = threading.Event()
+
+        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            decode_entered.set()
+            assert release_decode.wait(3)
+            return b"\x01\x00" * 8
+
+        engine, fake_io = self._recovering_engine(
+            recovery_entered, release_recovery, decoder=gated_decoder
+        )
+
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert decode_entered.wait(3)
+
+        # PAUSE lands before chunk one's boundary is evaluated, so the boundary
+        # is honest and chunk two's wedged recovery is never awaited.
+        engine.handle_pause()
+        release_decode.set()
+
+        try:
+            assert engine.wait_idle(3), "worker waited for wedged recovery"
+            assert fake_io.lines.count("700:__spd_0") == 1
+            assert fake_io.lines.count("702 END") == 0
+            terminal = [
+                line for line in fake_io.lines if line in {"703 STOP", "704 PAUSE"}
+            ]
+            assert terminal == ["704 PAUSE"]
+        finally:
+            release_recovery.set()
+            engine.wait_idle(3)
+
+    def test_recovery_still_succeeds_without_cancellation(self):
+        """The deadline must not fire when nobody cancelled."""
+        engine, fake_io, client, state = _lifecycle_engine(fail_first_post=True)
+        engine.handle_speak(SSML)
+        assert engine.wait_idle(5)
+        assert state["spawns"] == 1
+        assert client.attempts == 2
+        assert fake_io.lines[-1] == "702 END"
+
+
 class TestPause:
     def test_pause_reports_mark_then_pause_event(self):
         engine, fake_io = _engine()

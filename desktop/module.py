@@ -66,6 +66,9 @@ _WORKER_RECLAIM_SECONDS = 10.0
 # applies only after STOP, or after PAUSE reaches its honest boundary; wanted
 # synthesis keeps the configured request timeout.
 _CANCEL_DRAIN_SECONDS = 1.25
+# Whole-recovery budget once STOP or a PAUSE boundary is pending. Recovery that
+# nobody has cancelled keeps the configured startup and voice timeouts.
+_RECOVERY_DEADLINE_SECONDS = 1.0
 _FUTURE_POLL_INTERVAL = 0.05
 
 
@@ -306,6 +309,47 @@ class SpeechEngine:
             raise SynthError("backend returned no voices")
         self.catalog = catalog
         return catalog
+
+    def _recover_backend(self, generation: _GenerationToken) -> None:
+        """Restart the backend and refresh voices, abandonable on cancellation.
+
+        ``ensure_ready`` blocks on a startup file lock, health probes, and process
+        launch, and ``voices`` performs one HTTP request; none of them accepts a
+        cancellation signal, and a ``urllib`` timeout is per-read rather than a
+        whole-call deadline. Recovery therefore runs on a thread this method owns.
+        A cancelled generation stops waiting at ``_RECOVERY_DEADLINE_SECONDS``
+        while that thread finishes on its own: it holds no protocol lock and no
+        generation state, so it cannot emit output or affect a later utterance.
+        """
+        outcome: dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def recover() -> None:
+            try:
+                self.catalog = None
+                self._controller.ensure_ready()  # type: ignore[attr-defined]
+                self._refresh_catalog()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the worker
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        helper = threading.Thread(
+            target=recover, name="free-tts-recover", daemon=True
+        )
+        # Not joined on the cancelled path by design: unlike the decoder's I/O
+        # thread, this one owns no child process, no pipe, and no protocol lock.
+        helper.start()
+        deadline: float | None = None
+        while not done.wait(_FUTURE_POLL_INTERVAL):
+            if self._should_abort_fetch(generation):
+                if deadline is None:
+                    deadline = time.monotonic() + _RECOVERY_DEADLINE_SECONDS
+                elif time.monotonic() >= deadline:
+                    raise Cancelled("recovery exceeded its cancellation deadline")
+        error = outcome.get("error")
+        if error is not None:
+            raise error
 
     def _reclaim_worker(self) -> bool:
         """Stop the previous generation. False if its worker is still alive."""
@@ -600,9 +644,7 @@ class SpeechEngine:
         except SynthError:
             if self._should_abort_fetch(generation):
                 raise Cancelled("aborted instead of recovering backend")
-            self.catalog = None
-            self._controller.ensure_ready()  # type: ignore[attr-defined]
-            self._refresh_catalog()
+            self._recover_backend(generation)
             if self._should_abort_fetch(generation):
                 raise Cancelled("aborted before retrying synthesis")
             # A fresh id: the first POST's delivery is ambiguous, so reusing the
