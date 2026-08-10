@@ -8,6 +8,7 @@ import os
 
 import pytest
 
+import desktop.install
 import install
 
 
@@ -487,6 +488,11 @@ def test_main_rejects_unknown_command(capsys):
     assert install.main(["frobnicate"]) == 2
 
 
+def test_main_help_exits_zero(capsys):
+    assert install.main(["--help"]) == 0
+    assert "usage" in capsys.readouterr().out
+
+
 def test_main_status_prints_a_report(checkout, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         install, "status", lambda **kwargs: {
@@ -509,7 +515,7 @@ def test_main_install_all_reports_each_component(monkeypatch, capsys):
 
     def failing_desktop(**kwargs):
         performed.append("desktop")
-        raise install.InstallError("speech-dispatcher is missing")
+        raise desktop.install.PrerequisiteError("speech-dispatcher is missing")
 
     monkeypatch.setattr(install, "install_desktop", failing_desktop)
 

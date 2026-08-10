@@ -584,8 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         args = parser.parse_args(argv)
-    except SystemExit:
-        return 2
+    except SystemExit as exc:
+        # argparse exits 0 for --help/--version and 2 for usage errors.
+        return 0 if exc.code in (None, 0) else 2
 
     if args.command == "status":
         _print_status(status())
@@ -614,7 +615,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Removed {path}")
                 if not removed:
                     print(f"Nothing to remove for {component}")
-        except (InstallError, OSError, ImportError, subprocess.SubprocessError) as exc:
+        # RuntimeError covers the desktop hierarchy (desktop.install.InstallError
+        # and its PrerequisiteError/InstallOwnershipError subclasses); our own
+        # errors are all InstallError subclasses.
+        except (
+            InstallError,
+            RuntimeError,
+            OSError,
+            ImportError,
+            subprocess.SubprocessError,
+        ) as exc:
             failures += 1
             print(f"{component}: {exc}")
     return 1 if failures else 0
