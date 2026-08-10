@@ -342,7 +342,7 @@ class SpeechEngine:
         helper.start()
         deadline: float | None = None
         while not done.wait(_FUTURE_POLL_INTERVAL):
-            if self._should_abort_fetch(generation):
+            if self._recovery_abandoned(generation):
                 if deadline is None:
                     deadline = time.monotonic() + _RECOVERY_DEADLINE_SECONDS
                 elif time.monotonic() >= deadline:
@@ -550,6 +550,21 @@ class SpeechEngine:
             return (
                 generation is not self._generation
                 or generation.cancelled.is_set()
+                or generation.pause_boundary_reached.is_set()
+            )
+
+    def _recovery_abandoned(self, generation: _GenerationToken) -> bool:
+        """True when waiting for backend recovery is no longer wanted.
+
+        Unlike ``_should_abort_fetch``, a pending PAUSE counts here. Waiting for a
+        dead backend cannot produce the honest boundary PAUSE needs, so the
+        utterance ends rather than stalling for startup and catalog timeouts.
+        """
+        with self._lock:
+            return (
+                generation is not self._generation
+                or generation.cancelled.is_set()
+                or generation.pause_requested.is_set()
                 or generation.pause_boundary_reached.is_set()
             )
 

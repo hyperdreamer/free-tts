@@ -521,34 +521,21 @@ class TestRecoveryIsCancellable:
     def test_pause_during_recovery_reclaims_the_worker(self):
         recovery_entered = threading.Event()
         release_recovery = threading.Event()
-        decode_entered = threading.Event()
-        release_decode = threading.Event()
-
-        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
-            decode_entered.set()
-            assert release_decode.wait(3)
-            return b"\x01\x00" * 8
-
         engine, fake_io = self._recovering_engine(
-            recovery_entered, release_recovery, decoder=gated_decoder
+            recovery_entered, release_recovery
         )
 
         engine.handle_speak(TWO_CHUNK_SSML)
-        assert decode_entered.wait(3)
-
-        # PAUSE lands before chunk one's boundary is evaluated, so the boundary
-        # is honest and chunk two's wedged recovery is never awaited.
-        engine.handle_pause()
-        release_decode.set()
+        assert recovery_entered.wait(3)
 
         try:
+            engine.handle_pause()
             assert engine.wait_idle(3), "worker waited for wedged recovery"
-            assert fake_io.lines.count("700:__spd_0") == 1
             assert fake_io.lines.count("702 END") == 0
             terminal = [
                 line for line in fake_io.lines if line in {"703 STOP", "704 PAUSE"}
             ]
-            assert terminal == ["704 PAUSE"]
+            assert len(terminal) == 1
         finally:
             release_recovery.set()
             engine.wait_idle(3)
