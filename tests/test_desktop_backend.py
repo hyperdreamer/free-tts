@@ -2,6 +2,8 @@
 
 import contextlib
 import dataclasses
+import socket
+import threading
 
 import pytest
 
@@ -71,6 +73,36 @@ def _controller(responses, *, config=None, spawn=None, clock=None):
 
 
 class TestProbe:
+    def test_truncated_response_is_reported_as_unreachable(self):
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def serve():
+            conn, _ = server.accept()
+            try:
+                conn.recv(4096)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n"
+                    + b'{"sta'
+                )
+            finally:
+                conn.close()
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        config = _config(backend_url=f"http://127.0.0.1:{port}")
+        try:
+            health = backend.BackendController(config).probe()
+        finally:
+            server.close()
+            worker.join(1)
+
+        assert health.reachable is False
+        assert health.ready is False
+
     def test_healthy_backend(self):
         ctrl, _ = _controller([HEALTHY])
         health = ctrl.probe()

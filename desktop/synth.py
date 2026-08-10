@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import secrets
@@ -70,7 +71,13 @@ def _http_transport(
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers or {}), exc.read()
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except http.client.InvalidURL:
+        raise
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+    ) as exc:
         raise OSError(str(exc)) from exc
 
 

@@ -109,7 +109,16 @@ def _fetch_json(url: str, timeout: float) -> object:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return {"status": "error", "http_status": exc.code}
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except http.client.InvalidURL:
+        # A malformed URL is a configuration fault, not a transfer fault: the
+        # caller maps it to ConfigError, so it must not be normalised here.
+        raise
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as exc:
         raise OSError(str(exc)) from exc
 
 

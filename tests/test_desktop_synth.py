@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import socket
 import threading
 
 import pytest
@@ -58,6 +59,37 @@ class TestRequestId:
 
     def test_ids_are_unique(self):
         assert len({synth.new_request_id() for _ in range(50)}) == 50
+
+
+class TestHttpTransport:
+    def test_truncated_response_raises_oserror(self):
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def serve():
+            conn, _ = server.accept()
+            try:
+                conn.recv(4096)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n"
+                    + b'{"sta'
+                )
+            finally:
+                conn.close()
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        try:
+            with pytest.raises(OSError):
+                synth._http_transport(
+                    "GET", f"http://127.0.0.1:{port}/voices", None, 1.0
+                )
+        finally:
+            server.close()
+            worker.join(1)
 
 
 class TestVoices:
