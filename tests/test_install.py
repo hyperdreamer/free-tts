@@ -502,6 +502,90 @@ class StatefulSystemctl:
         return FakeCompleted()
 
 
+class EnablementSystemctl(StatefulSystemctl):
+    """Stateful systemctl model that applies wants-link filesystem effects."""
+
+    def __init__(
+        self,
+        unit_dir,
+        *,
+        active=False,
+        enabled=False,
+        fail_after_enable=False,
+        remove_on_disable=True,
+        foreign_after_disable=False,
+    ):
+        super().__init__(active=active, enabled=enabled)
+        self.unit = pathlib.Path(unit_dir) / install.UNIT_NAME
+        self.link = (
+            pathlib.Path(unit_dir)
+            / "default.target.wants"
+            / install.UNIT_NAME
+        )
+        self.fail_after_enable = fail_after_enable
+        self.remove_on_disable = remove_on_disable
+        self.foreign_after_disable = foreign_after_disable
+
+    def _write_owned_link(self):
+        if self.link.is_dir() and not self.link.is_symlink():
+            shutil.rmtree(self.link)
+        elif os.path.lexists(self.link):
+            self.link.unlink()
+        self.link.parent.mkdir(parents=True, exist_ok=True)
+        self.link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
+
+    def _link_is_owned(self):
+        if not self.link.is_symlink():
+            return False
+        target = pathlib.Path(os.readlink(self.link))
+        resolved = (
+            target
+            if target.is_absolute()
+            else self.link.parent / target
+        ).resolve(strict=False)
+        return resolved == self.unit.resolve(strict=False)
+
+    def __call__(self, args, check=True):
+        args = list(args)
+        command = args[0]
+        if command == "enable":
+            self.calls.append(args)
+            self._write_owned_link()
+            self.enabled = True
+            if self.fail_after_enable and not self.failed:
+                self.failed = True
+                return FakeCompleted(returncode=7, stderr="enable failed")
+            return FakeCompleted()
+        if command == "disable":
+            result = super().__call__(args, check=check)
+            if self.remove_on_disable and self._link_is_owned():
+                self.link.unlink()
+            if self.foreign_after_disable:
+                if self.link.is_dir() and not self.link.is_symlink():
+                    shutil.rmtree(self.link)
+                elif os.path.lexists(self.link):
+                    self.link.unlink()
+                self.link.parent.mkdir(parents=True, exist_ok=True)
+                self.link.write_text("foreign replacement\n")
+            return result
+        return super().__call__(args, check=check)
+
+
+def write_foreign_enablement(link, kind, unit):
+    """Create a literal unowned wants-path entry for collision tests."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "file":
+        link.write_text("foreign\n")
+    elif kind == "directory":
+        link.mkdir()
+    elif kind == "foreign-symlink":
+        link.symlink_to(link.parent / "foreign.service")
+    elif kind == "owned-target-symlink":
+        link.symlink_to(pathlib.Path("..") / unit.name)
+    else:
+        raise AssertionError(f"unknown enablement entry kind: {kind}")
+
+
 def snapshot_tree(root):
     """Capture exact file bytes, modes, directories, and symlink targets."""
     snapshot = {}
@@ -982,6 +1066,176 @@ def fake_venv_builder(target):
     (target / ".venv" / "bin" / "python").write_text("#!/bin/sh\n")
 
 
+@pytest.mark.parametrize(
+    "kind", ("file", "directory", "foreign-symlink", "owned-target-symlink")
+)
+def test_install_server_rejects_fresh_enablement_collision_before_mutation(
+    kind, checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = EnablementSystemctl(unit_dir)
+    write_foreign_enablement(runner.link, kind, unit)
+    before_entry = snapshot_tree(runner.link.parent)
+    builds = []
+
+    with pytest.raises(install.OwnershipError, match="enablement"):
+        _transaction_install(
+            checkout,
+            root,
+            unit_dir,
+            runner,
+            lambda target: builds.append(target),
+            healthy_fetch,
+        )
+
+    assert snapshot_tree(runner.link.parent) == before_entry
+    assert not root.exists()
+    assert not unit.exists()
+    assert builds == []
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("kind", ("file", "directory", "foreign-symlink"))
+def test_install_server_rejects_upgrade_enablement_collision_before_mutation(
+    kind, checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = EnablementSystemctl(unit_dir)
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+    )
+    runner.link.unlink()
+    write_foreign_enablement(runner.link, kind, unit)
+    before_root = snapshot_tree(root)
+    before_unit = unit.read_bytes()
+    before_entry = snapshot_tree(runner.link.parent)
+    runner.calls.clear()
+
+    with pytest.raises(install.OwnershipError, match="enablement"):
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    assert snapshot_tree(root) == before_root
+    assert unit.read_bytes() == before_unit
+    assert snapshot_tree(runner.link.parent) == before_entry
+    assert runner.calls == []
+
+
+def test_install_server_fresh_enable_failure_restores_absent_enablement(
+    checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = EnablementSystemctl(
+        unit_dir, fail_after_enable=True, remove_on_disable=False
+    )
+
+    with pytest.raises(install.InstallError, match="enable failed"):
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    assert not os.path.lexists(runner.link)
+    assert not root.exists()
+    assert not unit.exists()
+    assert runner.calls[:3] == [
+        ["daemon-reload"],
+        ["enable", install.UNIT_NAME],
+        ["disable", "--now", install.UNIT_NAME],
+    ]
+
+
+def test_install_server_upgrade_enable_failure_restores_exact_enablement(
+    checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = EnablementSystemctl(unit_dir)
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+    )
+    runner.link.unlink()
+    runner.link.symlink_to(unit)
+    previous_target = os.readlink(runner.link)
+    before_root = snapshot_tree(root)
+    before_unit = unit.read_bytes()
+    runner.fail_after_enable = True
+    runner.remove_on_disable = False
+    runner.failed = False
+    runner.calls.clear()
+
+    with pytest.raises(install.InstallError, match="enable failed"):
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    assert snapshot_tree(root) == before_root
+    assert unit.read_bytes() == before_unit
+    assert runner.link.is_symlink()
+    assert os.readlink(runner.link) == previous_target
+    assert runner.active is True
+    assert runner.enabled is True
+
+
+def test_install_server_rollback_preserves_new_foreign_enablement(
+    checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    runner = EnablementSystemctl(
+        unit_dir,
+        fail_after_enable=True,
+        remove_on_disable=False,
+        foreign_after_disable=True,
+    )
+
+    with pytest.raises(
+        install.InstallError, match="rollback was incomplete"
+    ) as excinfo:
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    assert "enablement" in str(excinfo.value)
+    assert runner.link.read_text() == "foreign replacement\n"
+
+
+def test_install_server_success_creates_repairs_and_keeps_owned_enablement(
+    checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = EnablementSystemctl(unit_dir)
+
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+    )
+    assert runner.link.is_symlink()
+    assert runner.link.resolve(strict=False) == unit.resolve(strict=False)
+
+    runner.link.unlink()
+    runner.enabled = False
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+    )
+    assert runner.link.is_symlink()
+    assert runner.link.resolve(strict=False) == unit.resolve(strict=False)
+
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+    )
+    assert runner.link.is_symlink()
+    assert runner.link.resolve(strict=False) == unit.resolve(strict=False)
+
+
 def _arm_install_failure(boundary, monkeypatch, root, runner):
     pending = {"value": True}
     health_blocked = {"value": boundary == "health"}
@@ -1213,7 +1467,14 @@ def test_uninstall_server_removes_unit_and_root(checkout, tmp_path):
     removed = install.uninstall_server(
         root=tmp_path / "share" / "free-tts-server",
         unit_dir=tmp_path / "config" / "systemd" / "user",
-        systemctl=fake_systemctl(calls=calls),
+        systemctl=fake_systemctl(
+            {
+                "is-active": FakeCompleted(
+                    returncode=3, stdout="inactive\n"
+                )
+            },
+            calls=calls,
+        ),
     )
 
     root = tmp_path / "share" / "free-tts-server"
@@ -1324,7 +1585,10 @@ def test_uninstall_server_disable_failure_keeps_runtime_and_unit_for_retry(
     assert unit.read_bytes() == before_unit
     assert runner.active is True
     assert runner.enabled is True
-    assert runner.calls == [["disable", "--now", "free-tts.service"]]
+    assert runner.calls == [
+        ["disable", "--now", "free-tts.service"],
+        ["is-active", "free-tts.service"],
+    ]
 
     removed = install.uninstall_server(
         root=root,
@@ -1479,6 +1743,49 @@ class DisableReplacesEnablementSystemctl(StatefulSystemctl):
             self.link.unlink()
             self.link.write_text("foreign replacement\n")
         return super().__call__(args, check=check)
+
+
+class DisableLeavesActiveSystemctl(StatefulSystemctl):
+    """A successful-looking disable that fails to stop the service."""
+
+    def __init__(self):
+        super().__init__(active=True, enabled=True)
+
+    def __call__(self, args, check=True):
+        args = list(args)
+        if args[0] == "disable":
+            self.calls.append(args)
+            self.enabled = False
+            return FakeCompleted()
+        return super().__call__(args, check=check)
+
+
+def test_uninstall_rejects_successful_disable_when_unit_stays_active(
+    checkout, tmp_path
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    before_root = snapshot_tree(root)
+    before_unit = unit.read_bytes()
+    previous_target = os.readlink(link)
+    runner = DisableLeavesActiveSystemctl()
+
+    with pytest.raises(install.InstallError, match="still active"):
+        install.uninstall_server(
+            root=root, unit_dir=unit_dir, systemctl=runner
+        )
+
+    assert snapshot_tree(root) == before_root
+    assert unit.read_bytes() == before_unit
+    assert link.is_symlink()
+    assert os.readlink(link) == previous_target
+    assert runner.calls == [
+        ["disable", "--now", install.UNIT_NAME],
+        ["is-active", install.UNIT_NAME],
+    ]
 
 
 def test_uninstall_removes_dangling_owned_enablement_without_fragment(

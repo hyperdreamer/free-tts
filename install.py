@@ -868,6 +868,9 @@ def _rollback_install(
     unit_path: pathlib.Path,
     unit_snapshot: _PathSnapshot,
     unit_touched: bool,
+    enablement_path: pathlib.Path,
+    enablement_snapshot: _PathSnapshot,
+    enablement_touched: bool,
     service_touched: bool,
     runner: Callable[..., object],
     previous_active: bool,
@@ -919,6 +922,19 @@ def _rollback_install(
             failure = _systemctl_error(runner, ["enable", UNIT_NAME])
             if failure is not None:
                 errors.append(failure)
+
+    if enablement_touched:
+        try:
+            # Only an absent path or the link we own may be replaced during
+            # rollback. A concurrent foreign entry is retained and reported.
+            _validate_enablement_link(enablement_path, unit_path)
+            _restore_path(enablement_path, enablement_snapshot)
+        except BaseException as exc:
+            errors.append(
+                f"could not restore service enablement {enablement_path}: {exc}"
+            )
+
+    if service_touched:
         if previous_active:
             failure = _systemctl_error(runner, ["restart", UNIT_NAME])
             if failure is not None:
@@ -989,6 +1005,13 @@ def install_server(
                 f"owned service unit must be a regular non-symlink file: {unit_path}"
             )
     unit_snapshot = _snapshot_path(unit_path)
+    enablement_path = _enablement_path(unit_dir)
+    enablement_present = _validate_enablement_link(enablement_path, unit_path)
+    if not upgrading and enablement_present:
+        raise OwnershipError(
+            f"refusing to overwrite unowned enablement path {enablement_path}"
+        )
+    enablement_snapshot = _snapshot_path(enablement_path)
     previous_active = (
         _query_unit_state(runner, "is-active", "active") if upgrading else False
     )
@@ -1019,6 +1042,7 @@ def install_server(
     rollback: pathlib.Path | None = None
     published = False
     unit_touched = False
+    enablement_touched = False
     service_touched = False
 
     try:
@@ -1051,6 +1075,7 @@ def install_server(
         unit_touched = True
         service_touched = True
         _run_systemctl(runner, ["daemon-reload"])
+        enablement_touched = True
         _run_systemctl(runner, ["enable", UNIT_NAME])
         _run_systemctl(runner, ["restart", UNIT_NAME])
         _verify_service(
@@ -1069,6 +1094,9 @@ def install_server(
             unit_path=unit_path,
             unit_snapshot=unit_snapshot,
             unit_touched=unit_touched,
+            enablement_path=enablement_path,
+            enablement_snapshot=enablement_snapshot,
+            enablement_touched=enablement_touched,
             service_touched=service_touched,
             runner=runner,
             previous_active=previous_active,
@@ -1194,15 +1222,11 @@ def uninstall_server(
     _validate_enablement_link(enablement, unit_path)
 
     failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
-    if failure is not None and os.path.lexists(unit_path):
-        raise InstallError(f"server uninstall failed:\n- {failure}")
-
-    if not os.path.lexists(unit_path):
-        if _query_unit_state(runner, "is-active", "active"):
-            detail = f"{UNIT_NAME} is still active"
-            if failure is not None:
-                detail = f"{detail}\n- {failure}"
-            raise InstallError(f"server uninstall failed:\n- {detail}")
+    if _query_unit_state(runner, "is-active", "active"):
+        detail = f"{UNIT_NAME} is still active"
+        if failure is not None:
+            detail = f"{detail}\n- {failure}"
+        raise InstallError(f"server uninstall failed:\n- {detail}")
 
     if os.path.lexists(enablement):
         # A successful disable normally removes the link itself; only a
@@ -1219,6 +1243,12 @@ def uninstall_server(
                 detail = f"{detail}\n- {failure}"
             raise InstallError(f"server uninstall failed:\n- {detail}") from exc
         removed.append(str(enablement))
+
+    if failure is not None and os.path.lexists(enablement):
+        raise InstallError(
+            "server uninstall failed:\n- "
+            f"{failure}\n- enablement path remains at {enablement}"
+        )
 
     if os.path.lexists(unit_path):
         try:
