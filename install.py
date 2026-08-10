@@ -15,16 +15,21 @@ Stdlib-only: the installer runs before any dependency exists.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 import argparse
 import contextlib
+import errno
+import http.client
 import json
 import logging
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -32,6 +37,7 @@ logger = logging.getLogger("free-tts.install")
 
 MANIFEST_NAME = "server-manifest.json"
 COMPONENT = "server"
+UNIT_NAME = "free-tts.service"
 RUNTIME_ENTRIES = ("server.py", "requirements.txt", "config.example.json")
 PRESERVED = (".venv", "config.json")
 
@@ -85,6 +91,64 @@ def read_manifest(root: pathlib.Path) -> dict | None:
     return payload
 
 
+def _canonical(path: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(path).expanduser().resolve(strict=False)
+
+
+def _expected_manifest(
+    root: pathlib.Path, unit_dir: pathlib.Path
+) -> dict[str, str]:
+    root = pathlib.Path(root)
+    unit = pathlib.Path(unit_dir) / UNIT_NAME
+    return {
+        "component": COMPONENT,
+        "root": str(_canonical(root)),
+        "unit": str(_canonical(unit)),
+        "config": str(_canonical(root / "config.json")),
+        "python": str(_canonical(root / ".venv" / "bin" / "python")),
+    }
+
+
+def _validate_manifest(payload: object, expected: dict[str, str]) -> dict:
+    if not isinstance(payload, dict):
+        raise OwnershipError("server manifest is not a JSON object")
+    if payload.get("component") != COMPONENT:
+        raise OwnershipError("server manifest has the wrong component owner")
+    for key in ("root", "unit", "config", "python"):
+        recorded = payload.get(key)
+        if not isinstance(recorded, str):
+            raise OwnershipError(f"server manifest is missing {key!r}")
+        if _canonical(pathlib.Path(recorded)) != _canonical(
+            pathlib.Path(expected[key])
+        ):
+            raise OwnershipError(
+                f"server manifest path {key!r} is outside the expected user target"
+            )
+    return dict(payload)
+
+
+def _load_manifest(
+    root: pathlib.Path,
+    expected: dict[str, str],
+    *,
+    missing_ok: bool,
+) -> dict | None:
+    path = manifest_path(root)
+    if not os.path.lexists(path):
+        if missing_ok:
+            return None
+        raise OwnershipError(
+            f"cannot establish ownership: server manifest is missing at {path}"
+        )
+    if root.is_symlink() or not root.is_dir() or path.is_symlink() or not path.is_file():
+        raise OwnershipError("server manifest must be a regular owned file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OwnershipError(f"server manifest is corrupt: {exc}") from exc
+    return _validate_manifest(payload, expected)
+
+
 def read_version(source_root: pathlib.Path) -> str:
     """Version recorded in the checkout, or 'unknown'."""
     path = pathlib.Path(source_root) / "VERSION"
@@ -109,19 +173,36 @@ def _atomic_write(path: pathlib.Path, data: bytes, mode: int = 0o644) -> None:
         raise
 
 
-def _check_root_ownership(root: pathlib.Path) -> dict | None:
+def _atomic_copy(source: pathlib.Path, target: pathlib.Path) -> None:
+    """Copy metadata and contents to a sibling, then publish atomically."""
+    handle, name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f".{target.name}."
+    )
+    os.close(handle)
+    temporary = pathlib.Path(name)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        if os.path.lexists(temporary):
+            temporary.unlink()
+
+
+def _check_root_ownership(
+    root: pathlib.Path, unit_dir: pathlib.Path
+) -> dict | None:
     """Return the owned manifest, or raise when the root is not ours."""
+    expected = _expected_manifest(root, unit_dir)
     if not os.path.lexists(root):
+        unit = pathlib.Path(expected["unit"])
+        if os.path.lexists(unit):
+            raise OwnershipError(
+                f"refusing to overwrite unowned service unit at {unit}"
+            )
         return None
     if root.is_symlink() or not root.is_dir():
         raise OwnershipError(f"refusing to replace non-directory install root {root}")
-    manifest = read_manifest(root)
-    if manifest is None:
-        raise OwnershipError(
-            f"refusing to write into {root}: it exists without a valid "
-            f"{MANIFEST_NAME}. Move it aside, then install again."
-        )
-    return manifest
+    return _load_manifest(root, expected, missing_ok=False)
 
 
 def _stage_runtime(source_root: pathlib.Path, staging: pathlib.Path) -> None:
@@ -141,14 +222,83 @@ def _copy_preserved(source: pathlib.Path, target: pathlib.Path) -> None:
         shutil.copy2(source, target)
 
 
-def publish_runtime(source_root: pathlib.Path, root: pathlib.Path) -> bool:
+@dataclass(frozen=True)
+class _PathSnapshot:
+    kind: str
+    data: bytes | str | None = None
+    mode: int = 0
+
+
+def _snapshot_path(path: pathlib.Path) -> _PathSnapshot:
+    if path.is_symlink():
+        return _PathSnapshot("symlink", os.readlink(path))
+    if path.is_file():
+        return _PathSnapshot(
+            "file", path.read_bytes(), path.stat().st_mode & 0o7777
+        )
+    if path.exists():
+        raise OwnershipError(f"owned unit path became a directory: {path}")
+    return _PathSnapshot("missing")
+
+
+def _restore_path(path: pathlib.Path, snapshot: _PathSnapshot) -> None:
+    if os.path.lexists(path):
+        if path.is_dir() and not path.is_symlink():
+            raise InstallError(f"cannot restore file snapshot over directory {path}")
+        path.unlink()
+    if snapshot.kind == "missing":
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if snapshot.kind == "symlink":
+        path.symlink_to(str(snapshot.data))
+    else:
+        _atomic_write(path, bytes(snapshot.data), snapshot.mode)
+
+
+def _ensure_directory(path: pathlib.Path, created: list[pathlib.Path]) -> None:
+    missing: list[pathlib.Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor == cursor.parent:
+            break
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=True)
+    created.extend(reversed(missing))
+
+
+def _remove_empty_directories(created: list[pathlib.Path]) -> None:
+    for path in sorted(set(created), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def _reserve_sibling(parent: pathlib.Path, prefix: str) -> pathlib.Path:
+    path = pathlib.Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    path.rmdir()
+    return path
+
+
+def publish_runtime(
+    source_root: pathlib.Path,
+    root: pathlib.Path,
+    *,
+    unit_dir: pathlib.Path | None = None,
+) -> bool:
     """Stage the runtime and swap it in, preserving the venv and config.
 
     Returns True when an existing owned install was upgraded.
     """
     source_root = pathlib.Path(source_root)
     root = pathlib.Path(root)
-    existing = _check_root_ownership(root)
+    unit_dir = systemd_user_dir() if unit_dir is None else pathlib.Path(unit_dir)
+    existing = _check_root_ownership(root, unit_dir)
+    manifest = {
+        **_expected_manifest(root, unit_dir),
+        "version": read_version(source_root),
+    }
     root.parent.mkdir(parents=True, exist_ok=True)
     staging = pathlib.Path(
         tempfile.mkdtemp(prefix=".free-tts-server-stage-", dir=root.parent)
@@ -160,7 +310,12 @@ def publish_runtime(source_root: pathlib.Path, root: pathlib.Path) -> bool:
         if existing is not None:
             for name in PRESERVED:
                 _copy_preserved(root / name, staging / name)
-            _copy_preserved(manifest_path(root), manifest_path(staging))
+        _atomic_write(
+            manifest_path(staging),
+            json.dumps(manifest, indent=2).encode("utf-8"),
+            0o644,
+        )
+        if existing is not None:
             rollback = pathlib.Path(
                 tempfile.mkdtemp(prefix=".free-tts-server-rollback-", dir=root.parent)
             )
@@ -195,12 +350,10 @@ def publish_runtime(source_root: pathlib.Path, root: pathlib.Path) -> bool:
     return existing is not None
 
 
-UNIT_NAME = "free-tts.service"
-
 UNIT_TEMPLATE = """\
 # free-tts server. Managed by `python install.py install server`.
 #
-# Keep `idle_timeout` at 0 in {root}/config.json: the server arms its
+# Keep `idle_timeout` at 0 in config.json: the server arms its
 # idle-shutdown watchdog only when TTS_IDLE_TIMEOUT > 0, and a persistent
 # service must never exit on its own.
 [Unit]
@@ -209,8 +362,8 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={python} {server}
-WorkingDirectory={root}
+ExecStart=:/usr/bin/env -- {python} {server}
+WorkingDirectory={working_directory}
 Restart=on-failure
 RestartSec=2
 
@@ -223,14 +376,36 @@ def bootstrap_config(root: pathlib.Path) -> bool:
     """Seed config.json from the example. True when it created the file."""
     root = pathlib.Path(root)
     config = root / "config.json"
-    if config.exists():
+    if os.path.lexists(config):
         return False
     example = root / "config.example.json"
     if not example.is_file():
         raise InstallError(f"missing config template: {example}")
-    shutil.copy2(example, config)
+    _atomic_copy(example, config)
     logger.info("Wrote default config to %s", config)
     return True
+
+
+def _systemd_quote(path: pathlib.Path) -> str:
+    """Quote one systemd value and neutralize unit specifier expansion."""
+    value = str(path)
+    if any(character in value for character in ("\0", "\n", "\r")):
+        raise InstallError("systemd paths cannot contain NUL or line breaks")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
+def _systemd_path_value(path: pathlib.Path) -> str:
+    """Escape a path for a systemd directive that does not accept quoting."""
+    value = str(path)
+    if any(character in value for character in ("\0", "\n", "\r")):
+        raise InstallError("systemd paths cannot contain NUL or line breaks")
+    return (
+        value.replace("\\", "\\\\")
+        .replace(" ", "\\x20")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+    )
 
 
 def render_unit(
@@ -242,7 +417,9 @@ def render_unit(
         root / ".venv" / "bin" / "python" if python is None else pathlib.Path(python)
     )
     return UNIT_TEMPLATE.format(
-        python=interpreter, server=root / "server.py", root=root
+        python=_systemd_quote(interpreter),
+        server=_systemd_quote(root / "server.py"),
+        working_directory=_systemd_path_value(root),
     )
 
 
@@ -274,6 +451,99 @@ def default_systemctl(
         capture_output=True,
         text=True,
     )
+
+
+def _systemctl_error(
+    runner: Callable[..., object], args: list[str]
+) -> str | None:
+    """Run one systemctl action and return an actionable failure, if any."""
+    try:
+        result = runner(args, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"systemctl --user {' '.join(args)} could not run: {exc}"
+    returncode = getattr(result, "returncode", 0)
+    if returncode == 0:
+        return None
+    detail = str(
+        getattr(result, "stderr", "")
+        or getattr(result, "stdout", "")
+        or "no diagnostic output"
+    ).strip()
+    return (
+        f"systemctl --user {' '.join(args)} failed with status "
+        f"{returncode}: {detail}"
+    )
+
+
+def _run_systemctl(runner: Callable[..., object], args: list[str]) -> None:
+    failure = _systemctl_error(runner, args)
+    if failure is not None:
+        raise InstallError(failure)
+
+
+def _query_unit_state(
+    runner: Callable[..., object], command: str, expected: str
+) -> bool:
+    try:
+        result = runner([command, UNIT_NAME], check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallError(
+            f"systemctl --user {command} {UNIT_NAME} could not run: {exc}"
+        ) from exc
+    output = str(getattr(result, "stdout", "") or "").strip()
+    returncode = getattr(result, "returncode", 0)
+    if returncode == 0 and output == expected:
+        return True
+    known_negative = {
+        "is-active": {
+            "activating",
+            "deactivating",
+            "failed",
+            "inactive",
+            "maintenance",
+            "reloading",
+            "unknown",
+        },
+        "is-enabled": {
+            "bad",
+            "disabled",
+            "generated",
+            "indirect",
+            "masked",
+            "masked-runtime",
+            "not-found",
+            "static",
+            "transient",
+        },
+    }
+    if output in known_negative.get(command, set()):
+        return False
+    detail = str(getattr(result, "stderr", "") or output or "no diagnostic output")
+    raise InstallError(
+        f"systemctl --user {command} {UNIT_NAME} failed with status "
+        f"{returncode}: {detail.strip()}"
+    )
+
+
+def _verify_service(
+    runner: Callable[..., object],
+    fetch: Callable[[str, float], object] | None,
+    *,
+    attempts: int,
+    delay: float,
+    sleeper: Callable[[float], None],
+) -> None:
+    """Require both an active unit and the expected health identity."""
+    last_failure = "the unit did not become active"
+    for attempt in range(max(1, attempts)):
+        if _query_unit_state(runner, "is-active", "active"):
+            payload = probe_health(fetch=fetch)
+            if payload is not None and payload.get("service") == "free-tts":
+                return
+            last_failure = "the health endpoint did not identify free-tts"
+        if attempt + 1 < max(1, attempts):
+            sleeper(delay)
+    raise InstallError(f"service verification failed: {last_failure}")
 
 
 def check_python(version: tuple[int, ...] | None = None) -> None:
@@ -319,9 +589,28 @@ def probe_health(
     url = f"http://127.0.0.1:{port}/health"
     try:
         payload = getter(url, _PROBE_TIMEOUT)
-    except (OSError, urllib.error.URLError, ValueError):
+    except (
+        OSError,
+        urllib.error.URLError,
+        ValueError,
+        http.client.HTTPException,
+    ):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _tcp_port_occupied(port: int, timeout: float) -> bool:
+    """Return False only when localhost explicitly refuses the connection."""
+    try:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except ConnectionRefusedError:
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ECONNREFUSED:
+            return False
+        return True
+    connection.close()
+    return True
 
 
 def unit_is_active(systemctl: Callable[..., object] | None = None) -> bool:
@@ -339,13 +628,25 @@ def check_port(
     port: int = DEFAULT_PORT,
     force: bool = False,
     fetch: Callable[[str, float], object] | None = None,
+    occupancy_probe: Callable[[int, float], bool] | None = None,
     systemctl: Callable[..., object] | None = None,
 ) -> str:
     """Classify who owns the server port before we bind it."""
-    payload = probe_health(port, fetch=fetch)
-    if payload is None:
+    probe = occupancy_probe or _tcp_port_occupied
+    try:
+        occupied = probe(port, _PROBE_TIMEOUT)
+    except OSError as exc:
+        if force:
+            return "forced"
+        raise PreflightError(
+            f"could not prove port {port} is free ({exc}); treating it as "
+            "occupied. Pass --force to install anyway."
+        ) from exc
+    if not occupied:
         return "free"
-    if payload.get("service") == "free-tts":
+
+    payload = probe_health(port, fetch=fetch)
+    if payload is not None and payload.get("service") == "free-tts":
         if unit_is_active(systemctl):
             return "ours"
         if force:
@@ -361,6 +662,103 @@ def check_port(
         f"port {port} is already used by another service; free the port or "
         "pass --force to install anyway."
     )
+
+
+def _publish_staged_runtime(
+    staging: pathlib.Path, root: pathlib.Path, *, upgrading: bool
+) -> pathlib.Path | None:
+    rollback: pathlib.Path | None = None
+    if upgrading:
+        rollback = _reserve_sibling(root.parent, ".free-tts-server-rollback-")
+        os.replace(root, rollback)
+    try:
+        os.replace(staging, root)
+    except BaseException:
+        if rollback is not None and os.path.lexists(rollback):
+            try:
+                os.replace(rollback, root)
+            except BaseException as restore_error:
+                raise InstallError(
+                    "runtime publication failed and the previous install could "
+                    f"not be restored; it is kept at {rollback}"
+                ) from restore_error
+        raise
+    return rollback
+
+
+def _rollback_install(
+    *,
+    root: pathlib.Path,
+    rollback: pathlib.Path | None,
+    published: bool,
+    unit_path: pathlib.Path,
+    unit_snapshot: _PathSnapshot,
+    unit_touched: bool,
+    service_touched: bool,
+    runner: Callable[..., object],
+    previous_active: bool,
+    previous_enabled: bool,
+) -> list[str]:
+    """Restore pre-install files and service state, retaining failed data on error."""
+    errors: list[str] = []
+    failed_tree: pathlib.Path | None = None
+
+    if service_touched:
+        failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
+        if failure is not None:
+            errors.append(failure)
+
+    if published and os.path.lexists(root):
+        try:
+            failed_tree = _reserve_sibling(
+                root.parent, ".free-tts-server-failed-"
+            )
+            os.replace(root, failed_tree)
+        except BaseException as exc:
+            errors.append(f"could not move the failed runtime aside: {exc}")
+
+    if rollback is not None and os.path.lexists(rollback):
+        if os.path.lexists(root):
+            errors.append(
+                f"could not restore the previous runtime from {rollback}: "
+                f"the target {root} is still occupied"
+            )
+        else:
+            try:
+                os.replace(rollback, root)
+            except BaseException as exc:
+                errors.append(
+                    f"could not restore the previous runtime from {rollback}: {exc}"
+                )
+
+    if unit_touched:
+        try:
+            _restore_path(unit_path, unit_snapshot)
+        except BaseException as exc:
+            errors.append(f"could not restore service unit {unit_path}: {exc}")
+
+    if service_touched:
+        failure = _systemctl_error(runner, ["daemon-reload"])
+        if failure is not None:
+            errors.append(failure)
+        if previous_enabled:
+            failure = _systemctl_error(runner, ["enable", UNIT_NAME])
+            if failure is not None:
+                errors.append(failure)
+        if previous_active:
+            failure = _systemctl_error(runner, ["restart", UNIT_NAME])
+            if failure is not None:
+                errors.append(failure)
+
+    if failed_tree is not None and os.path.lexists(failed_tree):
+        if errors:
+            errors.append(f"failed runtime retained at {failed_tree}")
+        else:
+            try:
+                shutil.rmtree(failed_tree)
+            except OSError as exc:
+                errors.append(f"could not remove failed runtime {failed_tree}: {exc}")
+    return errors
 
 
 def default_venv_builder(root: pathlib.Path) -> None:
@@ -387,10 +785,14 @@ def install_server(
     venv_builder: Callable[[pathlib.Path], None] | None = None,
     systemctl: Callable[..., object] | None = None,
     fetch: Callable[[str, float], object] | None = None,
+    occupancy_probe: Callable[[int, float], bool] | None = None,
     force: bool = False,
     preflight: Callable[[], None] | None = None,
+    verify_attempts: int = 10,
+    verify_delay: float = 0.5,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> dict:
-    """Install or refresh the server plus its systemd user service."""
+    """Transactionally install or refresh the server and its user service."""
     source_root = checkout_root() if source_root is None else pathlib.Path(source_root)
     root = server_root() if root is None else pathlib.Path(root)
     unit_dir = systemd_user_dir() if unit_dir is None else pathlib.Path(unit_dir)
@@ -400,31 +802,114 @@ def install_server(
     def _default_preflight() -> None:
         check_python()
         check_systemd(systemctl=runner)
-        check_port(force=force, fetch=fetch, systemctl=runner)
+        check_port(
+            force=force,
+            fetch=fetch,
+            occupancy_probe=occupancy_probe,
+            systemctl=runner,
+        )
 
     (preflight or _default_preflight)()
 
-    publish_runtime(source_root, root)
-    if not (root / ".venv").exists():
-        build_venv(root)
-    bootstrap_config(root)
-    unit_path = write_unit(render_unit(root), unit_dir)
+    expected = _expected_manifest(root, unit_dir)
+    existing = _check_root_ownership(root, unit_dir)
+    upgrading = existing is not None
+    unit_path = pathlib.Path(expected["unit"])
+    if upgrading and os.path.lexists(unit_path):
+        if unit_path.is_symlink() or not unit_path.is_file():
+            raise OwnershipError(
+                f"owned service unit must be a regular non-symlink file: {unit_path}"
+            )
+    unit_snapshot = _snapshot_path(unit_path)
+    previous_active = (
+        _query_unit_state(runner, "is-active", "active") if upgrading else False
+    )
+    previous_enabled = (
+        _query_unit_state(runner, "is-enabled", "enabled") if upgrading else False
+    )
     manifest = {
-        "component": COMPONENT,
-        "root": str(root),
-        "unit": str(unit_path),
-        "config": str(root / "config.json"),
-        "python": str(root / ".venv" / "bin" / "python"),
+        **expected,
         "version": read_version(source_root),
     }
-    _atomic_write(
-        manifest_path(root),
-        json.dumps(manifest, indent=2).encode("utf-8"),
-        0o644,
-    )
-    runner(["daemon-reload"])
-    runner(["enable", UNIT_NAME])
-    runner(["restart", UNIT_NAME])
+    _validate_manifest(manifest, expected)
+    unit_text = render_unit(root)
+    created_directories: list[pathlib.Path] = []
+    staging: pathlib.Path | None = None
+    rollback: pathlib.Path | None = None
+    published = False
+    unit_touched = False
+    service_touched = False
+
+    try:
+        _ensure_directory(root.parent, created_directories)
+        staging = pathlib.Path(
+            tempfile.mkdtemp(prefix=".free-tts-server-stage-", dir=root.parent)
+        )
+        _stage_runtime(source_root, staging)
+        if upgrading:
+            for name in PRESERVED:
+                _copy_preserved(root / name, staging / name)
+        bootstrap_config(staging)
+        _atomic_write(
+            manifest_path(staging),
+            json.dumps(manifest, indent=2).encode("utf-8"),
+            0o644,
+        )
+
+        rollback = _publish_staged_runtime(staging, root, upgrading=upgrading)
+        published = True
+        if not (root / ".venv").exists():
+            build_venv(root)
+
+        _ensure_directory(unit_dir, created_directories)
+        written_unit = write_unit(unit_text, unit_dir)
+        if _canonical(written_unit) != _canonical(unit_path):
+            raise InstallError(
+                f"service unit was written outside the expected target: {written_unit}"
+            )
+        unit_touched = True
+        service_touched = True
+        _run_systemctl(runner, ["daemon-reload"])
+        _run_systemctl(runner, ["enable", UNIT_NAME])
+        _run_systemctl(runner, ["restart", UNIT_NAME])
+        _verify_service(
+            runner,
+            fetch,
+            attempts=verify_attempts,
+            delay=verify_delay,
+            sleeper=sleeper,
+        )
+    except BaseException as exc:
+        rollback_errors = _rollback_install(
+            root=root,
+            rollback=rollback,
+            published=published,
+            unit_path=unit_path,
+            unit_snapshot=unit_snapshot,
+            unit_touched=unit_touched,
+            service_touched=service_touched,
+            runner=runner,
+            previous_active=previous_active,
+            previous_enabled=previous_enabled,
+        )
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        _remove_empty_directories(created_directories)
+        if rollback_errors:
+            details = "\n- ".join(rollback_errors)
+            raise InstallError(
+                f"install failed ({exc}) and rollback was incomplete:\n- {details}"
+            ) from exc
+        raise
+    finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+    if rollback is not None and os.path.lexists(rollback):
+        try:
+            shutil.rmtree(rollback)
+        except OSError as exc:
+            logger.warning("Could not remove retained rollback tree %s: %s", rollback, exc)
     logger.info("Installed free-tts server into %s", root)
     return manifest
 
@@ -441,23 +926,51 @@ def uninstall_server(
     runner = systemctl or default_systemctl
     removed: list[str] = []
 
-    unit_path = unit_dir / UNIT_NAME
-    if os.path.lexists(unit_path):
-        runner(["disable", "--now", UNIT_NAME], check=False)
-        unit_path.unlink()
-        removed.append(str(unit_path))
-        runner(["daemon-reload"], check=False)
-
-    if not os.path.lexists(root):
-        return removed
-    if read_manifest(root) is None:
+    expected = _expected_manifest(root, unit_dir)
+    owned = _load_manifest(root, expected, missing_ok=True)
+    if owned is None:
         logger.warning(
-            "No valid %s at %s; leaving the directory untouched.",
+            "No valid %s at %s; leaving all paths unchanged.",
             MANIFEST_NAME,
             root,
         )
         return removed
-    shutil.rmtree(root)
+
+    unit_path = pathlib.Path(owned["unit"])
+    if os.path.lexists(unit_path):
+        if unit_path.is_symlink() or not unit_path.is_file():
+            raise OwnershipError(
+                f"owned service unit must be a regular non-symlink file: {unit_path}"
+            )
+        failure = _systemctl_error(
+            runner, ["disable", "--now", UNIT_NAME]
+        )
+        if failure is not None:
+            raise InstallError(f"server uninstall failed:\n- {failure}")
+        try:
+            unit_path.unlink()
+        except OSError as exc:
+            raise InstallError(
+                f"server uninstall failed:\n- could not remove {unit_path}: {exc}"
+            ) from exc
+        removed.append(str(unit_path))
+    elif _query_unit_state(runner, "is-active", "active"):
+        failure = _systemctl_error(
+            runner, ["disable", "--now", UNIT_NAME]
+        )
+        if failure is not None:
+            raise InstallError(f"server uninstall failed:\n- {failure}")
+
+    failure = _systemctl_error(runner, ["daemon-reload"])
+    if failure is not None:
+        raise InstallError(f"server uninstall failed:\n- {failure}")
+
+    try:
+        shutil.rmtree(root)
+    except OSError as exc:
+        raise InstallError(
+            f"server uninstall failed:\n- could not remove {root}: {exc}"
+        ) from exc
     removed.append(str(root))
     return removed
 
