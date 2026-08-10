@@ -9,5 +9,6 @@ build/
 .venv/
 venv/
 .venv-dev/
+.worktrees/
 config.json
 insight-china-full.mp3
