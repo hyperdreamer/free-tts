@@ -187,3 +187,63 @@ def publish_runtime(source_root: pathlib.Path, root: pathlib.Path) -> bool:
             shutil.rmtree(rollback, ignore_errors=True)
     logger.info("Published server runtime into %s", root)
     return existing is not None
+
+
+UNIT_NAME = "free-tts.service"
+
+UNIT_TEMPLATE = """\
+# free-tts server. Managed by `python install.py install server`.
+#
+# Keep `idle_timeout` at 0 in {root}/config.json: the server arms its
+# idle-shutdown watchdog only when TTS_IDLE_TIMEOUT > 0, and a persistent
+# service must never exit on its own.
+[Unit]
+Description=free-tts local TTS server (edge-tts)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={python} {server}
+WorkingDirectory={root}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def bootstrap_config(root: pathlib.Path) -> bool:
+    """Seed config.json from the example. True when it created the file."""
+    root = pathlib.Path(root)
+    config = root / "config.json"
+    if config.exists():
+        return False
+    example = root / "config.example.json"
+    if not example.is_file():
+        raise InstallError(f"missing config template: {example}")
+    shutil.copy2(example, config)
+    logger.info("Wrote default config to %s", config)
+    return True
+
+
+def render_unit(
+    root: pathlib.Path, python: pathlib.Path | str | None = None
+) -> str:
+    """Render the systemd user unit for an install root."""
+    root = pathlib.Path(root)
+    interpreter = (
+        root / ".venv" / "bin" / "python" if python is None else pathlib.Path(python)
+    )
+    return UNIT_TEMPLATE.format(
+        python=interpreter, server=root / "server.py", root=root
+    )
+
+
+def write_unit(text: str, unit_dir: pathlib.Path) -> pathlib.Path:
+    """Atomically install the unit file and return its path."""
+    unit_dir = pathlib.Path(unit_dir)
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    path = unit_dir / UNIT_NAME
+    _atomic_write(path, text.encode("utf-8"), 0o644)
+    return path

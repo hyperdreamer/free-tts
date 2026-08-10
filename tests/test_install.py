@@ -144,3 +144,55 @@ def test_read_version_falls_back_when_missing(tmp_path, checkout):
     bare = tmp_path / "bare"
     bare.mkdir()
     assert install.read_version(bare) == "unknown"
+
+
+def test_bootstrap_config_copies_example_once(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "config.example.json").write_text('{"port": 5000}\n')
+
+    assert install.bootstrap_config(root) is True
+    assert (root / "config.json").read_text() == '{"port": 5000}\n'
+
+    (root / "config.json").write_text('{"port": 6000}\n')
+    assert install.bootstrap_config(root) is False
+    assert (root / "config.json").read_text() == '{"port": 6000}\n'
+
+
+def test_bootstrap_config_requires_example(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+
+    with pytest.raises(install.InstallError):
+        install.bootstrap_config(root)
+
+
+def test_render_unit_embeds_paths_and_idle_warning(tmp_path):
+    root = tmp_path / "share" / "free-tts-server"
+
+    text = install.render_unit(root)
+
+    assert f"ExecStart={root / '.venv' / 'bin' / 'python'} {root / 'server.py'}" in text
+    assert f"WorkingDirectory={root}" in text
+    assert "Restart=on-failure" in text
+    assert "WantedBy=default.target" in text
+    assert "idle_timeout" in text
+    assert "Environment=TTS_CONFIG" not in text
+
+
+def test_render_unit_accepts_explicit_python(tmp_path):
+    text = install.render_unit(tmp_path / "root", python="/usr/bin/python3")
+
+    assert "ExecStart=/usr/bin/python3 " in text
+
+
+def test_write_unit_creates_then_overwrites(tmp_path):
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+
+    path = install.write_unit("[Unit]\nDescription=one\n", unit_dir)
+    assert path == unit_dir / install.UNIT_NAME
+    assert path.read_text() == "[Unit]\nDescription=one\n"
+
+    install.write_unit("[Unit]\nDescription=two\n", unit_dir)
+    assert path.read_text() == "[Unit]\nDescription=two\n"
+    assert sorted(p.name for p in unit_dir.iterdir()) == [install.UNIT_NAME]
