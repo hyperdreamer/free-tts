@@ -1,6 +1,10 @@
 """
 edge-tts SSML Server
 ====================
+
+Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+See the LICENSE file at the repository root for the full license text.
+
 A production-ready Flask server that accepts SSML input, extracts voice/rate/pitch
 parameters, generates speech via Microsoft Edge TTS, and returns the audio as MP3.
 

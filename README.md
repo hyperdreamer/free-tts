@@ -1,5 +1,7 @@
 # free-tts
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Browser-based SSML text-to-speech generator powered by Microsoft Edge TTS.
 
 paste SSML or use the visual **Text Input** builder to pick a voice, set speed/pitch, and generate speech. Uses [edge-tts](https://github.com/rany2/edge-tts) which communicates with Microsoft's online TTS service — your text is sent over the network. No API key required.
@@ -166,6 +168,11 @@ FLASK_DEBUG=1 python server.py
 ## Dependencies
 
 - Python ≥ 3.11
-- [edge-tts](https://github.com/rany2/edge-tts) — Microsoft Edge TTS client
+- [edge-tts](https://github.com/rany2/edge-tts) — Microsoft Edge TTS client (LGPLv3)
 - Flask + flask-cors — HTTP API
 - Waitress — production WSGI server
+
+## License
+
+[GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0) (AGPL-3.0).
+See the [LICENSE](LICENSE) file for the full license text.
