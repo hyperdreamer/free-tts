@@ -1564,7 +1564,7 @@ def test_uninstall_server_rejects_symlinked_root_before_mutation(tmp_path):
 
 
 def test_uninstall_server_disable_failure_keeps_runtime_and_unit_for_retry(
-    checkout, tmp_path
+    checkout, tmp_path, monkeypatch
 ):
     _install_server(checkout, tmp_path)
     root = tmp_path / "share" / "free-tts-server"
@@ -1573,6 +1573,7 @@ def test_uninstall_server_disable_failure_keeps_runtime_and_unit_for_retry(
     before_root = snapshot_tree(root)
     before_unit = unit.read_bytes()
     runner = StatefulSystemctl(active=True, enabled=True, fail_once="disable")
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
 
     with pytest.raises(install.InstallError, match="disable --now.*status 7"):
         install.uninstall_server(
@@ -1587,7 +1588,7 @@ def test_uninstall_server_disable_failure_keeps_runtime_and_unit_for_retry(
     assert runner.enabled is True
     assert runner.calls == [
         ["disable", "--now", "free-tts.service"],
-        ["is-active", "free-tts.service"],
+        *([["is-active", "free-tts.service"]] * 10),
     ]
 
     removed = install.uninstall_server(
@@ -1648,6 +1649,7 @@ def test_main_uninstall_server_returns_one_on_systemctl_failure(
     monkeypatch.setattr(install, "server_root", lambda: root)
     monkeypatch.setattr(install, "systemd_user_dir", lambda: unit_dir)
     monkeypatch.setattr(install, "default_systemctl", runner)
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
 
     code = install.main(["uninstall", "server"])
 
@@ -1760,8 +1762,59 @@ class DisableLeavesActiveSystemctl(StatefulSystemctl):
         return super().__call__(args, check=check)
 
 
+class DisableActivitySequenceSystemctl:
+    """Disable removes the wants link, then reports a scripted activity sequence."""
+
+    def __init__(
+        self,
+        link,
+        states,
+        *,
+        disable_returncode=0,
+        reset_returncode=0,
+        replacement=None,
+    ):
+        self.link = link
+        self.states = list(states)
+        self.last_state = self.states[-1]
+        self.disable_returncode = disable_returncode
+        self.reset_returncode = reset_returncode
+        self.replacement = replacement
+        self.calls = []
+
+    def __call__(self, args, check=True):
+        args = list(args)
+        self.calls.append(args)
+        if args[0] == "disable":
+            if os.path.lexists(self.link):
+                self.link.unlink()
+            if self.replacement == "file":
+                self.link.write_text("foreign replacement\n")
+            return FakeCompleted(
+                returncode=self.disable_returncode,
+                stderr="disable failed" if self.disable_returncode else "",
+            )
+        if args[0] == "is-active":
+            state = self.states.pop(0) if self.states else self.last_state
+            return FakeCompleted(
+                returncode=0 if state == "active" else 3,
+                stdout=f"{state}\n",
+            )
+        if args[0] == "reset-failed":
+            return FakeCompleted(
+                returncode=self.reset_returncode,
+                stderr="reset failed" if self.reset_returncode else "",
+            )
+        return FakeCompleted()
+
+
+def assert_owned_enablement_restored(link, target):
+    assert link.is_symlink()
+    assert os.readlink(link) == target
+
+
 def test_uninstall_rejects_successful_disable_when_unit_stays_active(
-    checkout, tmp_path
+    checkout, tmp_path, monkeypatch
 ):
     _install_server(checkout, tmp_path)
     root = tmp_path / "share" / "free-tts-server"
@@ -1772,8 +1825,9 @@ def test_uninstall_rejects_successful_disable_when_unit_stays_active(
     before_unit = unit.read_bytes()
     previous_target = os.readlink(link)
     runner = DisableLeavesActiveSystemctl()
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
 
-    with pytest.raises(install.InstallError, match="still active"):
+    with pytest.raises(install.InstallError, match="did not become inactive"):
         install.uninstall_server(
             root=root, unit_dir=unit_dir, systemctl=runner
         )
@@ -1784,7 +1838,7 @@ def test_uninstall_rejects_successful_disable_when_unit_stays_active(
     assert os.readlink(link) == previous_target
     assert runner.calls == [
         ["disable", "--now", install.UNIT_NAME],
-        ["is-active", install.UNIT_NAME],
+        *([["is-active", install.UNIT_NAME]] * 10),
     ]
 
 
@@ -1874,6 +1928,164 @@ def test_uninstall_rejects_foreign_enablement_before_mutation(
     assert unit.read_bytes() == before_unit
     assert os.path.lexists(link)
     assert runner.calls == []
+
+
+@pytest.mark.parametrize("state", ("active", "activating", "reloading", "deactivating"))
+def test_uninstall_noninactive_state_restores_enablement_and_keeps_files(
+    state, checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    target = os.readlink(link)
+    before_root = snapshot_tree(root)
+    before_unit = unit.read_bytes()
+    runner = DisableActivitySequenceSystemctl(link, [state, state])
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    with pytest.raises(install.InstallError, match="did not become inactive"):
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert snapshot_tree(root) == before_root
+    assert unit.read_bytes() == before_unit
+    assert_owned_enablement_restored(link, target)
+
+
+def test_uninstall_waits_from_deactivating_to_inactive(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    sleeps = []
+    runner = DisableActivitySequenceSystemctl(link, ["deactivating", "inactive"])
+    monkeypatch.setattr(install.time, "sleep", sleeps.append)
+
+    removed = install.uninstall_server(
+        root=root,
+        unit_dir=unit_dir,
+        systemctl=runner,
+    )
+
+    assert sleeps == [0.2]
+    assert not os.path.lexists(link)
+    assert not unit.exists()
+    assert not root.exists()
+    assert str(unit) in removed and str(root) in removed
+
+
+def test_uninstall_resets_failed_state_before_cleanup(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    link = write_enablement_link(unit_dir)
+    runner = DisableActivitySequenceSystemctl(link, ["failed", "inactive"])
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    install.uninstall_server(
+        root=root,
+        unit_dir=unit_dir,
+        systemctl=runner,
+    )
+
+    assert ["reset-failed", install.UNIT_NAME] in runner.calls
+    assert not root.exists()
+
+
+def test_uninstall_reset_failure_restores_enablement(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    target = os.readlink(link)
+    runner = DisableActivitySequenceSystemctl(
+        link, ["failed"], reset_returncode=7
+    )
+
+    with pytest.raises(install.InstallError, match="reset-failed"):
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert root.is_dir() and unit.is_file()
+    assert_owned_enablement_restored(link, target)
+
+
+def test_uninstall_compensation_retains_foreign_replacement(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = DisableActivitySequenceSystemctl(
+        link, ["active"], replacement="file"
+    )
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert link.read_text() == "foreign replacement\n"
+    assert "could not restore service enablement" in str(excinfo.value)
+    assert root.is_dir() and unit.is_file()
+
+
+def test_uninstall_failed_stop_preserves_absent_enablement(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = install._enablement_path(unit_dir)
+    assert not os.path.lexists(link)
+    runner = DisableActivitySequenceSystemctl(link, ["deactivating"])
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    with pytest.raises(install.InstallError):
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert not os.path.lexists(link)
+    assert root.is_dir() and unit.is_file()
+
+
+def test_uninstall_unknown_activity_restores_enablement(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    target = os.readlink(link)
+    runner = DisableActivitySequenceSystemctl(link, ["unknown"])
+
+    with pytest.raises(install.InstallError, match="unrecognized state"):
+        install.uninstall_server(root=root, unit_dir=unit_dir, systemctl=runner)
+
+    assert_owned_enablement_restored(link, target)
+    assert root.is_dir() and unit.is_file()
 
 
 def test_uninstall_partial_root_delete_restores_manifest_and_retries(

@@ -611,6 +611,62 @@ def _query_unit_state(
     )
 
 
+_UNIT_ACTIVITY_STATES = frozenset(
+    {
+        "active",
+        "activating",
+        "deactivating",
+        "failed",
+        "inactive",
+        "maintenance",
+        "reloading",
+        "unknown",
+    }
+)
+
+
+def _query_unit_active_state(runner: Callable[..., object]) -> str:
+    args = ["is-active", UNIT_NAME]
+    try:
+        result = runner(args, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallError(
+            f"systemctl --user is-active {UNIT_NAME} could not run: {exc}"
+        ) from exc
+    state = str(getattr(result, "stdout", "") or "").strip()
+    if state not in _UNIT_ACTIVITY_STATES or state == "unknown":
+        detail = str(getattr(result, "stderr", "") or state or "no diagnostic output")
+        raise InstallError(
+            f"systemctl --user is-active {UNIT_NAME} returned unrecognized state: "
+            f"{detail.strip()}"
+        )
+    return state
+
+
+def _wait_for_unit_inactive(
+    runner: Callable[..., object],
+    *,
+    attempts: int,
+    delay: float,
+    sleeper: Callable[[float], None],
+) -> tuple[str, ...]:
+    history = []
+    reset_attempted = False
+    for attempt in range(max(1, attempts)):
+        state = _query_unit_active_state(runner)
+        history.append(state)
+        if state == "inactive":
+            return tuple(history)
+        if state == "failed" and not reset_attempted:
+            _run_systemctl(runner, ["reset-failed", UNIT_NAME])
+            reset_attempted = True
+        if attempt + 1 < max(1, attempts):
+            sleeper(delay)
+    raise InstallError(
+        f"{UNIT_NAME} did not become inactive; observed: {', '.join(history)}"
+    )
+
+
 _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
 
 
@@ -1148,6 +1204,17 @@ def _validate_enablement_link(
     return True
 
 
+def _restore_enablement_after_failed_disable(
+    path: pathlib.Path,
+    unit_path: pathlib.Path,
+    snapshot: _PathSnapshot,
+) -> None:
+    # Absence is safe. Any present path must still be our validated link;
+    # foreign replacements are retained and reported by validation.
+    _validate_enablement_link(path, unit_path)
+    _restore_path(path, snapshot)
+
+
 def _remove_owned_root(root: pathlib.Path, manifest: dict) -> None:
     """Delete a validated install root, restoring ownership on partial failure.
 
@@ -1195,8 +1262,16 @@ def uninstall_server(
     root: pathlib.Path | None = None,
     unit_dir: pathlib.Path | None = None,
     systemctl: Callable[..., object] | None = None,
+    stop_attempts: int = 10,
+    stop_delay: float = 0.2,
+    sleeper: Callable[[float], None] | None = None,
 ) -> list[str]:
-    """Remove the service and the server root. Returns removed paths."""
+    """Remove the service and the server root. Returns removed paths.
+
+    The unit must reach the exact `inactive` state after `disable --now`;
+    transitional and failed states are retried, and enablement ownership is
+    restored before anything else is removed when the stop cannot be proven.
+    """
     root = server_root() if root is None else pathlib.Path(root)
     unit_dir = systemd_user_dir() if unit_dir is None else pathlib.Path(unit_dir)
     runner = systemctl or default_systemctl
@@ -1220,13 +1295,36 @@ def uninstall_server(
             )
     enablement = _enablement_path(unit_dir)
     _validate_enablement_link(enablement, unit_path)
+    enablement_snapshot = _snapshot_path(enablement)
+    stop_sleeper = time.sleep if sleeper is None else sleeper
 
-    failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
-    if _query_unit_state(runner, "is-active", "active"):
-        detail = f"{UNIT_NAME} is still active"
-        if failure is not None:
-            detail = f"{detail}\n- {failure}"
-        raise InstallError(f"server uninstall failed:\n- {detail}")
+    disable_failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
+    try:
+        _wait_for_unit_inactive(
+            runner,
+            attempts=stop_attempts,
+            delay=stop_delay,
+            sleeper=stop_sleeper,
+        )
+    except BaseException as stop_error:
+        compensation = None
+        try:
+            _restore_enablement_after_failed_disable(
+                enablement, unit_path, enablement_snapshot
+            )
+        except BaseException as exc:
+            compensation = exc
+        detail = f"server uninstall failed:\n- {stop_error}"
+        if disable_failure is not None:
+            detail += f"\n- {disable_failure}"
+        if compensation is not None:
+            detail += (
+                f"\n- could not restore service enablement {enablement}: "
+                f"{compensation}"
+            )
+        else:
+            detail += "\n- service enablement restored for retry"
+        raise InstallError(detail) from stop_error
 
     if os.path.lexists(enablement):
         # A successful disable normally removes the link itself; only a
@@ -1239,15 +1337,15 @@ def uninstall_server(
             pass
         except OSError as exc:
             detail = f"could not remove {enablement}: {exc}"
-            if failure is not None:
-                detail = f"{detail}\n- {failure}"
+            if disable_failure is not None:
+                detail = f"{detail}\n- {disable_failure}"
             raise InstallError(f"server uninstall failed:\n- {detail}") from exc
         removed.append(str(enablement))
 
-    if failure is not None and os.path.lexists(enablement):
+    if disable_failure is not None and os.path.lexists(enablement):
         raise InstallError(
             "server uninstall failed:\n- "
-            f"{failure}\n- enablement path remains at {enablement}"
+            f"{disable_failure}\n- enablement path remains at {enablement}"
         )
 
     if os.path.lexists(unit_path):
