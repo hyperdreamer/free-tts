@@ -287,3 +287,116 @@ def test_check_port_rejects_unrelated_service():
 
     with pytest.raises(install.PreflightError):
         install.check_port(fetch=fetch, systemctl=fake_systemctl())
+
+
+def _install_server(checkout, tmp_path, *, calls=None, force=False, venv=None):
+    """Install with every side effect injected."""
+    def venv_builder(root):
+        (root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (root / ".venv" / "bin" / "python").write_text("#!/bin/sh\n")
+        if venv is not None:
+            venv.append(root)
+
+    return install.install_server(
+        checkout,
+        root=tmp_path / "share" / "free-tts-server",
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        venv_builder=venv_builder,
+        systemctl=fake_systemctl(calls=calls),
+        preflight=lambda: None,
+        force=force,
+    )
+
+
+def test_install_server_writes_manifest_config_and_unit(checkout, tmp_path):
+    calls = []
+    venv = []
+
+    manifest = _install_server(checkout, tmp_path, calls=calls, venv=venv)
+
+    root = tmp_path / "share" / "free-tts-server"
+    unit = tmp_path / "config" / "systemd" / "user" / install.UNIT_NAME
+    assert manifest["component"] == "server"
+    assert manifest["root"] == str(root)
+    assert manifest["unit"] == str(unit)
+    assert manifest["version"] == "2.1.0"
+    assert install.read_manifest(root) == manifest
+    assert (root / "config.json").exists()
+    assert str(root) in unit.read_text()
+    assert venv == [root]
+    assert ["daemon-reload"] in calls
+    assert ["enable", install.UNIT_NAME] in calls
+    assert ["restart", install.UNIT_NAME] in calls
+
+
+def test_install_server_reinstall_preserves_config_and_venv(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    (root / "config.json").write_text('{"port": 6000}\n')
+    venv = []
+
+    _install_server(checkout, tmp_path, venv=venv)
+
+    assert (root / "config.json").read_text() == '{"port": 6000}\n'
+    assert venv == []
+
+
+def test_install_server_runs_preflight_before_touching_disk(checkout, tmp_path):
+    def preflight():
+        raise install.PreflightError("nope")
+
+    with pytest.raises(install.PreflightError):
+        install.install_server(
+            checkout,
+            root=tmp_path / "share" / "free-tts-server",
+            unit_dir=tmp_path / "config" / "systemd" / "user",
+            venv_builder=lambda root: None,
+            systemctl=fake_systemctl(),
+            preflight=preflight,
+        )
+
+    assert not (tmp_path / "share").exists()
+
+
+def test_uninstall_server_removes_unit_and_root(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    calls = []
+
+    removed = install.uninstall_server(
+        root=tmp_path / "share" / "free-tts-server",
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        systemctl=fake_systemctl(calls=calls),
+    )
+
+    root = tmp_path / "share" / "free-tts-server"
+    unit = tmp_path / "config" / "systemd" / "user" / install.UNIT_NAME
+    assert str(root) in removed
+    assert str(unit) in removed
+    assert not root.exists()
+    assert not unit.exists()
+    assert ["disable", "--now", install.UNIT_NAME] in calls
+
+
+def test_uninstall_server_is_idempotent(tmp_path):
+    removed = install.uninstall_server(
+        root=tmp_path / "missing",
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        systemctl=fake_systemctl(),
+    )
+
+    assert removed == []
+
+
+def test_uninstall_server_keeps_unowned_root(tmp_path):
+    root = tmp_path / "share" / "free-tts-server"
+    root.mkdir(parents=True)
+    (root / "important.txt").write_text("not ours\n")
+
+    removed = install.uninstall_server(
+        root=root,
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        systemctl=fake_systemctl(),
+    )
+
+    assert removed == []
+    assert (root / "important.txt").exists()

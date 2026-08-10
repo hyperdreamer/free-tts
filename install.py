@@ -360,3 +360,102 @@ def check_port(
         f"port {port} is already used by another service; free the port or "
         "pass --force to install anyway."
     )
+
+
+def default_venv_builder(root: pathlib.Path) -> None:
+    """Create the private virtualenv and install the server requirements."""
+    venv = pathlib.Path(root) / ".venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    subprocess.run(
+        [
+            str(venv / "bin" / "pip"),
+            "install",
+            "--quiet",
+            "-r",
+            str(pathlib.Path(root) / "requirements.txt"),
+        ],
+        check=True,
+    )
+
+
+def install_server(
+    source_root: pathlib.Path | None = None,
+    *,
+    root: pathlib.Path | None = None,
+    unit_dir: pathlib.Path | None = None,
+    venv_builder: Callable[[pathlib.Path], None] | None = None,
+    systemctl: Callable[..., object] | None = None,
+    fetch: Callable[[str, float], object] | None = None,
+    force: bool = False,
+    preflight: Callable[[], None] | None = None,
+) -> dict:
+    """Install or refresh the server plus its systemd user service."""
+    source_root = checkout_root() if source_root is None else pathlib.Path(source_root)
+    root = server_root() if root is None else pathlib.Path(root)
+    unit_dir = systemd_user_dir() if unit_dir is None else pathlib.Path(unit_dir)
+    build_venv = venv_builder or default_venv_builder
+    runner = systemctl or default_systemctl
+
+    def _default_preflight() -> None:
+        check_python()
+        check_systemd(systemctl=runner)
+        check_port(force=force, fetch=fetch, systemctl=runner)
+
+    (preflight or _default_preflight)()
+
+    publish_runtime(source_root, root)
+    if not (root / ".venv").exists():
+        build_venv(root)
+    bootstrap_config(root)
+    unit_path = write_unit(render_unit(root), unit_dir)
+    manifest = {
+        "component": COMPONENT,
+        "root": str(root),
+        "unit": str(unit_path),
+        "config": str(root / "config.json"),
+        "python": str(root / ".venv" / "bin" / "python"),
+        "version": read_version(source_root),
+    }
+    _atomic_write(
+        manifest_path(root),
+        json.dumps(manifest, indent=2).encode("utf-8"),
+        0o644,
+    )
+    runner(["daemon-reload"])
+    runner(["enable", UNIT_NAME])
+    runner(["restart", UNIT_NAME])
+    logger.info("Installed free-tts server into %s", root)
+    return manifest
+
+
+def uninstall_server(
+    *,
+    root: pathlib.Path | None = None,
+    unit_dir: pathlib.Path | None = None,
+    systemctl: Callable[..., object] | None = None,
+) -> list[str]:
+    """Remove the service and the server root. Returns removed paths."""
+    root = server_root() if root is None else pathlib.Path(root)
+    unit_dir = systemd_user_dir() if unit_dir is None else pathlib.Path(unit_dir)
+    runner = systemctl or default_systemctl
+    removed: list[str] = []
+
+    unit_path = unit_dir / UNIT_NAME
+    if os.path.lexists(unit_path):
+        runner(["disable", "--now", UNIT_NAME], check=False)
+        unit_path.unlink()
+        removed.append(str(unit_path))
+        runner(["daemon-reload"], check=False)
+
+    if not os.path.lexists(root):
+        return removed
+    if read_manifest(root) is None:
+        logger.warning(
+            "No valid %s at %s; leaving the directory untouched.",
+            MANIFEST_NAME,
+            root,
+        )
+        return removed
+    shutil.rmtree(root)
+    removed.append(str(root))
+    return removed
