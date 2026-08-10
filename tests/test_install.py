@@ -1594,6 +1594,18 @@ def test_install_server_upgrade_failure_restores_exact_install_and_retries(
         healthy_fetch,
     )
     (root / "config.json").write_text('{"port": 6123}\n')
+    unit.write_text(
+        "[Unit]\n"
+        "Description=legacy free-tts server\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/bin/true\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    unit.chmod(0o640)
     before_root = snapshot_tree(root)
     before_unit = (unit.read_bytes(), stat.S_IMODE(unit.stat().st_mode))
     before_enablement = os.readlink(link)
