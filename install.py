@@ -15,7 +15,7 @@ Stdlib-only: the installer runs before any dependency exists.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import argparse
 import contextlib
 import errno
@@ -233,30 +233,42 @@ class _PathSnapshot:
     identity: tuple[int, int] | None = None
 
 
-def _snapshot_path(path: pathlib.Path) -> _PathSnapshot:
-    if path.is_symlink():
-        return _PathSnapshot("symlink", os.readlink(path))
-    if path.is_file():
-        return _PathSnapshot(
-            "file", path.read_bytes(), path.stat().st_mode & 0o7777
+def _observe_unit(path: pathlib.Path) -> _PathSnapshot:
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return _PathSnapshot("missing")
+    except OSError as exc:
+        raise InstallError(f"could not inspect service unit {path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise OwnershipError(
+            f"owned service unit must be a regular non-symlink file: {path}"
         )
-    if path.exists():
-        raise OwnershipError(f"owned unit path became a directory: {path}")
-    return _PathSnapshot("missing")
+    try:
+        data = path.read_bytes()
+        after = os.lstat(path)
+    except OSError as exc:
+        raise InstallError(f"could not read service unit {path}: {exc}") from exc
+    if _lstat_identity(before) != _lstat_identity(after):
+        raise OwnershipError(f"service unit changed during observation: {path}")
+    return _PathSnapshot(
+        "file",
+        data,
+        stat.S_IMODE(after.st_mode),
+        _lstat_identity(after),
+    )
 
 
-def _restore_file_path(path: pathlib.Path, snapshot: _PathSnapshot) -> None:
-    if os.path.lexists(path):
-        if path.is_dir() and not path.is_symlink():
-            raise InstallError(f"cannot restore file snapshot over directory {path}")
-        path.unlink()
-    if snapshot.kind == "missing":
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if snapshot.kind == "symlink":
-        path.symlink_to(str(snapshot.data))
-    else:
-        _atomic_write(path, bytes(snapshot.data), snapshot.mode)
+def _snapshot_matches(expected: _PathSnapshot, observed: _PathSnapshot) -> bool:
+    if expected.kind != observed.kind:
+        return False
+    if expected.kind == "missing":
+        return True
+    return (
+        expected.data == observed.data
+        and expected.mode == observed.mode
+        and expected.identity == observed.identity
+    )
 
 
 def _ensure_directory(path: pathlib.Path, created: list[pathlib.Path]) -> None:
@@ -427,15 +439,6 @@ def render_unit(
         server=_systemd_quote(root / "server.py"),
         working_directory=_systemd_path_value(root),
     )
-
-
-def write_unit(text: str, unit_dir: pathlib.Path) -> pathlib.Path:
-    """Atomically install the unit file and return its path."""
-    unit_dir = pathlib.Path(unit_dir)
-    unit_dir.mkdir(parents=True, exist_ok=True)
-    path = unit_dir / UNIT_NAME
-    _atomic_write(path, text.encode("utf-8"), 0o644)
-    return path
 
 
 MIN_PYTHON = (3, 11)
@@ -1018,13 +1021,7 @@ def _rollback_install(
     root: pathlib.Path,
     rollback: pathlib.Path | None,
     published: bool,
-    unit_path: pathlib.Path,
-    unit_snapshot: _PathSnapshot,
-    unit_touched: bool,
-    enablement_path: pathlib.Path,
-    enablement_snapshot: _PathSnapshot,
-    enablement_created_identity: tuple[int, int] | None,
-    enablement_touched: bool,
+    artifacts: _SystemdArtifacts,
     service_touched: bool,
     runner: Callable[..., object],
     previous_active: bool,
@@ -1061,24 +1058,7 @@ def _rollback_install(
                     f"could not restore the previous runtime from {rollback}: {exc}"
                 )
 
-    if unit_touched:
-        try:
-            _restore_file_path(unit_path, unit_snapshot)
-        except BaseException as exc:
-            errors.append(f"could not restore service unit {unit_path}: {exc}")
-
-    if enablement_touched:
-        try:
-            _restore_enablement_snapshot(
-                enablement_path,
-                unit_path,
-                enablement_snapshot,
-                created_identity=enablement_created_identity,
-            )
-        except BaseException as exc:
-            errors.append(
-                f"could not restore service enablement {enablement_path}: {exc}"
-            )
+    errors.extend(artifacts.restore())
 
     if service_touched:
         failure = _systemctl_error(runner, ["daemon-reload"])
@@ -1151,18 +1131,10 @@ def install_server(
     existing = _check_root_ownership(root, unit_dir)
     upgrading = existing is not None
     unit_path = pathlib.Path(expected["unit"])
-    if upgrading and os.path.lexists(unit_path):
-        if unit_path.is_symlink() or not unit_path.is_file():
-            raise OwnershipError(
-                f"owned service unit must be a regular non-symlink file: {unit_path}"
-            )
-    unit_snapshot = _snapshot_path(unit_path)
     enablement_path = _enablement_path(unit_dir)
-    enablement_snapshot = _snapshot_enablement(enablement_path, unit_path)
-    if not upgrading and enablement_snapshot.kind != "missing":
-        raise OwnershipError(
-            f"refusing to overwrite unowned enablement path {enablement_path}"
-        )
+    artifacts = _SystemdArtifacts.capture_for_install(
+        unit_path, enablement_path, upgrading
+    )
     previous_active = (
         _query_unit_state(runner, "is-active", "active") if upgrading else False
     )
@@ -1189,9 +1161,6 @@ def install_server(
     staging: pathlib.Path | None = None
     rollback: pathlib.Path | None = None
     published = False
-    unit_touched = False
-    enablement_touched = False
-    enablement_created_identity: tuple[int, int] | None = None
     service_touched = False
 
     try:
@@ -1215,24 +1184,12 @@ def install_server(
         if not (root / ".venv").exists():
             build_venv(root)
 
-        _ensure_directory(unit_dir, created_directories)
-        written_unit = write_unit(unit_text, unit_dir)
-        if _canonical(written_unit) != _canonical(unit_path):
-            raise InstallError(
-                f"service unit was written outside the expected target: {written_unit}"
-            )
-        unit_touched = True
+        artifacts.publish_unit(unit_text)
         service_touched = True
         _run_systemctl(runner, ["daemon-reload"])
-        enablement_touched = True
-        enablement_created_identity = _ensure_enablement(
-            enablement_path,
-            unit_path,
-            enablement_snapshot,
-            created_directories,
-        )
+        artifacts.ensure_enablement()
         _run_systemctl(runner, ["restart", UNIT_NAME])
-        _verify_enablement(enablement_path, unit_path)
+        artifacts.verify_enablement()
         _verify_service(
             runner,
             fetch,
@@ -1246,13 +1203,7 @@ def install_server(
             root=root,
             rollback=rollback,
             published=published,
-            unit_path=unit_path,
-            unit_snapshot=unit_snapshot,
-            unit_touched=unit_touched,
-            enablement_path=enablement_path,
-            enablement_snapshot=enablement_snapshot,
-            enablement_created_identity=enablement_created_identity,
-            enablement_touched=enablement_touched,
+            artifacts=artifacts,
             service_touched=service_touched,
             runner=runner,
             previous_active=previous_active,
@@ -1407,57 +1358,257 @@ def _observe_enablement(path: pathlib.Path) -> _PathSnapshot:
     )
 
 
-def _ensure_enablement(
-    path: pathlib.Path,
-    unit_path: pathlib.Path,
-    snapshot: _PathSnapshot,
-    created_directories: list[pathlib.Path],
-) -> tuple[int, int] | None:
-    """Create the wants link without replacing any entry.
+@dataclass
+class _SystemdArtifacts:
+    unit_path: pathlib.Path
+    enablement_path: pathlib.Path
+    unit_initial: _PathSnapshot
+    enablement_initial: _PathSnapshot
+    unit_expected: _PathSnapshot
+    enablement_expected: _PathSnapshot
+    operation: str
+    unit_touched: bool = False
+    enablement_touched: bool = False
+    created_directories: list[pathlib.Path] = field(default_factory=list)
 
-    The returned identity belongs to a link created by this invocation. None
-    means an exact owned link was already present and was left untouched.
-    """
-    target = _enablement_target(path, unit_path)
-    _ensure_directory(path.parent, created_directories)
-    try:
-        os.symlink(target, path)
-    except FileExistsError as exc:
-        observed = _observe_enablement(path)
-        accepted_targets = {target}
-        if snapshot.kind == "symlink" and isinstance(snapshot.data, str):
-            accepted_targets.add(snapshot.data)
-        if (
-            _snapshot_is_owned_enablement(path, unit_path, observed)
-            and observed.data in accepted_targets
+    @classmethod
+    def capture_for_install(
+        cls,
+        unit_path: pathlib.Path,
+        enablement_path: pathlib.Path,
+        upgrading: bool,
+    ) -> "_SystemdArtifacts":
+        unit_path = pathlib.Path(unit_path)
+        enablement_path = pathlib.Path(enablement_path)
+        unit = _observe_unit(unit_path)
+        enablement = _observe_enablement(enablement_path)
+        if enablement.kind != "missing" and not _snapshot_is_owned_enablement(
+            enablement_path, unit_path, enablement
         ):
-            return None
-        raise OwnershipError(
-            f"refusing to replace service enablement {path}; retained "
-            f"{_describe_enablement(observed)}"
-        ) from exc
-    except OSError as exc:
-        raise InstallError(
-            f"could not create service enablement {path}: {exc}"
-        ) from exc
-
-    observed = _observe_enablement(path)
-    if (
-        observed.data != target
-        or observed.identity is None
-        or not _snapshot_is_owned_enablement(path, unit_path, observed)
-    ):
-        raise InstallError(
-            f"created service enablement could not be verified at {path}; "
-            f"observed {_describe_enablement(observed)}"
+            raise OwnershipError(
+                f"enablement path is foreign: {enablement_path}; retained "
+                f"{_describe_enablement(enablement)}"
+            )
+        if not upgrading and unit.kind != "missing":
+            raise OwnershipError(
+                f"refusing to overwrite unowned service unit at {unit_path}"
+            )
+        if not upgrading and enablement.kind != "missing":
+            raise OwnershipError(
+                f"refusing to overwrite unowned enablement path {enablement_path}"
+            )
+        return cls(
+            unit_path,
+            enablement_path,
+            unit,
+            enablement,
+            unit,
+            enablement,
+            "install",
         )
-    return observed.identity
 
+    def _assert_unit_expected(self) -> None:
+        observed = _observe_unit(self.unit_path)
+        if not _snapshot_matches(self.unit_expected, observed):
+            raise InstallError(
+                f"service unit changed before mutation: {self.unit_path}; retained"
+            )
 
-def _verify_enablement(path: pathlib.Path, unit_path: pathlib.Path) -> None:
-    observed = _snapshot_enablement(path, unit_path)
-    if observed.kind == "missing":
-        raise InstallError(f"service enablement disappeared after restart: {path}")
+    def _assert_enablement_expected(self) -> None:
+        observed = _observe_enablement(self.enablement_path)
+        if not _snapshot_matches(self.enablement_expected, observed):
+            raise InstallError(
+                f"service enablement changed before mutation: "
+                f"{self.enablement_path}; retained "
+                f"{_describe_enablement(observed)}"
+            )
+
+    def _stage_unit(
+        self, data: bytes, mode: int
+    ) -> tuple[pathlib.Path, _PathSnapshot]:
+        descriptor, name = tempfile.mkstemp(
+            dir=str(self.unit_path.parent),
+            prefix=f".{UNIT_NAME}.staged-",
+        )
+        staged = pathlib.Path(name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+            os.chmod(staged, mode)
+            return staged, _observe_unit(staged)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            with contextlib.suppress(OSError):
+                staged.unlink()
+            raise
+
+    def _stage_enablement(
+        self, target: str
+    ) -> tuple[pathlib.Path, _PathSnapshot]:
+        staged = _reserve_sibling(
+            self.enablement_path.parent,
+            f".{UNIT_NAME}.staged-enablement-",
+        )
+        try:
+            os.symlink(target, staged)
+            return staged, _observe_enablement(staged)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                staged.unlink()
+            raise
+
+    def publish_unit(self, unit_text: str) -> None:
+        _ensure_directory(self.unit_path.parent, self.created_directories)
+        staged, staged_snapshot = self._stage_unit(
+            unit_text.encode("utf-8"), 0o644
+        )
+        try:
+            if self.unit_expected.kind == "missing":
+                try:
+                    os.link(staged, self.unit_path, follow_symlinks=False)
+                except FileExistsError as exc:
+                    observed = _observe_unit(self.unit_path)
+                    raise OwnershipError(
+                        f"refusing to replace service unit {self.unit_path}; "
+                        f"retained {observed.kind}"
+                    ) from exc
+            else:
+                self._assert_unit_expected()
+                os.replace(staged, self.unit_path)
+                staged = None
+            self.unit_expected = staged_snapshot
+            self.unit_touched = True
+        finally:
+            if staged is not None and os.path.lexists(staged):
+                staged.unlink()
+
+    def ensure_enablement(self) -> None:
+        if self.enablement_expected.kind != "missing":
+            self._assert_enablement_expected()
+            return
+        _ensure_directory(self.enablement_path.parent, self.created_directories)
+        staged, staged_snapshot = self._stage_enablement(
+            _enablement_target(self.enablement_path, self.unit_path)
+        )
+        try:
+            try:
+                os.link(
+                    staged,
+                    self.enablement_path,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                observed = _observe_enablement(self.enablement_path)
+                raise OwnershipError(
+                    f"refusing to replace service enablement "
+                    f"{self.enablement_path}; retained "
+                    f"{_describe_enablement(observed)}"
+                ) from exc
+            self.enablement_expected = staged_snapshot
+            self.enablement_touched = True
+        finally:
+            if os.path.lexists(staged):
+                staged.unlink()
+
+    def verify_enablement(self) -> None:
+        self._assert_enablement_expected()
+        if self.enablement_expected.kind == "missing":
+            raise InstallError(
+                f"service enablement disappeared after restart: "
+                f"{self.enablement_path}"
+            )
+
+    def _restore_initial_unit(self) -> None:
+        if self.unit_initial.kind != "file" or not isinstance(
+            self.unit_initial.data, bytes
+        ):
+            raise InstallError("saved service unit snapshot is invalid")
+        staged, restored = self._stage_unit(
+            self.unit_initial.data,
+            self.unit_initial.mode,
+        )
+        try:
+            os.replace(staged, self.unit_path)
+            staged = None
+            self.unit_expected = restored
+        finally:
+            if staged is not None and os.path.lexists(staged):
+                staged.unlink()
+
+    def _restore_initial_enablement(self) -> None:
+        target = self.enablement_initial.data
+        if self.enablement_initial.kind != "symlink" or not isinstance(
+            target, str
+        ):
+            raise InstallError("saved service enablement snapshot is invalid")
+        observed = _observe_enablement(self.enablement_path)
+        if (
+            observed.kind == "symlink"
+            and observed.data == target
+            and _snapshot_is_owned_enablement(
+                self.enablement_path,
+                self.unit_path,
+                observed,
+            )
+        ):
+            self.enablement_expected = observed
+            return
+        if observed.kind != "missing":
+            raise InstallError(
+                f"refusing to replace service enablement "
+                f"{self.enablement_path}; retained "
+                f"{_describe_enablement(observed)}"
+            )
+        _ensure_directory(
+            self.enablement_path.parent,
+            self.created_directories,
+        )
+        staged, restored = self._stage_enablement(target)
+        try:
+            os.link(
+                staged,
+                self.enablement_path,
+                follow_symlinks=False,
+            )
+            self.enablement_expected = restored
+        finally:
+            if os.path.lexists(staged):
+                staged.unlink()
+
+    def restore(self) -> list[str]:
+        errors = []
+        if self.operation != "install":
+            raise InstallError(
+                f"artifact restore mode is not implemented: {self.operation}"
+            )
+        if self.enablement_touched:
+            try:
+                self._assert_enablement_expected()
+                if self.enablement_initial.kind == "missing":
+                    self.enablement_path.unlink()
+                    self.enablement_expected = _PathSnapshot("missing")
+                else:
+                    self._restore_initial_enablement()
+            except BaseException as exc:
+                errors.append(
+                    f"could not restore service enablement "
+                    f"{self.enablement_path}: {exc}"
+                )
+        if self.unit_touched:
+            try:
+                self._assert_unit_expected()
+                if self.unit_initial.kind == "missing":
+                    self.unit_path.unlink()
+                    self.unit_expected = _PathSnapshot("missing")
+                else:
+                    self._restore_initial_unit()
+            except BaseException as exc:
+                errors.append(
+                    f"could not restore service unit {self.unit_path}: {exc}"
+                )
+        _remove_empty_directories(self.created_directories)
+        return errors
 
 
 _ENABLEMENT_QUARANTINE_PREFIX = f".{UNIT_NAME}.enablement-quarantine-"
