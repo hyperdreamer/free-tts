@@ -90,6 +90,7 @@ class SynthClient:
         self._config = config
         self._transport = transport or _http_transport
         self._sleep = sleep
+        self._monotonic = time.monotonic
 
     def voices(self) -> object:
         """Fetch and parse the backend's voice catalog payload."""
@@ -176,16 +177,25 @@ class SynthClient:
         request_id: str,
         *,
         still_wanted: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> bool:
         """Deliver cancellation, tolerating the pre-registration interval.
 
         The adapter can send DELETE before the backend has registered the POST,
         which answers 404. That is "not yet", not "unknown", so retry briefly
-        while this generation still wants the request cancelled.
+        while this generation still wants the request cancelled. ``deadline`` is
+        an absolute ``time.monotonic()`` value shared by every id in one cleanup
+        pass, so a slow DELETE cannot stretch the whole pass.
         """
         url = f"{self._config.backend_url}/tts-request/{request_id}"
-        deadline = time.monotonic() + _CANCEL_HANDOFF_SECONDS
+        own_deadline = self._monotonic() + _CANCEL_HANDOFF_SECONDS
+        limit = own_deadline if deadline is None else min(own_deadline, deadline)
         while True:
+            if self._monotonic() >= limit:
+                logger.debug(
+                    "Cancel for %s ran out of handoff time", request_id
+                )
+                return False
             try:
                 status, _headers, _body = self._transport(
                     "DELETE", url, None, _CANCEL_TIMEOUT
@@ -199,7 +209,7 @@ class SynthClient:
                 return True
             if still_wanted is None or not still_wanted():
                 return False
-            if time.monotonic() >= deadline:
+            if self._monotonic() >= limit:
                 logger.debug(
                     "Cancel for %s was never registered by the backend", request_id
                 )

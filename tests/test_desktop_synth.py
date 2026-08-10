@@ -239,6 +239,34 @@ class TestCancel:
         client = synth.SynthClient(_config(), transport=transport)
         client.cancel("req9")
 
+    def test_shared_deadline_stops_admitting_deletes(self):
+        clock = [0.0]
+        transport = _Transport(
+            [(404, {}, b"{}"), (404, {}, b"{}"), (404, {}, b"{}")]
+        )
+
+        def slow_delete(method, url, body, timeout):
+            clock[0] += 5.0
+            return transport(method, url, body, timeout)
+
+        client = synth.SynthClient(
+            _config(), transport=slow_delete, sleep=lambda _s: None
+        )
+        client._monotonic = lambda: clock[0]
+
+        deadline = clock[0] + 1.0
+        assert (
+            client.cancel("req1", still_wanted=lambda: True, deadline=deadline)
+            is False
+        )
+        assert len(transport.calls) == 1
+
+        assert (
+            client.cancel("req2", still_wanted=lambda: True, deadline=deadline)
+            is False
+        )
+        assert len(transport.calls) == 1
+
 
 class TestCancelHandoff:
     """DELETE tolerates the interval before the server registers the POST."""

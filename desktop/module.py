@@ -69,6 +69,8 @@ _CANCEL_DRAIN_SECONDS = 1.25
 # Whole-recovery budget once STOP or a PAUSE boundary is pending. Recovery that
 # nobody has cancelled keeps the configured startup and voice timeouts.
 _RECOVERY_DEADLINE_SECONDS = 1.0
+# Whole-pass budget for cancelling one generation's outstanding request ids.
+_CLEANUP_DEADLINE_SECONDS = 1.0
 _FUTURE_POLL_INTERVAL = 0.05
 
 
@@ -79,12 +81,22 @@ class _GenerationToken:
         self.cancelled = threading.Event()
         self.pause_requested = threading.Event()
         self.pause_boundary_reached = threading.Event()
+        self.cleanup_started = threading.Event()
         self._lock = threading.Lock()
         self.requests: set[str] = set()
 
     def cancel(self) -> None:
         """Mark this generation cancelled without taking the engine lock."""
         self.cancelled.set()
+
+    def begin_cleanup(self) -> None:
+        """Record that cleanup owns this generation's remaining requests.
+
+        Distinct from ``cancelled``: an internal failure abandons the utterance
+        without the client having asked for STOP, and cleanup must still complete
+        the bounded registration handoff.
+        """
+        self.cleanup_started.set()
 
     def add_request(self, request_id: str) -> None:
         with self._lock:
@@ -683,6 +695,7 @@ class SpeechEngine:
             generation.discard_request(request_id)
 
     def _cancel_outstanding(self, generation: _GenerationToken) -> None:
+        generation.begin_cleanup()
         self._cancel_requests(generation, generation.take_requests())
 
     def _cancellation_still_wanted(self, generation: _GenerationToken) -> bool:
@@ -690,17 +703,20 @@ class SpeechEngine:
             return generation is self._generation and (
                 generation.cancelled.is_set()
                 or generation.pause_requested.is_set()
+                or generation.cleanup_started.is_set()
             )
 
     def _cancel_requests(
         self, generation: _GenerationToken, request_ids: list[str]
     ) -> None:
+        deadline = time.monotonic() + _CLEANUP_DEADLINE_SECONDS
         for request_id in request_ids:
             self._client.cancel(  # type: ignore[attr-defined]
                 request_id,
                 still_wanted=lambda: self._cancellation_still_wanted(
                     generation
                 ),
+                deadline=deadline,
             )
 
 

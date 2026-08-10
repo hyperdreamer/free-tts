@@ -101,7 +101,7 @@ class _FakeClient:
             raise self._error
         return self._audio
 
-    def cancel(self, request_id, *, still_wanted=None):
+    def cancel(self, request_id, *, still_wanted=None, deadline=None):
         self.cancelled.append(request_id)
 
 
@@ -550,6 +550,92 @@ class TestRecoveryIsCancellable:
         assert fake_io.lines[-1] == "702 END"
 
 
+class TestErrorExitCleanup:
+    """An internal failure must still cancel prefetched backend work."""
+
+    def test_decode_failure_retries_cleanup_across_registration(self):
+        from desktop.audio import DecodeError
+
+        lookahead_entered = threading.Event()
+        registered = threading.Event()
+        allow_registration = threading.Event()
+        release_lookahead = threading.Event()
+
+        class HandoffClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.statuses = []
+                self.lookahead_id = None
+
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    return self._audio
+                self.lookahead_id = request_id
+                lookahead_entered.set()
+                assert allow_registration.wait(3)
+                registered.set()
+                assert release_lookahead.wait(3)
+                return self._audio
+
+            def cancel(self, request_id, *, still_wanted=None, deadline=None):
+                if not registered.is_set():
+                    self.statuses.append(404)
+                    allow_registration.set()
+                    if still_wanted is None or not still_wanted():
+                        return False
+                    assert registered.wait(3)
+                self.statuses.append(200)
+                self.cancelled.append(request_id)
+                release_lookahead.set()
+                return True
+
+        client = HandoffClient()
+
+        def failing_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            assert lookahead_entered.wait(3)
+            raise DecodeError("forced current-chunk decode failure")
+
+        fake_io = _FakeIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            client,
+            decoder=failing_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+
+        try:
+            assert engine.wait_idle(3)
+            assert client.statuses == [404, 200]
+            assert client.cancelled == [client.lookahead_id]
+            assert fake_io.lines.count("703 STOP") == 1
+        finally:
+            allow_registration.set()
+            registered.set()
+            release_lookahead.set()
+            engine.wait_idle(3)
+
+    def test_cleanup_intent_is_recorded_before_delete(self):
+        generation = module._GenerationToken()
+        assert generation.cleanup_started.is_set() is False
+        generation.begin_cleanup()
+        assert generation.cleanup_started.is_set() is True
+        assert generation.cancelled.is_set() is False
+
+
 class TestPause:
     def test_pause_reports_mark_then_pause_event(self):
         engine, fake_io = _engine()
@@ -604,7 +690,7 @@ class TestCancellationOwnership:
                 release_post.wait(2)
                 return self._audio
 
-            def cancel(self, request_id, *, still_wanted=None):
+            def cancel(self, request_id, *, still_wanted=None, deadline=None):
                 if not registered.is_set():
                     self.statuses.append(404)
                     allow_registration.set()
@@ -671,7 +757,7 @@ class TestCancellationOwnership:
                 assert post_cancelled.wait(3)
                 raise module.Cancelled("lookahead request cancelled")
 
-            def cancel(self, request_id, *, still_wanted=None):
+            def cancel(self, request_id, *, still_wanted=None, deadline=None):
                 assert request_id == self.lookahead_id
                 if not registered.is_set():
                     self.statuses.append(404)
@@ -1035,7 +1121,7 @@ class TestCancellationOwnership:
                 self.ids_second = request_id
                 return self._audio
 
-            def cancel(self, request_id, *, still_wanted=None):
+            def cancel(self, request_id, *, still_wanted=None, deadline=None):
                 self.cancelled.append(request_id)
                 return True
 
