@@ -26,6 +26,7 @@ import os
 import pathlib
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1204,15 +1205,155 @@ def _validate_enablement_link(
     return True
 
 
+_ENABLEMENT_OBSERVATION_ATTEMPTS = 3
+
+
+def _lstat_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _observe_enablement(path: pathlib.Path) -> _PathSnapshot:
+    """Observe enablement without changing any present entry."""
+    for _ in range(_ENABLEMENT_OBSERVATION_ATTEMPTS):
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            return _PathSnapshot("missing")
+        except OSError as exc:
+            raise InstallError(
+                f"incomplete compensation for service enablement {path}: "
+                f"could not inspect path: {exc}"
+            ) from exc
+
+        if stat.S_ISLNK(before.st_mode):
+            try:
+                target = os.readlink(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise InstallError(
+                    f"incomplete compensation for service enablement {path}: "
+                    f"could not read symlink target: {exc}"
+                ) from exc
+            try:
+                after = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise InstallError(
+                    f"incomplete compensation for service enablement {path}: "
+                    f"could not confirm symlink identity: {exc}"
+                ) from exc
+            if _lstat_identity(before) != _lstat_identity(after):
+                continue
+            return _PathSnapshot("symlink", target)
+
+        try:
+            after = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise InstallError(
+                f"incomplete compensation for service enablement {path}: "
+                f"could not confirm path identity: {exc}"
+            ) from exc
+        if _lstat_identity(before) != _lstat_identity(after):
+            continue
+        if stat.S_ISREG(after.st_mode):
+            return _PathSnapshot("file")
+        if stat.S_ISDIR(after.st_mode):
+            return _PathSnapshot("directory")
+        return _PathSnapshot("other")
+
+    raise InstallError(
+        f"incomplete compensation for service enablement {path}: "
+        "could not obtain a stable observation"
+    )
+
+
 def _restore_enablement_after_failed_disable(
     path: pathlib.Path,
     unit_path: pathlib.Path,
     snapshot: _PathSnapshot,
 ) -> None:
-    # Absence is safe. Any present path must still be our validated link;
-    # foreign replacements are retained and reported by validation.
-    _validate_enablement_link(path, unit_path)
-    _restore_path(path, snapshot)
+    """Restore only an absent or unchanged owned enablement entry."""
+    if snapshot.kind not in {"missing", "symlink"}:
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: "
+            f"unexpected snapshot kind {snapshot.kind!r}"
+        )
+
+    try:
+        _validate_enablement_link(path, unit_path)
+    except FileNotFoundError:
+        # The stable observation below handles a disappearance/reappearance
+        # between validation and compensation without mutating the path.
+        pass
+    except OwnershipError as exc:
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: {exc}"
+        ) from exc
+
+    observed = _observe_enablement(path)
+    if snapshot.kind == "missing":
+        if observed.kind == "missing":
+            return
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: "
+            f"expected an absent path, observed {observed.kind}"
+        )
+
+    target = snapshot.data
+    if not isinstance(target, str):
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: "
+            "saved symlink target is invalid"
+        )
+    if observed.kind == "symlink" and observed.data == target:
+        return
+    if observed.kind != "missing":
+        detail = f"observed {observed.kind}"
+        if observed.kind == "symlink":
+            detail += f" with target {observed.data!r}"
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: "
+            f"expected symlink target {target!r}, {detail}"
+        )
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, path)
+    except FileExistsError as exc:
+        try:
+            replacement = _observe_enablement(path)
+        except InstallError as observation_error:
+            raise InstallError(
+                f"incomplete compensation for service enablement {path}: "
+                f"an entry appeared during symlink creation ({observation_error})"
+            ) from exc
+        detail = replacement.kind
+        if replacement.kind == "symlink":
+            detail += f" with target {replacement.data!r}"
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: "
+            f"an entry appeared during symlink creation; observed {detail}"
+        ) from exc
+    except OSError as exc:
+        raise InstallError(
+            f"incomplete compensation for service enablement {path}: "
+            f"could not recreate symlink: {exc}"
+        ) from exc
+
+    restored = _observe_enablement(path)
+    if restored.kind == "symlink" and restored.data == target:
+        return
+    detail = restored.kind
+    if restored.kind == "symlink":
+        detail += f" with target {restored.data!r}"
+    raise InstallError(
+        f"incomplete compensation for service enablement {path}: "
+        f"created symlink was not stable at the saved target; observed {detail}"
+    )
 
 
 def _remove_owned_root(root: pathlib.Path, manifest: dict) -> None:

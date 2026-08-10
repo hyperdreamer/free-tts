@@ -1808,9 +1808,122 @@ class DisableActivitySequenceSystemctl:
         return FakeCompleted()
 
 
+class DisableCreatesOwnedEnablementSystemctl:
+    """Disable creates an owned wants link while the unit remains active."""
+
+    def __init__(self, link):
+        self.link = link
+        self.calls = []
+
+    def __call__(self, args, check=True):
+        args = list(args)
+        self.calls.append(args)
+        if args[0] == "disable":
+            self.link.parent.mkdir(parents=True, exist_ok=True)
+            self.link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
+            return FakeCompleted()
+        if args[0] == "is-active":
+            return FakeCompleted(returncode=0, stdout="active\n")
+        return FakeCompleted()
+
+
 def assert_owned_enablement_restored(link, target):
     assert link.is_symlink()
     assert os.readlink(link) == target
+
+
+def test_uninstall_compensation_retains_replacement_after_validation(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = DisableLeavesActiveSystemctl()
+    validations = 0
+    real_validate = install._validate_enablement_link
+
+    def validate_then_replace(path, unit_path):
+        nonlocal validations
+        result = real_validate(path, unit_path)
+        validations += 1
+        if validations == 2:
+            path.unlink()
+            path.write_text("foreign replacement after validation\n")
+        return result
+
+    monkeypatch.setattr(install, "_validate_enablement_link", validate_then_replace)
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert link.read_text() == "foreign replacement after validation\n"
+    assert "incomplete compensation" in str(excinfo.value)
+    assert root.is_dir() and unit.is_file()
+
+
+def test_uninstall_compensation_retains_foreign_creation_race(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = DisableActivitySequenceSystemctl(link, ["active"])
+    real_symlink = install.os.symlink
+
+    def foreign_before_create(target, destination, *args, **kwargs):
+        if pathlib.Path(destination) == link:
+            link.write_text("foreign creation race\n")
+            raise FileExistsError("foreign entry appeared")
+        return real_symlink(target, destination, *args, **kwargs)
+
+    monkeypatch.setattr(install.os, "symlink", foreign_before_create)
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert link.read_text() == "foreign creation race\n"
+    assert "incomplete compensation" in str(excinfo.value)
+    assert root.is_dir() and unit.is_file()
+
+
+def test_uninstall_compensation_retains_unexpected_enablement_from_missing_snapshot(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = install._enablement_path(unit_dir)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    assert not os.path.lexists(link)
+    runner = DisableCreatesOwnedEnablementSystemctl(link)
+    monkeypatch.setattr(install.time, "sleep", lambda delay: None)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=runner,
+        )
+
+    assert link.is_symlink()
+    assert os.readlink(link) == str(pathlib.Path("..") / install.UNIT_NAME)
+    assert "incomplete compensation" in str(excinfo.value)
+    assert root.is_dir() and unit.is_file()
 
 
 def test_uninstall_rejects_successful_disable_when_unit_stays_active(
