@@ -14,11 +14,13 @@ Stdlib-only: the installer runs before any dependency exists.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 import argparse
 import contextlib
 import errno
+import fcntl
+import functools
 import http.client
 import json
 import logging
@@ -482,6 +484,96 @@ def _probe_host(bind_host: str) -> str:
 
 class PreflightError(InstallError):
     """A pre-flight check failed; nothing has been changed yet."""
+
+
+def _server_lock_path() -> pathlib.Path:
+    raw_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not raw_runtime:
+        raise PreflightError(
+            "XDG_RUNTIME_DIR is required for the server installer lock"
+        )
+    runtime = pathlib.Path(raw_runtime)
+    if not runtime.is_absolute():
+        raise PreflightError(
+            f"XDG_RUNTIME_DIR must be absolute for the installer lock: {runtime}"
+        )
+    try:
+        metadata = os.lstat(runtime)
+    except OSError as exc:
+        raise PreflightError(
+            f"XDG_RUNTIME_DIR is not accessible for the installer lock: "
+            f"{runtime}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise PreflightError(
+            f"XDG_RUNTIME_DIR must be a non-symlink directory: {runtime}"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise PreflightError(
+            f"XDG_RUNTIME_DIR is not owned by the current user: {runtime}"
+        )
+    return runtime / "free-tts-installer.lock"
+
+
+@contextlib.contextmanager
+def _server_transaction_lock(
+    path: pathlib.Path | None = None,
+) -> Iterator[None]:
+    lock_path = _server_lock_path() if path is None else pathlib.Path(path)
+    descriptor = None
+    locked = False
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT
+            | os.O_RDWR
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PreflightError(
+                f"installer lock must be a regular file: {lock_path}"
+            )
+        if metadata.st_uid != os.geteuid():
+            raise PreflightError(
+                f"installer lock is not owned by the current user: {lock_path}"
+            )
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise PreflightError(
+                f"installer lock has insecure permissions: {lock_path}"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PreflightError(
+                "another server installer operation is active; "
+                f"lock: {lock_path}"
+            ) from exc
+        locked = True
+        yield
+    except PreflightError:
+        raise
+    except OSError as exc:
+        raise PreflightError(
+            f"could not open or lock installer lock {lock_path}: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            if locked:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+def _serialized_server_transaction(operation: Callable) -> Callable:
+    @functools.wraps(operation)
+    def serialized(*args, **kwargs):
+        with _server_transaction_lock():
+            return operation(*args, **kwargs)
+
+    return serialized
 
 
 def _load_service_endpoint(path: pathlib.Path) -> ServiceEndpoint:
@@ -1026,6 +1118,7 @@ def default_venv_builder(root: pathlib.Path) -> None:
     )
 
 
+@_serialized_server_transaction
 def install_server(
     source_root: pathlib.Path | None = None,
     *,
@@ -1589,6 +1682,7 @@ def _remove_owned_root(root: pathlib.Path, manifest: dict) -> None:
         ) from delete_error
 
 
+@_serialized_server_transaction
 def uninstall_server(
     *,
     root: pathlib.Path | None = None,

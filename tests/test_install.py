@@ -21,6 +21,83 @@ import desktop.install
 import install
 
 
+@pytest.fixture(autouse=True)
+def isolated_server_runtime(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    return runtime / "free-tts-installer.lock"
+
+
+def test_server_transaction_lock_rejects_a_second_open(isolated_server_runtime):
+    with install._server_transaction_lock():
+        with pytest.raises(install.PreflightError, match="another server installer"):
+            with install._server_transaction_lock():
+                pytest.fail("contender entered the critical section")
+
+    with install._server_transaction_lock():
+        pass
+
+
+def test_server_transaction_lock_reuses_stale_unlocked_file(
+    isolated_server_runtime,
+):
+    isolated_server_runtime.write_text("stale diagnostic\n")
+    isolated_server_runtime.chmod(0o600)
+
+    with install._server_transaction_lock():
+        assert isolated_server_runtime.is_file()
+
+
+@pytest.mark.parametrize("kind", ("symlink", "directory", "insecure-file"))
+def test_server_transaction_lock_rejects_unsafe_lock_path(
+    kind, isolated_server_runtime, tmp_path
+):
+    if kind == "symlink":
+        target = tmp_path / "foreign-lock"
+        target.write_text("foreign\n")
+        isolated_server_runtime.symlink_to(target)
+    elif kind == "directory":
+        isolated_server_runtime.mkdir()
+    else:
+        isolated_server_runtime.write_text("insecure\n")
+        isolated_server_runtime.chmod(0o644)
+
+    with pytest.raises(install.PreflightError, match="installer lock"):
+        with install._server_transaction_lock():
+            pytest.fail("unsafe lock entered the critical section")
+
+
+def test_server_transaction_lock_rejects_foreign_owner(
+    isolated_server_runtime, monkeypatch
+):
+    real_fstat = install.os.fstat
+
+    def foreign_fstat(fd):
+        values = list(real_fstat(fd))
+        values[4] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(install.os, "fstat", foreign_fstat)
+
+    with pytest.raises(install.PreflightError, match="owned by the current user"):
+        with install._server_transaction_lock():
+            pytest.fail("foreign lock entered the critical section")
+
+
+def test_server_lock_path_rejects_symlinked_runtime(
+    isolated_server_runtime, tmp_path, monkeypatch
+):
+    real_runtime = tmp_path / "real-runtime"
+    real_runtime.mkdir()
+    linked_runtime = tmp_path / "linked-runtime"
+    linked_runtime.symlink_to(real_runtime, target_is_directory=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(linked_runtime))
+
+    with pytest.raises(install.PreflightError, match="XDG_RUNTIME_DIR"):
+        install._server_lock_path()
+
+
 @pytest.fixture
 def checkout(tmp_path):
     """A stand-in checkout holding the files the installer copies."""
@@ -977,6 +1054,34 @@ def test_verify_rejects_identity_change_during_health(checkout, tmp_path):
     assert not os.path.lexists(root)
 
 
+def test_contended_install_does_not_run_preflight_or_touch_targets(
+    checkout, tmp_path, isolated_server_runtime, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    calls = []
+    ownership_reads = []
+    monkeypatch.setattr(
+        install,
+        "_check_root_ownership",
+        lambda *args: ownership_reads.append(args),
+    )
+
+    with install._server_transaction_lock():
+        with pytest.raises(install.PreflightError, match="another server installer"):
+            install.install_server(
+                checkout,
+                root=root,
+                unit_dir=unit_dir,
+                preflight=lambda: calls.append("preflight"),
+            )
+
+    assert calls == []
+    assert ownership_reads == []
+    assert not root.exists()
+    assert not unit_dir.exists()
+
+
 def test_install_server_runs_preflight_before_touching_disk(checkout, tmp_path):
     def preflight():
         raise install.PreflightError("nope")
@@ -1597,6 +1702,35 @@ def test_install_server_upgrade_failure_restores_exact_install_and_retries(
     assert link.is_symlink()
     assert os.readlink(link) == before_enablement
     assert_no_transaction_artifacts(root, unit_dir)
+
+
+def test_contended_uninstall_does_not_read_manifest_or_call_systemctl(
+    tmp_path, isolated_server_runtime, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    calls = []
+    manifest_reads = []
+    monkeypatch.setattr(
+        install,
+        "_load_manifest",
+        lambda *args, **kwargs: manifest_reads.append((args, kwargs)),
+    )
+
+    def runner(args, check=False):
+        calls.append(args)
+        return FakeCompleted()
+
+    with install._server_transaction_lock():
+        with pytest.raises(install.PreflightError, match="another server installer"):
+            install.uninstall_server(
+                root=root, unit_dir=unit_dir, systemctl=runner
+            )
+
+    assert manifest_reads == []
+    assert calls == []
+    assert not root.exists()
+    assert not unit_dir.exists()
 
 
 def test_uninstall_server_removes_unit_and_root(checkout, tmp_path):
@@ -2552,6 +2686,19 @@ def test_uninstall_desktop_restarts_speech_dispatcher():
 
     assert removed == ["/removed/path"]
     assert delegate.calls == ["uninstall", "restart"]
+
+
+def test_status_remains_unlocked_without_xdg_runtime(tmp_path, monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
+    report = install.status(
+        root=tmp_path / "missing",
+        desktop_root=tmp_path / "desktop",
+        unit_dir=tmp_path / "systemd" / "user",
+        systemctl=fake_systemctl(),
+    )
+
+    assert report["server"]["installed"] is False
 
 
 def test_status_reports_both_components(checkout, tmp_path):
