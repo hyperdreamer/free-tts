@@ -130,6 +130,24 @@ class TestConfigHelpers:
         assert isinstance(result, int)
 
 
+def test_config_only_mode_ignores_tts_setting_env(monkeypatch):
+    monkeypatch.setenv("TTS_PORT", "7000")
+    with (
+        mock.patch.object(server, "_CONFIG_ONLY", True),
+        mock.patch.object(server, "_CONFIG_CACHE", {"port": 6123}),
+    ):
+        assert server._cfg_int(
+            "port", "TTS_PORT", 5000, minimum=1, maximum=65535
+        ) == 6123
+
+
+def test_config_only_path_ignores_external_tts_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("TTS_CONFIG", str(tmp_path / "foreign.json"))
+    expected = pathlib.Path(server.__file__).resolve().parent / "config.json"
+    assert server._config_path(config_only=True) == expected
+    assert server._config_path(config_only=False) == tmp_path / "foreign.json"
+
+
 class TestProcessContract:
     def test_waitress_satisfies_single_process_contract(self):
         server._validate_process_model("waitress")
@@ -453,6 +471,25 @@ class TestFlaskErrorResponses:
     def test_health_identity_constants_exported(self):
         assert server.SERVICE_NAME == "free-tts"
         assert server.API_VERSION == 1
+
+    def test_health_reports_systemd_process_identity(self, client, monkeypatch):
+        invocation_id = "a" * 32
+        monkeypatch.setenv("INVOCATION_ID", invocation_id)
+        monkeypatch.setattr(server.os, "getpid", lambda: 4242)
+
+        payload = client.get("/health").get_json()
+
+        assert payload["pid"] == 4242
+        assert payload["invocation_id"] == invocation_id
+
+    def test_health_reports_null_invocation_outside_systemd(self, client, monkeypatch):
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setattr(server.os, "getpid", lambda: 4242)
+
+        payload = client.get("/health").get_json()
+
+        assert payload["pid"] == 4242
+        assert payload["invocation_id"] is None
 
     def test_successful_tts_request(self, client):
         ssml = VALID_SSML_TEMPLATE.format(

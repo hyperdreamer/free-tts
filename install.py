@@ -362,6 +362,8 @@ After=default.target
 
 [Service]
 Type=simple
+Environment=FREE_TTS_CONFIG_ONLY=1
+UnsetEnvironment=FLASK_DEBUG
 ExecStart=:/usr/bin/env -- {python} {server}
 WorkingDirectory={working_directory}
 Restart=on-failure
@@ -437,8 +439,92 @@ DEFAULT_PORT = 5000
 _PROBE_TIMEOUT = 3.0
 
 
+@dataclass(frozen=True)
+class ServiceEndpoint:
+    """Immutable address of the server governed by the installed config.
+
+    ``bind_host`` is what the server listens on; ``probe_host`` is the
+    loopback address used to verify it locally (wildcard binds map to the
+    matching loopback address).
+    """
+
+    bind_host: str
+    probe_host: str
+    port: int
+
+    @property
+    def health_url(self) -> str:
+        host = f"[{self.probe_host}]" if ":" in self.probe_host else self.probe_host
+        return f"http://{host}:{self.port}/health"
+
+
+@dataclass(frozen=True)
+class UnitIdentity:
+    """systemd identity of the running unit: MainPID and InvocationID."""
+
+    main_pid: int
+    invocation_id: str
+
+
+DEFAULT_ENDPOINT = ServiceEndpoint("127.0.0.1", "127.0.0.1", DEFAULT_PORT)
+
+
+def _probe_host(bind_host: str) -> str:
+    """Loopback address used to verify a wildcard or concrete bind."""
+    if bind_host == "0.0.0.0":
+        return "127.0.0.1"
+    if bind_host == "::":
+        return "::1"
+    return bind_host
+
+
 class PreflightError(InstallError):
     """A pre-flight check failed; nothing has been changed yet."""
+
+
+def _load_service_endpoint(path: pathlib.Path) -> ServiceEndpoint:
+    """Parse and validate the endpoint that the config at ``path`` governs.
+
+    Read-only and raised before any install mutation, so preflight, startup
+    verification, and the server configuration cannot drift.
+    """
+    path = pathlib.Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise PreflightError(
+            f"endpoint config must be a regular non-symlink file: {path}"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreflightError(
+            f"endpoint config is not readable JSON: {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PreflightError(f"endpoint config must be a JSON object: {path}")
+    host = payload.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host:
+        raise PreflightError(
+            f"endpoint config host must be a non-empty string: {path}"
+        )
+    port = payload.get("port", DEFAULT_PORT)
+    if isinstance(port, bool) or not isinstance(port, (int, str)):
+        raise PreflightError(
+            "endpoint config port must be an integer or integer-like "
+            f"string: {path}"
+        )
+    if isinstance(port, str):
+        port = port.strip()
+        if not port.isdigit():
+            raise PreflightError(
+                "endpoint config port must be an integer or integer-like "
+                f"string: {path}"
+            )
+        port = int(port)
+    if not 1 <= port <= 65535:
+        raise PreflightError(
+            f"endpoint config port must be between 1 and 65535: {path}"
+        )
+    return ServiceEndpoint(bind_host=host, probe_host=_probe_host(host), port=port)
 
 
 def default_systemctl(
@@ -525,22 +611,109 @@ def _query_unit_state(
     )
 
 
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+
+
+def _query_unit_identity(
+    runner: Callable[..., object],
+) -> UnitIdentity | None:
+    """Return the unit's systemd identity, or None while it is not ready.
+
+    A None result means the unit is transitional/inactive or its MainPID or
+    InvocationID is not yet valid. Command execution failures and
+    unrecognized output raise instead.
+    """
+    args = [
+        "show",
+        UNIT_NAME,
+        "-p",
+        "ActiveState",
+        "-p",
+        "MainPID",
+        "-p",
+        "InvocationID",
+    ]
+    try:
+        result = runner(args, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallError(
+            f"systemctl --user show {UNIT_NAME} could not run: {exc}"
+        ) from exc
+    output = str(getattr(result, "stdout", "") or "")
+    returncode = getattr(result, "returncode", 0)
+    if returncode != 0:
+        detail = str(
+            getattr(result, "stderr", "") or output or "no diagnostic output"
+        ).strip()
+        raise InstallError(
+            f"systemctl --user show {UNIT_NAME} failed with status "
+            f"{returncode}: {detail}"
+        )
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            fields[key.strip()] = value.strip()
+    if "ActiveState" not in fields:
+        raise InstallError(
+            f"systemctl --user show {UNIT_NAME} returned unrecognized output: "
+            f"{output.strip() or '(empty)'}"
+        )
+    if fields.get("ActiveState") != "active":
+        return None
+    main_pid = fields.get("MainPID")
+    invocation_id = fields.get("InvocationID")
+    if main_pid is None or invocation_id is None:
+        return None
+    try:
+        pid = int(main_pid)
+    except ValueError:
+        return None
+    if pid < 1:
+        return None
+    if len(invocation_id) != 32 or any(
+        char not in _HEX_CHARS for char in invocation_id
+    ):
+        return None
+    return UnitIdentity(main_pid=pid, invocation_id=invocation_id)
+
+
 def _verify_service(
     runner: Callable[..., object],
     fetch: Callable[[str, float], object] | None,
     *,
+    endpoint: ServiceEndpoint,
     attempts: int,
     delay: float,
     sleeper: Callable[[float], None],
 ) -> None:
-    """Require both an active unit and the expected health identity."""
-    last_failure = "the unit did not become active"
+    """Require the active unit and the expected health identity to match.
+
+    The configured endpoint must report the same PID and invocation ID that
+    systemd reports for the unit both before and after the health probe, so a
+    foreign responder or a unit that restarted mid-check cannot commit the
+    install.
+    """
+    last_failure = (
+        "the unit did not report a stable active identity matching "
+        f"{endpoint.health_url}"
+    )
     for attempt in range(max(1, attempts)):
-        if _query_unit_state(runner, "is-active", "active"):
-            payload = probe_health(fetch=fetch)
-            if payload is not None and payload.get("service") == "free-tts":
-                return
-            last_failure = "the health endpoint did not identify free-tts"
+        before = _query_unit_identity(runner)
+        payload = (
+            probe_health(endpoint, fetch=fetch) if before is not None else None
+        )
+        after = _query_unit_identity(runner) if before is not None else None
+        if (
+            before is not None
+            and after == before
+            and payload is not None
+            and payload.get("service") == "free-tts"
+            and not isinstance(payload.get("pid"), bool)
+            and payload.get("pid") == before.main_pid
+            and payload.get("invocation_id") == before.invocation_id
+        ):
+            return
         if attempt + 1 < max(1, attempts):
             sleeper(delay)
     raise InstallError(f"service verification failed: {last_failure}")
@@ -580,13 +753,13 @@ def _fetch_json(url: str, timeout: float) -> object:
 
 
 def probe_health(
-    port: int = DEFAULT_PORT,
+    endpoint: ServiceEndpoint | None = None,
     *,
     fetch: Callable[[str, float], object] | None = None,
 ) -> dict | None:
     """Return the /health payload from a local server, or None."""
     getter = fetch or _fetch_json
-    url = f"http://127.0.0.1:{port}/health"
+    url = (endpoint or DEFAULT_ENDPOINT).health_url
     try:
         payload = getter(url, _PROBE_TIMEOUT)
     except (
@@ -599,10 +772,10 @@ def probe_health(
     return payload if isinstance(payload, dict) else None
 
 
-def _tcp_port_occupied(port: int, timeout: float) -> bool:
-    """Return False only when localhost explicitly refuses the connection."""
+def _tcp_port_occupied(host: str, port: int, timeout: float) -> bool:
+    """Return False only when the probe host explicitly refuses the connection."""
     try:
-        connection = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        connection = socket.create_connection((host, port), timeout=timeout)
     except ConnectionRefusedError:
         return False
     except OSError as exc:
@@ -625,42 +798,43 @@ def unit_is_active(systemctl: Callable[..., object] | None = None) -> bool:
 
 def check_port(
     *,
-    port: int = DEFAULT_PORT,
+    endpoint: ServiceEndpoint | None = None,
     force: bool = False,
     fetch: Callable[[str, float], object] | None = None,
-    occupancy_probe: Callable[[int, float], bool] | None = None,
+    occupancy_probe: Callable[[str, int, float], bool] | None = None,
     systemctl: Callable[..., object] | None = None,
 ) -> str:
     """Classify who owns the server port before we bind it."""
+    endpoint = endpoint or DEFAULT_ENDPOINT
     probe = occupancy_probe or _tcp_port_occupied
     try:
-        occupied = probe(port, _PROBE_TIMEOUT)
+        occupied = probe(endpoint.probe_host, endpoint.port, _PROBE_TIMEOUT)
     except OSError as exc:
         if force:
             return "forced"
         raise PreflightError(
-            f"could not prove port {port} is free ({exc}); treating it as "
-            "occupied. Pass --force to install anyway."
+            f"could not prove port {endpoint.port} is free ({exc}); treating it "
+            "as occupied. Pass --force to install anyway."
         ) from exc
     if not occupied:
         return "free"
 
-    payload = probe_health(port, fetch=fetch)
+    payload = probe_health(endpoint, fetch=fetch)
     if payload is not None and payload.get("service") == "free-tts":
         if unit_is_active(systemctl):
             return "ours"
         if force:
             return "forced"
         raise PreflightError(
-            f"port {port} already serves free-tts, but not through "
+            f"port {endpoint.port} already serves free-tts, but not through "
             f"{UNIT_NAME}. Another supervisor probably owns it; stop that "
             "owner first, or pass --force to install anyway."
         )
     if force:
         return "forced"
     raise PreflightError(
-        f"port {port} is already used by another service; free the port or "
-        "pass --force to install anyway."
+        f"port {endpoint.port} is already used by another service; free the "
+        "port or pass --force to install anyway."
     )
 
 
@@ -785,7 +959,7 @@ def install_server(
     venv_builder: Callable[[pathlib.Path], None] | None = None,
     systemctl: Callable[..., object] | None = None,
     fetch: Callable[[str, float], object] | None = None,
-    occupancy_probe: Callable[[int, float], bool] | None = None,
+    occupancy_probe: Callable[[str, int, float], bool] | None = None,
     force: bool = False,
     preflight: Callable[[], None] | None = None,
     verify_attempts: int = 10,
@@ -802,12 +976,6 @@ def install_server(
     def _default_preflight() -> None:
         check_python()
         check_systemd(systemctl=runner)
-        check_port(
-            force=force,
-            fetch=fetch,
-            occupancy_probe=occupancy_probe,
-            systemctl=runner,
-        )
 
     (preflight or _default_preflight)()
 
@@ -833,6 +1001,19 @@ def install_server(
     }
     _validate_manifest(manifest, expected)
     unit_text = render_unit(root)
+    config_path = (
+        root / "config.json"
+        if upgrading and os.path.lexists(root / "config.json")
+        else source_root / "config.example.json"
+    )
+    endpoint = _load_service_endpoint(config_path)
+    check_port(
+        endpoint=endpoint,
+        force=force,
+        fetch=fetch,
+        occupancy_probe=occupancy_probe,
+        systemctl=runner,
+    )
     created_directories: list[pathlib.Path] = []
     staging: pathlib.Path | None = None
     rollback: pathlib.Path | None = None
@@ -875,6 +1056,7 @@ def install_server(
         _verify_service(
             runner,
             fetch,
+            endpoint=endpoint,
             attempts=verify_attempts,
             delay=verify_delay,
             sleeper=sleeper,

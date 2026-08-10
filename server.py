@@ -66,13 +66,30 @@ logger = logging.getLogger("tts-server")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-_CONFIG_PATH = Path(os.environ.get("TTS_CONFIG", Path(__file__).parent / "config.json"))
+_CONFIG_ONLY = os.environ.get("FREE_TTS_CONFIG_ONLY") == "1"
+"""True when systemd runs the server and config.json is authoritative.
+
+The systemd unit sets FREE_TTS_CONFIG_ONLY=1, so every per-setting TTS_*
+environment override is ignored and config.json beside server.py governs.
+"""
+
+
+def _config_path(config_only: bool | None = None) -> Path:
+    """Path of the config file, honoring the systemd config-only mode."""
+    authoritative = _CONFIG_ONLY if config_only is None else config_only
+    if authoritative:
+        return Path(__file__).resolve().parent / "config.json"
+    return Path(os.environ.get("TTS_CONFIG", Path(__file__).parent / "config.json"))
+
+
+_CONFIG_PATH = _config_path()
 
 
 def _load_config() -> dict[str, Any]:
     """Load configuration from config.json, if it exists.
 
-    Environment variables take precedence over the config file.
+    Environment variables take precedence over the config file, except in
+    config-only mode (systemd) where config.json is authoritative.
     Keys in config.json use snake_case and are mapped to TTS_* env vars.
     """
     cfg: dict[str, Any] = {}
@@ -86,8 +103,12 @@ def _load_config() -> dict[str, Any]:
 
 
 def _cfg(key: str, env_var: str, default: Any, coerce: type = str) -> Any:
-    """Resolve a config value: env var > config.json > hardcoded default."""
-    env_val = os.environ.get(env_var)
+    """Resolve a config value: env var > config.json > hardcoded default.
+
+    In config-only mode (systemd), per-setting environment overrides are
+    ignored so the installed config.json stays authoritative.
+    """
+    env_val = None if _CONFIG_ONLY else os.environ.get(env_var)
     raw_val = env_val if env_val is not None else _CONFIG_CACHE.get(key)
     if raw_val is not None:
         try:
@@ -130,7 +151,7 @@ def _cfg_int(
 
 def _cfg_list(key: str, env_var: str, default: list[str]) -> list[str]:
     """Resolve a string-list config value from JSON array or comma-separated env."""
-    env_val = os.environ.get(env_var)
+    env_val = None if _CONFIG_ONLY else os.environ.get(env_var)
     raw_val = env_val if env_val is not None else _CONFIG_CACHE.get(key)
     if raw_val is None:
         return default
@@ -1064,6 +1085,8 @@ def create_app() -> Flask:
                 "service": SERVICE_NAME,
                 "api_version": API_VERSION,
                 "voice_cache_ready": _voice_cache_ready,
+                "pid": os.getpid(),
+                "invocation_id": os.environ.get("INVOCATION_ID") or None,
             }
         )
 

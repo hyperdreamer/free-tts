@@ -329,6 +329,8 @@ def test_render_unit_embeds_paths_and_idle_warning(tmp_path):
     assert "Restart=on-failure" in text
     assert "WantedBy=default.target" in text
     assert "idle_timeout" in text
+    assert "Environment=FREE_TTS_CONFIG_ONLY=1" in text
+    assert "UnsetEnvironment=FLASK_DEBUG" in text
     assert "Environment=TTS_CONFIG" not in text
 
 
@@ -411,6 +413,10 @@ def fake_systemctl(responses=None, calls=None):
     return run
 
 
+TEST_MAIN_PID = 4242
+TEST_INVOCATION_ID = "a" * 32
+
+
 def healthy_fetch(url, timeout):
     """Complete payload returned by the real server's health endpoint."""
     return {
@@ -418,19 +424,41 @@ def healthy_fetch(url, timeout):
         "service": "free-tts",
         "api_version": 1,
         "voice_cache_ready": True,
+        "pid": TEST_MAIN_PID,
+        "invocation_id": TEST_INVOCATION_ID,
     }
 
 
 class StatefulSystemctl:
     """Hermetic systemctl model with one-shot command failure injection."""
 
-    def __init__(self, *, active=False, enabled=False, fail_once=None):
+    def __init__(
+        self,
+        *,
+        active=False,
+        enabled=False,
+        fail_once=None,
+        main_pid=TEST_MAIN_PID,
+        invocation_id=TEST_INVOCATION_ID,
+    ):
         self.active = active
         self.enabled = enabled
         self.fail_once = fail_once
         self.failed = False
         self.hide_active = False
+        self.main_pid = main_pid
+        self.invocation_id = invocation_id
         self.calls = []
+
+    def health_payload(self):
+        return {
+            "status": "ok",
+            "service": "free-tts",
+            "api_version": 1,
+            "voice_cache_ready": True,
+            "pid": self.main_pid,
+            "invocation_id": self.invocation_id,
+        }
 
     def __call__(self, args, check=True):
         args = list(args)
@@ -439,6 +467,15 @@ class StatefulSystemctl:
         if command == self.fail_once and not self.failed:
             self.failed = True
             return FakeCompleted(returncode=7, stderr=f"{command} failed")
+        if command == "show":
+            state = "active" if self.active and not self.hide_active else "inactive"
+            return FakeCompleted(
+                stdout=(
+                    f"ActiveState={state}\n"
+                    f"MainPID={self.main_pid if state == 'active' else 0}\n"
+                    f"InvocationID={self.invocation_id if state == 'active' else ''}\n"
+                )
+            )
         if command == "is-active":
             reported_active = self.active and not self.hide_active
             state = "active" if reported_active else "inactive"
@@ -545,7 +582,7 @@ def test_check_port_free_when_nothing_answers():
     assert (
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: False,
+            occupancy_probe=lambda host, port, timeout: False,
             systemctl=fake_systemctl(),
         )
         == "free"
@@ -566,7 +603,7 @@ def test_check_port_accepts_our_own_active_unit():
     assert (
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: True,
+            occupancy_probe=lambda host, port, timeout: True,
             systemctl=active,
         )
         == "ours"
@@ -589,7 +626,7 @@ def test_check_port_rejects_foreign_free_tts_owner():
     with pytest.raises(install.PreflightError) as excinfo:
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: True,
+            occupancy_probe=lambda host, port, timeout: True,
             systemctl=inactive,
         )
 
@@ -597,7 +634,7 @@ def test_check_port_rejects_foreign_free_tts_owner():
     assert (
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: True,
+            occupancy_probe=lambda host, port, timeout: True,
             systemctl=inactive,
             force=True,
         )
@@ -612,7 +649,7 @@ def test_check_port_rejects_unrelated_service():
     with pytest.raises(install.PreflightError):
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: True,
+            occupancy_probe=lambda host, port, timeout: True,
             systemctl=fake_systemctl(),
         )
 
@@ -639,7 +676,7 @@ def test_check_port_treats_every_reachable_nonmatch_as_occupied(response):
     with pytest.raises(install.PreflightError) as excinfo:
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: True,
+            occupancy_probe=lambda host, port, timeout: True,
             systemctl=fake_systemctl(),
         )
 
@@ -647,7 +684,7 @@ def test_check_port_treats_every_reachable_nonmatch_as_occupied(response):
     assert (
         install.check_port(
             fetch=fetch,
-            occupancy_probe=lambda port, timeout: True,
+            occupancy_probe=lambda host, port, timeout: True,
             systemctl=fake_systemctl(),
             force=True,
         )
@@ -656,7 +693,7 @@ def test_check_port_treats_every_reachable_nonmatch_as_occupied(response):
 
 
 def test_check_port_contains_tcp_probe_errors():
-    def failing_probe(port, timeout):
+    def failing_probe(host, port, timeout):
         raise OSError("probe unavailable")
 
     with pytest.raises(install.PreflightError) as excinfo:
@@ -676,6 +713,68 @@ def test_check_port_contains_tcp_probe_errors():
     )
 
 
+def test_load_service_endpoint_accepts_custom_port(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text('{"host": "127.0.0.1", "port": "6123"}\n')
+
+    endpoint = install._load_service_endpoint(config)
+
+    assert endpoint == install.ServiceEndpoint("127.0.0.1", "127.0.0.1", 6123)
+    assert endpoint.health_url == "http://127.0.0.1:6123/health"
+
+
+@pytest.mark.parametrize(
+    "bind_host,probe_host,url",
+    (
+        ("0.0.0.0", "127.0.0.1", "http://127.0.0.1:6123/health"),
+        ("::", "::1", "http://[::1]:6123/health"),
+        ("::1", "::1", "http://[::1]:6123/health"),
+    ),
+)
+def test_service_endpoint_maps_probe_hosts(bind_host, probe_host, url):
+    endpoint = install.ServiceEndpoint(bind_host, probe_host, 6123)
+    assert endpoint.health_url == url
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        [],
+        {"host": "", "port": 5000},
+        {"host": "127.0.0.1", "port": True},
+        {"host": "127.0.0.1", "port": 0},
+        {"host": "127.0.0.1", "port": 65536},
+        {"host": "127.0.0.1", "port": "not-a-port"},
+    ),
+)
+def test_load_service_endpoint_rejects_invalid_config(tmp_path, payload):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(payload))
+    with pytest.raises(install.PreflightError):
+        install._load_service_endpoint(config)
+
+
+def test_load_service_endpoint_rejects_symlink(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text('{"port": 6123}\n')
+    config = tmp_path / "config.json"
+    config.symlink_to(target)
+    with pytest.raises(install.PreflightError, match="regular non-symlink"):
+        install._load_service_endpoint(config)
+
+
+def test_check_port_uses_configured_probe_host_and_port():
+    endpoint = install.ServiceEndpoint("127.0.0.1", "127.0.0.1", 6123)
+    seen = []
+
+    def occupancy(host, port, timeout):
+        seen.append((host, port))
+        return False
+
+    assert install.check_port(endpoint=endpoint, occupancy_probe=occupancy) == "free"
+    assert seen == [("127.0.0.1", 6123)]
+
+
 def _install_server(checkout, tmp_path, *, calls=None, force=False, venv=None):
     """Install with every side effect injected."""
     def venv_builder(root):
@@ -684,24 +783,23 @@ def _install_server(checkout, tmp_path, *, calls=None, force=False, venv=None):
         if venv is not None:
             venv.append(root)
 
-    return install.install_server(
+    runner = StatefulSystemctl(active=True, enabled=True)
+    manifest = install.install_server(
         checkout,
         root=tmp_path / "share" / "free-tts-server",
         unit_dir=tmp_path / "config" / "systemd" / "user",
         venv_builder=venv_builder,
-        systemctl=fake_systemctl(
-            {
-                "is-active": FakeCompleted(stdout="active\n"),
-                "is-enabled": FakeCompleted(stdout="enabled\n"),
-            },
-            calls=calls,
-        ),
+        systemctl=runner,
         fetch=healthy_fetch,
+        occupancy_probe=lambda host, port, timeout: False,
         preflight=lambda: None,
         force=force,
         verify_attempts=1,
         verify_delay=0,
     )
+    if calls is not None:
+        calls.extend(runner.calls)
+    return manifest
 
 
 def test_install_server_writes_manifest_config_and_unit(checkout, tmp_path):
@@ -735,6 +833,61 @@ def test_install_server_reinstall_preserves_config_and_venv(checkout, tmp_path):
 
     assert (root / "config.json").read_text() == '{"port": 6000}\n'
     assert venv == []
+
+
+def test_install_server_reinstall_verifies_preserved_custom_port(checkout, tmp_path):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    runner = StatefulSystemctl()
+
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+    )
+    (root / "config.json").write_text('{"host": "127.0.0.1", "port": 6123}\n')
+
+    def custom_fetch(url, timeout):
+        assert url == "http://127.0.0.1:6123/health"
+        return runner.health_payload()
+
+    _transaction_install(
+        checkout, root, unit_dir, runner, fake_venv_builder, custom_fetch
+    )
+
+
+def test_verify_rejects_foreign_responder_after_forced_install(checkout, tmp_path):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    runner = StatefulSystemctl()
+
+    def foreign_fetch(url, timeout):
+        payload = runner.health_payload()
+        payload["pid"] = 9999
+        payload["invocation_id"] = "f" * 32
+        return payload
+
+    with pytest.raises(install.InstallError, match="identity"):
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, foreign_fetch
+        )
+    assert not os.path.lexists(root)
+
+
+def test_verify_rejects_identity_change_during_health(checkout, tmp_path):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    runner = StatefulSystemctl()
+
+    def racing_fetch(url, timeout):
+        payload = runner.health_payload()
+        runner.main_pid = 5252
+        runner.invocation_id = "b" * 32
+        return payload
+
+    with pytest.raises(install.InstallError, match="identity"):
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, racing_fetch
+        )
+    assert not os.path.lexists(root)
 
 
 def test_install_server_runs_preflight_before_touching_disk(checkout, tmp_path):
@@ -817,10 +970,16 @@ def _transaction_install(checkout, root, unit_dir, runner, builder, fetch):
         venv_builder=builder,
         systemctl=runner,
         fetch=fetch,
+        occupancy_probe=lambda host, port, timeout: False,
         preflight=lambda: None,
         verify_attempts=1,
         verify_delay=0,
     )
+
+
+def fake_venv_builder(target):
+    (target / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (target / ".venv" / "bin" / "python").write_text("#!/bin/sh\n")
 
 
 def _arm_install_failure(boundary, monkeypatch, root, runner):
