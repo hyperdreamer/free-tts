@@ -42,6 +42,40 @@ The backend starts on demand and exits when idle. See
 [docs/desktop-tts.md](docs/desktop-tts.md) for configuration, verification, and
 uninstall.
 
+## Installation
+
+Install the server as a systemd **user** service, self-contained in
+`~/.local/share/free-tts-server` with its own virtualenv. The checkout is only
+needed at install time; you can move or delete it afterwards.
+
+```bash
+python install.py install server     # server + systemd user service
+python install.py install desktop    # Speech Dispatcher module (Okular, KDE)
+python install.py install all        # both
+python install.py status             # what is installed, and unit state
+python install.py uninstall server   # stop, disable, and remove
+```
+
+The installer is stdlib-only and never needs root. It refuses to write into a
+directory it does not own, and it checks before installing that the interpreter
+is Python 3.11+, that a systemd user session is reachable, and that port 5000
+is free or already served by its own unit. Pass `--force` to install anyway
+when another service holds the port.
+
+Manage the service afterwards with `systemctl --user`:
+
+```bash
+systemctl --user status free-tts
+systemctl --user restart free-tts
+journalctl --user -u free-tts -f
+```
+
+Keep `idle_timeout` at `0` in `~/.local/share/free-tts-server/config.json`. The
+server arms its idle-shutdown watchdog only when `TTS_IDLE_TIMEOUT > 0`, and a
+persistent service must not exit on its own. To run the service without a
+graphical login, enable a lingering session with
+`loginctl enable-linger $USER`.
+
 ## Quick Start
 
 ```bash

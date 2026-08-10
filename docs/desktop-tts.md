@@ -1,5 +1,10 @@
 # Using free-tts as a desktop TTS engine
 
+The commands below install the Speech Dispatcher module on its own. The
+repo-root installer wraps them as `python install.py install desktop` (and
+`python install.py install all` to add the server's systemd user service);
+both routes call the same code and reload Speech Dispatcher afterwards.
+
 This makes Okular's built-in **Tools > Speak** actions, and any other Speech
 Dispatcher client, speak through free-tts voices.
 
