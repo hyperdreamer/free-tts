@@ -592,7 +592,7 @@ def _load_service_endpoint(path: pathlib.Path) -> ServiceEndpoint:
         )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise PreflightError(
             f"endpoint config is not readable JSON: {path}: {exc}"
         ) from exc

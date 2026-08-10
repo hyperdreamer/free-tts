@@ -57,10 +57,20 @@ python install.py uninstall server   # stop, disable, and remove
 ```
 
 The installer is stdlib-only and never needs root. It refuses to write into a
-directory it does not own, and it checks before installing that the interpreter
-is Python 3.11+, that a systemd user session is reachable, and that port 5000
-is free or already served by its own unit. Pass `--force` to install anyway
-when another service holds the port.
+directory it does not own, and checks Python 3.11+, the systemd user session,
+and the host/port selected by the installed `config.json` before mutation.
+`--force` bypasses endpoint occupancy only.
+
+Server install and uninstall operations are serialized by a per-user runtime
+lock. A concurrent installer invocation fails before preflight or mutation.
+Direct edits to managed unit/link paths, or independent mutating `systemctl`
+commands, are unsupported while an installer transaction is active; foreign
+state observed when the transaction starts is retained and reported.
+
+The systemd-managed service runs in config-only mode. Its installed
+`config.json` is authoritative for host, port, voice, and runtime settings;
+inherited per-setting `TTS_*` variables do not override it. `INVOCATION_ID`
+remains available for service identity verification.
 
 Manage the service afterwards with `systemctl --user`:
 
@@ -107,7 +117,9 @@ Copy `config.example.json` to `config.json` and edit:
 cp config.example.json config.json
 ```
 
-All settings can be set via `config.json` or environment variables. Env vars take precedence.
+When `server.py` runs manually, settings may come from `config.json` or the
+listed environment variables, with environment variables taking precedence.
+The installed systemd service uses the config-only behavior described above.
 
 ### Network
 

@@ -851,6 +851,17 @@ def test_load_service_endpoint_accepts_custom_port(tmp_path):
     assert endpoint.health_url == "http://127.0.0.1:6123/health"
 
 
+def test_load_service_endpoint_rejects_oversized_unquoted_json_integer(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text('{"port": ' + ("9" * 5000) + "}\n")
+
+    with pytest.raises(install.PreflightError) as exc:
+        install._load_service_endpoint(config)
+
+    assert str(config) in str(exc.value)
+    assert "JSON" in str(exc.value)
+
+
 @pytest.mark.parametrize(
     "port",
     (
@@ -2592,11 +2603,18 @@ def test_main_help_exits_zero(capsys):
     assert "usage" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "raw_config",
+    (
+        json.dumps({"port": "\N{SUPERSCRIPT TWO}"}),
+        '{"port": ' + ("9" * 5000) + "}",
+    ),
+)
 def test_main_install_server_aggregates_malformed_port_without_traceback(
-    checkout, tmp_path, monkeypatch, capsys
+    raw_config, checkout, tmp_path, monkeypatch, capsys
 ):
     config = checkout / "config.example.json"
-    config.write_text(json.dumps({"port": "\N{SUPERSCRIPT TWO}"}))
+    config.write_text(raw_config)
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
     monkeypatch.setattr(install, "checkout_root", lambda: checkout)
@@ -2615,7 +2633,6 @@ def test_main_install_server_aggregates_malformed_port_without_traceback(
     captured = capsys.readouterr()
     assert code == 1
     assert str(config) in captured.out
-    assert "port" in captured.out
     assert "Traceback" not in captured.out + captured.err
     assert not root.exists()
 
