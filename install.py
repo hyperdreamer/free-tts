@@ -15,6 +15,7 @@ Stdlib-only: the installer runs before any dependency exists.
 from __future__ import annotations
 
 from collections.abc import Callable
+import argparse
 import contextlib
 import json
 import logging
@@ -459,3 +460,165 @@ def uninstall_server(
     shutil.rmtree(root)
     removed.append(str(root))
     return removed
+
+
+DESKTOP_MANIFEST_NAME = "install-manifest.json"
+
+
+def _desktop_delegate():
+    """Import the desktop installer lazily so the CLI works without it."""
+    from desktop import install as desktop_install
+
+    return desktop_install
+
+
+def install_desktop(
+    source_root: pathlib.Path | None = None, *, delegate: object | None = None
+) -> dict:
+    """Install the Speech Dispatcher module and reload speechd."""
+    module = delegate or _desktop_delegate()
+    source_root = checkout_root() if source_root is None else pathlib.Path(source_root)
+    manifest = module.install(source_root)
+    module.restart_speech_dispatcher()
+    return dict(manifest)
+
+
+def uninstall_desktop(*, delegate: object | None = None) -> list[str]:
+    """Remove the Speech Dispatcher module and reload speechd."""
+    module = delegate or _desktop_delegate()
+    removed = list(module.uninstall())
+    module.restart_speech_dispatcher()
+    return removed
+
+
+def _desktop_root() -> pathlib.Path:
+    from desktop.backend import install_root
+
+    return install_root()
+
+
+def _read_json(path: pathlib.Path) -> dict | None:
+    """Read a JSON object tolerantly; None on any problem."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def status(
+    *,
+    root: pathlib.Path | None = None,
+    desktop_root: pathlib.Path | None = None,
+    unit_dir: pathlib.Path | None = None,
+    systemctl: Callable[..., object] | None = None,
+) -> dict:
+    """Describe what is installed, without raising on foreign state."""
+    root = server_root() if root is None else pathlib.Path(root)
+    unit_dir = systemd_user_dir() if unit_dir is None else pathlib.Path(unit_dir)
+    runner = systemctl or default_systemctl
+    try:
+        desktop_dir = (
+            _desktop_root() if desktop_root is None else pathlib.Path(desktop_root)
+        )
+    except ImportError:
+        desktop_dir = pathlib.Path.home() / ".local" / "share" / "free-tts"
+
+    manifest = read_manifest(root)
+    server: dict[str, object] = {
+        "installed": manifest is not None,
+        "root": str(root),
+        "unit": str(unit_dir / UNIT_NAME),
+        "version": manifest.get("version") if manifest else None,
+    }
+    for field, args in (
+        ("active", ["is-active", UNIT_NAME]),
+        ("enabled", ["is-enabled", UNIT_NAME]),
+    ):
+        try:
+            result = runner(args, check=False)
+            server[field] = str(getattr(result, "stdout", "") or "").strip()
+        except OSError as exc:
+            server[field] = f"unknown ({exc})"
+
+    desktop_manifest = _read_json(desktop_dir / DESKTOP_MANIFEST_NAME)
+    desktop = {
+        "installed": bool(
+            desktop_manifest and desktop_manifest.get("module") == "free-tts"
+        ),
+        "root": str(desktop_dir),
+    }
+    return {"server": server, "desktop": desktop}
+
+
+def _print_status(report: dict) -> None:
+    for name in ("server", "desktop"):
+        section = report[name]
+        state = "installed" if section.get("installed") else "not installed"
+        print(f"{name:8} {state} root={section.get('root')}")
+        if name == "server" and section.get("installed"):
+            print(
+                f"         version={section.get('version')} "
+                f"unit={section.get('active')}/{section.get('enabled')}"
+            )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python install.py install|uninstall|status [server|desktop|all]``."""
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+    parser = argparse.ArgumentParser(
+        prog="install.py",
+        description="Install the free-tts server and desktop TTS module.",
+    )
+    parser.add_argument("command", choices=("install", "uninstall", "status"))
+    parser.add_argument(
+        "component",
+        nargs="?",
+        default="all",
+        choices=("server", "desktop", "all"),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="install even when another service already owns the port",
+    )
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return 2
+
+    if args.command == "status":
+        _print_status(status())
+        return 0
+
+    components = (
+        ("server", "desktop") if args.component == "all" else (args.component,)
+    )
+    failures = 0
+    for component in components:
+        try:
+            if args.command == "install":
+                if component == "server":
+                    manifest = install_server(force=args.force)
+                    print(f"Installed server into {manifest['root']}")
+                else:
+                    manifest = install_desktop()
+                    print(f"Installed desktop module into {manifest['root']}")
+            else:
+                removed = (
+                    uninstall_server()
+                    if component == "server"
+                    else uninstall_desktop()
+                )
+                for path in removed:
+                    print(f"Removed {path}")
+                if not removed:
+                    print(f"Nothing to remove for {component}")
+        except (InstallError, OSError, ImportError, subprocess.SubprocessError) as exc:
+            failures += 1
+            print(f"{component}: {exc}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

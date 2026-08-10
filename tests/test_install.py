@@ -400,3 +400,134 @@ def test_uninstall_server_keeps_unowned_root(tmp_path):
 
     assert removed == []
     assert (root / "important.txt").exists()
+
+
+class FakeDesktop:
+    """Stand-in for the desktop.install module."""
+
+    def __init__(self):
+        self.calls = []
+
+    def install(self, source_root, **kwargs):
+        self.calls.append("install")
+        return {"module": "free-tts", "root": str(source_root)}
+
+    def uninstall(self, **kwargs):
+        self.calls.append("uninstall")
+        return ["/removed/path"]
+
+    def restart_speech_dispatcher(self):
+        self.calls.append("restart")
+        return True
+
+
+def test_install_desktop_restarts_speech_dispatcher(checkout):
+    delegate = FakeDesktop()
+
+    manifest = install.install_desktop(checkout, delegate=delegate)
+
+    assert manifest["module"] == "free-tts"
+    assert delegate.calls == ["install", "restart"]
+
+
+def test_uninstall_desktop_restarts_speech_dispatcher():
+    delegate = FakeDesktop()
+
+    removed = install.uninstall_desktop(delegate=delegate)
+
+    assert removed == ["/removed/path"]
+    assert delegate.calls == ["uninstall", "restart"]
+
+
+def test_status_reports_both_components(checkout, tmp_path):
+    _install_server(checkout, tmp_path)
+    desktop_root = tmp_path / "share" / "free-tts"
+    desktop_root.mkdir(parents=True)
+    (desktop_root / "install-manifest.json").write_text(
+        json.dumps({"module": "free-tts", "root": str(desktop_root)}),
+        encoding="utf-8",
+    )
+
+    report = install.status(
+        root=tmp_path / "share" / "free-tts-server",
+        desktop_root=desktop_root,
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        systemctl=fake_systemctl(
+            {
+                "is-active": FakeCompleted(stdout="active\n"),
+                "is-enabled": FakeCompleted(stdout="enabled\n"),
+            }
+        ),
+    )
+
+    assert report["server"]["installed"] is True
+    assert report["server"]["version"] == "2.1.0"
+    assert report["server"]["active"] == "active"
+    assert report["server"]["enabled"] == "enabled"
+    assert report["desktop"]["installed"] is True
+
+
+def test_status_tolerates_corrupt_desktop_manifest(tmp_path):
+    desktop_root = tmp_path / "share" / "free-tts"
+    desktop_root.mkdir(parents=True)
+    (desktop_root / "install-manifest.json").write_text("{broken", encoding="utf-8")
+
+    report = install.status(
+        root=tmp_path / "missing",
+        desktop_root=desktop_root,
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        systemctl=fake_systemctl(),
+    )
+
+    assert report["server"]["installed"] is False
+    assert report["desktop"]["installed"] is False
+
+
+def test_main_rejects_unknown_command(capsys):
+    assert install.main(["frobnicate"]) == 2
+
+
+def test_main_status_prints_a_report(checkout, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        install, "status", lambda **kwargs: {
+            "server": {"installed": False},
+            "desktop": {"installed": False},
+        }
+    )
+
+    assert install.main(["status"]) == 0
+    assert "server" in capsys.readouterr().out
+
+
+def test_main_install_all_reports_each_component(monkeypatch, capsys):
+    performed = []
+    monkeypatch.setattr(
+        install,
+        "install_server",
+        lambda **kwargs: performed.append("server") or {"root": "/srv"},
+    )
+
+    def failing_desktop(**kwargs):
+        performed.append("desktop")
+        raise install.InstallError("speech-dispatcher is missing")
+
+    monkeypatch.setattr(install, "install_desktop", failing_desktop)
+
+    code = install.main(["install", "all"])
+
+    assert performed == ["server", "desktop"]
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "speech-dispatcher is missing" in output
+
+
+def test_main_install_server_passes_force(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        install,
+        "install_server",
+        lambda **kwargs: seen.update(kwargs) or {"root": "/srv"},
+    )
+
+    assert install.main(["install", "server", "--force"]) == 0
+    assert seen["force"] is True
