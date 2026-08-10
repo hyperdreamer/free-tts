@@ -13,8 +13,10 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 
 from desktop import protocol
 from desktop.audio import (
@@ -60,6 +62,11 @@ def _mark_ahead(chunks: list[object], index: int) -> bool:
 
 
 _WORKER_RECLAIM_SECONDS = 10.0
+# How long the speech worker may keep waiting for work it has abandoned. It
+# applies only after STOP, or after PAUSE reaches its honest boundary; wanted
+# synthesis keeps the configured request timeout.
+_CANCEL_DRAIN_SECONDS = 1.25
+_FUTURE_POLL_INTERVAL = 0.05
 
 
 class _GenerationToken:
@@ -358,10 +365,11 @@ class SpeechEngine:
         """Synthesise every chunk with one-chunk lookahead, then report."""
         outcome = "end"
         began = False
-        with ThreadPoolExecutor(
+        pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="free-tts-pre"
-        ) as pool:
-            pending = None
+        )
+        pending = None
+        try:
             try:
                 for index, chunk in enumerate(chunks):
                     if self._should_abort(generation):
@@ -393,7 +401,7 @@ class SpeechEngine:
                             pitch,
                             self._register_request(generation),
                         )
-                    mp3 = future.result()
+                    mp3 = self._await_chunk(generation, future)
                     if self._should_abort(generation):
                         outcome = "stop"
                         break
@@ -456,10 +464,14 @@ class SpeechEngine:
             except Exception:
                 logger.exception("Unexpected synthesis failure")
                 outcome = "stop"
-            finally:
-                if pending is not None:
-                    pending.cancel()
-                self._cancel_outstanding(generation)
+        finally:
+            if pending is not None:
+                pending.cancel()
+            self._cancel_outstanding(generation)
+            # Queued work is dropped and the terminal event is not held behind a
+            # running fetch: the fetch itself is bounded by _await_chunk and the
+            # decoder's cancellation, so no thread is abandoned indefinitely.
+            pool.shutdown(wait=False, cancel_futures=True)
 
         def emit_stop() -> bool:
             return self._emit(
@@ -496,6 +508,29 @@ class SpeechEngine:
                 or generation.cancelled.is_set()
                 or generation.pause_boundary_reached.is_set()
             )
+
+    def _await_chunk(
+        self,
+        generation: _GenerationToken,
+        future: "Future[bytes]",
+    ) -> bytes:
+        """Wait for one chunk, giving up when the generation is abandoned.
+
+        A wanted chunk waits as long as synthesis needs. Once the generation is
+        abandoned the wait is capped, because the worker cannot cancel a running
+        HTTP call and must not withhold the terminal event until it returns.
+        """
+        deadline: float | None = None
+        while True:
+            try:
+                return future.result(timeout=_FUTURE_POLL_INTERVAL)
+            except FuturesTimeout:
+                pass
+            if self._should_abort(generation):
+                if deadline is None:
+                    deadline = time.monotonic() + _CANCEL_DRAIN_SECONDS
+                elif time.monotonic() >= deadline:
+                    raise Cancelled("abandoned chunk exceeded its drain deadline")
 
     def _reach_pause_boundary(self, generation: _GenerationToken) -> bool:
         """Make discarded lookahead abortable once the current chunk is done."""

@@ -5,6 +5,7 @@ import dataclasses
 import io
 import json
 import threading
+import time
 
 import pytest
 
@@ -1120,6 +1121,130 @@ class TestCancellationUnderBlockedOutput:
         finally:
             release_audio_emit.set()
             engine.wait_idle(3)
+
+
+class TestWorkerReclaimIsBounded:
+    """STOP and PAUSE must not wait on synthesis that nobody wants."""
+
+    def test_stop_reclaims_worker_while_a_post_is_in_flight(self):
+        post_entered = threading.Event()
+        release_post = threading.Event()
+
+        class WedgedClient(_FakeClient):
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                self.requests.append((text, voice_name, rate, pitch))
+                post_entered.set()
+                assert release_post.wait(10)
+                return self._audio
+
+        client = WedgedClient()
+        engine, fake_io = _engine(client=client)
+        engine.handle_speak(SSML)
+        assert post_entered.wait(3)
+
+        try:
+            engine.handle_stop()
+            assert engine.wait_idle(3), "worker waited for the abandoned POST"
+            assert fake_io.lines.count("703 STOP") == 1
+            assert "702 END" not in fake_io.lines
+        finally:
+            release_post.set()
+            engine.wait_idle(3)
+
+        assert engine.wait_idle(3)
+        release_post.set()
+        for _ in range(40):
+            if not [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("free-tts-pre")
+            ]:
+                break
+            time.sleep(0.05)
+        assert not [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("free-tts-pre")
+        ]
+
+    def test_pause_emits_at_boundary_while_lookahead_is_wedged(self):
+        lookahead_entered = threading.Event()
+        release_lookahead = threading.Event()
+        decode_entered = threading.Event()
+        release_decode = threading.Event()
+
+        class WedgedLookaheadClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    return self._audio
+                lookahead_entered.set()
+                assert release_lookahead.wait(10)
+                return self._audio
+
+        def gated_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            decode_entered.set()
+            assert release_decode.wait(3)
+            return b"\x01\x00" * 8
+
+        client = WedgedLookaheadClient()
+        fake_io = _FakeIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            client,
+            decoder=gated_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert lookahead_entered.wait(3)
+        assert decode_entered.wait(3)
+
+        # PAUSE lands before chunk one's boundary is evaluated, so the boundary
+        # is honest and chunk two becomes discarded lookahead.
+        engine.handle_pause()
+        release_decode.set()
+
+        try:
+            assert engine.wait_idle(3), "terminal event waited on executor drain"
+            assert fake_io.lines.count("704 PAUSE") == 1
+            assert "702 END" not in fake_io.lines
+            assert fake_io.lines.count("700:__spd_0") == 1
+            assert len(fake_io.audio) == 1
+        finally:
+            release_lookahead.set()
+            engine.wait_idle(3)
+
+    def test_uncancelled_speech_still_waits_for_synthesis(self):
+        """The bound applies to abandoned work only, never to wanted speech."""
+        engine, fake_io = _engine()
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert engine.wait_idle(5)
+        assert fake_io.lines[-1] == "702 END"
+        assert len(fake_io.audio) == 2
 
 
 class TestPauseFallback:
