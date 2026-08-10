@@ -228,6 +228,7 @@ class _PathSnapshot:
     kind: str
     data: bytes | str | None = None
     mode: int = 0
+    identity: tuple[int, int] | None = None
 
 
 def _snapshot_path(path: pathlib.Path) -> _PathSnapshot:
@@ -242,7 +243,7 @@ def _snapshot_path(path: pathlib.Path) -> _PathSnapshot:
     return _PathSnapshot("missing")
 
 
-def _restore_path(path: pathlib.Path, snapshot: _PathSnapshot) -> None:
+def _restore_file_path(path: pathlib.Path, snapshot: _PathSnapshot) -> None:
     if os.path.lexists(path):
         if path.is_dir() and not path.is_symlink():
             raise InstallError(f"cannot restore file snapshot over directory {path}")
@@ -515,12 +516,15 @@ def _load_service_endpoint(path: pathlib.Path) -> ServiceEndpoint:
         )
     if isinstance(port, str):
         port = port.strip()
-        if not port.isdigit():
+        try:
+            if not port.isascii() or not port.isdigit():
+                raise ValueError("port is not an ASCII decimal integer")
+            port = int(port)
+        except (TypeError, ValueError) as exc:
             raise PreflightError(
                 "endpoint config port must be an integer or integer-like "
                 f"string: {path}"
-            )
-        port = int(port)
+            ) from exc
     if not 1 <= port <= 65535:
         raise PreflightError(
             f"endpoint config port must be between 1 and 65535: {path}"
@@ -927,18 +931,18 @@ def _rollback_install(
     unit_touched: bool,
     enablement_path: pathlib.Path,
     enablement_snapshot: _PathSnapshot,
+    enablement_created_identity: tuple[int, int] | None,
     enablement_touched: bool,
     service_touched: bool,
     runner: Callable[..., object],
     previous_active: bool,
-    previous_enabled: bool,
 ) -> list[str]:
     """Restore pre-install files and service state, retaining failed data on error."""
     errors: list[str] = []
     failed_tree: pathlib.Path | None = None
 
     if service_touched:
-        failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
+        failure = _systemctl_error(runner, ["stop", UNIT_NAME])
         if failure is not None:
             errors.append(failure)
 
@@ -967,29 +971,27 @@ def _rollback_install(
 
     if unit_touched:
         try:
-            _restore_path(unit_path, unit_snapshot)
+            _restore_file_path(unit_path, unit_snapshot)
         except BaseException as exc:
             errors.append(f"could not restore service unit {unit_path}: {exc}")
+
+    if enablement_touched:
+        try:
+            _restore_enablement_snapshot(
+                enablement_path,
+                unit_path,
+                enablement_snapshot,
+                created_identity=enablement_created_identity,
+            )
+        except BaseException as exc:
+            errors.append(
+                f"could not restore service enablement {enablement_path}: {exc}"
+            )
 
     if service_touched:
         failure = _systemctl_error(runner, ["daemon-reload"])
         if failure is not None:
             errors.append(failure)
-        if previous_enabled:
-            failure = _systemctl_error(runner, ["enable", UNIT_NAME])
-            if failure is not None:
-                errors.append(failure)
-
-    if enablement_touched:
-        try:
-            # Only an absent path or the link we own may be replaced during
-            # rollback. A concurrent foreign entry is retained and reported.
-            _validate_enablement_link(enablement_path, unit_path)
-            _restore_path(enablement_path, enablement_snapshot)
-        except BaseException as exc:
-            errors.append(
-                f"could not restore service enablement {enablement_path}: {exc}"
-            )
 
     if service_touched:
         if previous_active:
@@ -1063,17 +1065,13 @@ def install_server(
             )
     unit_snapshot = _snapshot_path(unit_path)
     enablement_path = _enablement_path(unit_dir)
-    enablement_present = _validate_enablement_link(enablement_path, unit_path)
-    if not upgrading and enablement_present:
+    enablement_snapshot = _snapshot_enablement(enablement_path, unit_path)
+    if not upgrading and enablement_snapshot.kind != "missing":
         raise OwnershipError(
             f"refusing to overwrite unowned enablement path {enablement_path}"
         )
-    enablement_snapshot = _snapshot_path(enablement_path)
     previous_active = (
         _query_unit_state(runner, "is-active", "active") if upgrading else False
-    )
-    previous_enabled = (
-        _query_unit_state(runner, "is-enabled", "enabled") if upgrading else False
     )
     manifest = {
         **expected,
@@ -1100,6 +1098,7 @@ def install_server(
     published = False
     unit_touched = False
     enablement_touched = False
+    enablement_created_identity: tuple[int, int] | None = None
     service_touched = False
 
     try:
@@ -1133,8 +1132,14 @@ def install_server(
         service_touched = True
         _run_systemctl(runner, ["daemon-reload"])
         enablement_touched = True
-        _run_systemctl(runner, ["enable", UNIT_NAME])
+        enablement_created_identity = _ensure_enablement(
+            enablement_path,
+            unit_path,
+            enablement_snapshot,
+            created_directories,
+        )
         _run_systemctl(runner, ["restart", UNIT_NAME])
+        _verify_enablement(enablement_path, unit_path)
         _verify_service(
             runner,
             fetch,
@@ -1153,11 +1158,11 @@ def install_server(
             unit_touched=unit_touched,
             enablement_path=enablement_path,
             enablement_snapshot=enablement_snapshot,
+            enablement_created_identity=enablement_created_identity,
             enablement_touched=enablement_touched,
             service_touched=service_touched,
             runner=runner,
             previous_active=previous_active,
-            previous_enabled=previous_enabled,
         )
         if staging is not None and staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -1182,27 +1187,68 @@ def install_server(
 
 
 def _enablement_path(unit_dir: pathlib.Path) -> pathlib.Path:
-    """The enablement symlink that `systemctl enable` creates for our unit."""
+    """The sole wants path managed by this installer."""
     return pathlib.Path(unit_dir) / "default.target.wants" / UNIT_NAME
+
+
+def _enablement_target(path: pathlib.Path, unit_path: pathlib.Path) -> str:
+    """Return the fixed relative target for the validated wants path."""
+    expected = pathlib.Path(unit_path).parent / "default.target.wants" / UNIT_NAME
+    if os.path.abspath(path) != os.path.abspath(expected):
+        raise InstallError(
+            f"enablement path is outside the expected wants directory: {path}"
+        )
+    return str(pathlib.Path("..") / UNIT_NAME)
+
+
+def _snapshot_is_owned_enablement(
+    path: pathlib.Path,
+    unit_path: pathlib.Path,
+    snapshot: _PathSnapshot,
+) -> bool:
+    if snapshot.kind != "symlink" or not isinstance(snapshot.data, str):
+        return False
+    target = pathlib.Path(snapshot.data)
+    resolved = _canonical(target if target.is_absolute() else path.parent / target)
+    return resolved == _canonical(unit_path)
+
+
+def _describe_enablement(snapshot: _PathSnapshot) -> str:
+    if snapshot.kind == "symlink":
+        return f"symlink with target {snapshot.data!r}"
+    return snapshot.kind
 
 
 def _validate_enablement_link(
     path: pathlib.Path, unit_path: pathlib.Path
 ) -> bool:
-    """Return True for an owned enablement symlink, False when absent.
-
-    A regular file, directory, or symlink resolving outside the validated
-    unit path is foreign and raises before any uninstall mutation.
-    """
-    if not os.path.lexists(path):
+    """Observe and validate an owned enablement symlink without mutation."""
+    observed = _observe_enablement(path)
+    if observed.kind == "missing":
         return False
-    if not path.is_symlink():
+    if not _snapshot_is_owned_enablement(path, unit_path, observed):
+        if observed.kind == "symlink":
+            raise OwnershipError(
+                f"enablement symlink targets a foreign unit: {path}"
+            )
         raise OwnershipError(f"enablement path is not an owned symlink: {path}")
-    target = pathlib.Path(os.readlink(path))
-    resolved = _canonical(target if target.is_absolute() else path.parent / target)
-    if resolved != _canonical(unit_path):
-        raise OwnershipError(f"enablement symlink targets a foreign unit: {path}")
     return True
+
+
+def _snapshot_enablement(
+    path: pathlib.Path, unit_path: pathlib.Path
+) -> _PathSnapshot:
+    """Take a stable missing-or-owned snapshot of the wants path."""
+    _validate_enablement_link(path, unit_path)
+    observed = _observe_enablement(path)
+    if observed.kind == "missing":
+        return observed
+    if not _snapshot_is_owned_enablement(path, unit_path, observed):
+        raise OwnershipError(
+            f"enablement path changed during observation: {path}; retained "
+            f"{_describe_enablement(observed)}"
+        )
+    return observed
 
 
 _ENABLEMENT_OBSERVATION_ATTEMPTS = 3
@@ -1221,8 +1267,7 @@ def _observe_enablement(path: pathlib.Path) -> _PathSnapshot:
             return _PathSnapshot("missing")
         except OSError as exc:
             raise InstallError(
-                f"incomplete compensation for service enablement {path}: "
-                f"could not inspect path: {exc}"
+                f"could not inspect service enablement {path}: {exc}"
             ) from exc
 
         if stat.S_ISLNK(before.st_mode):
@@ -1232,8 +1277,7 @@ def _observe_enablement(path: pathlib.Path) -> _PathSnapshot:
                 continue
             except OSError as exc:
                 raise InstallError(
-                    f"incomplete compensation for service enablement {path}: "
-                    f"could not read symlink target: {exc}"
+                    f"could not read service enablement symlink {path}: {exc}"
                 ) from exc
             try:
                 after = os.lstat(path)
@@ -1241,12 +1285,12 @@ def _observe_enablement(path: pathlib.Path) -> _PathSnapshot:
                 continue
             except OSError as exc:
                 raise InstallError(
-                    f"incomplete compensation for service enablement {path}: "
-                    f"could not confirm symlink identity: {exc}"
+                    f"could not confirm service enablement identity {path}: {exc}"
                 ) from exc
-            if _lstat_identity(before) != _lstat_identity(after):
+            identity = _lstat_identity(after)
+            if _lstat_identity(before) != identity:
                 continue
-            return _PathSnapshot("symlink", target)
+            return _PathSnapshot("symlink", target, identity=identity)
 
         try:
             after = os.lstat(path)
@@ -1254,70 +1298,208 @@ def _observe_enablement(path: pathlib.Path) -> _PathSnapshot:
             continue
         except OSError as exc:
             raise InstallError(
-                f"incomplete compensation for service enablement {path}: "
-                f"could not confirm path identity: {exc}"
+                f"could not confirm service enablement identity {path}: {exc}"
             ) from exc
-        if _lstat_identity(before) != _lstat_identity(after):
+        identity = _lstat_identity(after)
+        if _lstat_identity(before) != identity:
             continue
         if stat.S_ISREG(after.st_mode):
-            return _PathSnapshot("file")
+            return _PathSnapshot("file", identity=identity)
         if stat.S_ISDIR(after.st_mode):
-            return _PathSnapshot("directory")
-        return _PathSnapshot("other")
+            return _PathSnapshot("directory", identity=identity)
+        return _PathSnapshot("other", identity=identity)
 
     raise InstallError(
-        f"incomplete compensation for service enablement {path}: "
-        "could not obtain a stable observation"
+        f"could not obtain a stable service enablement observation at {path}"
     )
 
 
-def _restore_enablement_after_failed_disable(
+def _ensure_enablement(
     path: pathlib.Path,
     unit_path: pathlib.Path,
     snapshot: _PathSnapshot,
+    created_directories: list[pathlib.Path],
+) -> tuple[int, int] | None:
+    """Create the wants link without replacing any entry.
+
+    The returned identity belongs to a link created by this invocation. None
+    means an exact owned link was already present and was left untouched.
+    """
+    target = _enablement_target(path, unit_path)
+    _ensure_directory(path.parent, created_directories)
+    try:
+        os.symlink(target, path)
+    except FileExistsError as exc:
+        observed = _observe_enablement(path)
+        accepted_targets = {target}
+        if snapshot.kind == "symlink" and isinstance(snapshot.data, str):
+            accepted_targets.add(snapshot.data)
+        if (
+            _snapshot_is_owned_enablement(path, unit_path, observed)
+            and observed.data in accepted_targets
+        ):
+            return None
+        raise OwnershipError(
+            f"refusing to replace service enablement {path}; retained "
+            f"{_describe_enablement(observed)}"
+        ) from exc
+    except OSError as exc:
+        raise InstallError(
+            f"could not create service enablement {path}: {exc}"
+        ) from exc
+
+    observed = _observe_enablement(path)
+    if (
+        observed.data != target
+        or observed.identity is None
+        or not _snapshot_is_owned_enablement(path, unit_path, observed)
+    ):
+        raise InstallError(
+            f"created service enablement could not be verified at {path}; "
+            f"observed {_describe_enablement(observed)}"
+        )
+    return observed.identity
+
+
+def _verify_enablement(path: pathlib.Path, unit_path: pathlib.Path) -> None:
+    observed = _snapshot_enablement(path, unit_path)
+    if observed.kind == "missing":
+        raise InstallError(f"service enablement disappeared after restart: {path}")
+
+
+_ENABLEMENT_QUARANTINE_PREFIX = f".{UNIT_NAME}.enablement-quarantine-"
+
+
+def _remove_owned_enablement(
+    path: pathlib.Path,
+    unit_path: pathlib.Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> bool:
+    """Move the wants entry aside, verify that inode, then remove only ours."""
+    # This observation is deliberately non-authoritative. The rename below
+    # moves whatever inode is current, and the moved inode is checked again.
+    _validate_enablement_link(path, unit_path)
+    if not path.parent.exists():
+        return False
+    quarantine = _reserve_sibling(path.parent, _ENABLEMENT_QUARANTINE_PREFIX)
+    try:
+        os.rename(path, quarantine)
+    except FileNotFoundError:
+        observed = _observe_enablement(path)
+        if observed.kind == "missing":
+            return False
+        raise InstallError(
+            f"incomplete cleanup for service enablement {path}: an entry "
+            f"appeared during removal; retained {_describe_enablement(observed)}"
+        )
+    except OSError as exc:
+        raise InstallError(
+            f"could not quarantine service enablement {path}: {exc}"
+        ) from exc
+
+    try:
+        moved = _observe_enablement(quarantine)
+        replacement = _observe_enablement(path)
+    except BaseException as exc:
+        raise InstallError(
+            f"incomplete cleanup for service enablement {path}: moved entry "
+            f"retained at {quarantine}; {exc}"
+        ) from exc
+
+    moved_is_owned = _snapshot_is_owned_enablement(path, unit_path, moved)
+    identity_matches = (
+        expected_identity is None or moved.identity == expected_identity
+    )
+    if not moved_is_owned or not identity_matches:
+        detail = _describe_enablement(moved)
+        if moved_is_owned and not identity_matches:
+            detail = "owned symlink with an unexpected inode"
+        if replacement.kind != "missing":
+            detail += (
+                f"; original path also retains "
+                f"{_describe_enablement(replacement)}"
+            )
+        raise InstallError(
+            f"incomplete cleanup for service enablement {path}: {detail} "
+            f"retained at {quarantine}"
+        )
+
+    try:
+        quarantine.unlink()
+    except OSError as exc:
+        raise InstallError(
+            f"could not remove verified service enablement; retained at "
+            f"{quarantine}: {exc}"
+        ) from exc
+
+    if replacement.kind != "missing":
+        raise InstallError(
+            f"incomplete cleanup for service enablement {path}: another entry "
+            f"appeared at the original path and was retained as "
+            f"{_describe_enablement(replacement)}"
+        )
+    return True
+
+
+def _restore_enablement_snapshot(
+    path: pathlib.Path,
+    unit_path: pathlib.Path,
+    snapshot: _PathSnapshot,
+    *,
+    created_identity: tuple[int, int] | None = None,
 ) -> None:
-    """Restore only an absent or unchanged owned enablement entry."""
+    """Restore exact missing-or-symlink state without replacing an entry."""
     if snapshot.kind not in {"missing", "symlink"}:
         raise InstallError(
             f"incomplete compensation for service enablement {path}: "
             f"unexpected snapshot kind {snapshot.kind!r}"
         )
 
+    if snapshot.kind == "missing":
+        observed = _observe_enablement(path)
+        if observed.kind == "missing":
+            return
+        if created_identity is None:
+            raise InstallError(
+                f"incomplete compensation for service enablement {path}: "
+                f"expected an absent path, observed "
+                f"{_describe_enablement(observed)}"
+            )
+        try:
+            _remove_owned_enablement(
+                path, unit_path, expected_identity=created_identity
+            )
+        except BaseException as exc:
+            raise InstallError(
+                f"incomplete compensation for service enablement {path}: {exc}"
+            ) from exc
+        return
+
     try:
         _validate_enablement_link(path, unit_path)
-    except FileNotFoundError:
-        # The stable observation below handles a disappearance/reappearance
-        # between validation and compensation without mutating the path.
-        pass
     except OwnershipError as exc:
         raise InstallError(
             f"incomplete compensation for service enablement {path}: {exc}"
         ) from exc
-
     observed = _observe_enablement(path)
-    if snapshot.kind == "missing":
-        if observed.kind == "missing":
-            return
-        raise InstallError(
-            f"incomplete compensation for service enablement {path}: "
-            f"expected an absent path, observed {observed.kind}"
-        )
-
     target = snapshot.data
     if not isinstance(target, str):
         raise InstallError(
             f"incomplete compensation for service enablement {path}: "
             "saved symlink target is invalid"
         )
-    if observed.kind == "symlink" and observed.data == target:
+    if (
+        observed.kind == "symlink"
+        and observed.data == target
+        and _snapshot_is_owned_enablement(path, unit_path, observed)
+    ):
         return
     if observed.kind != "missing":
-        detail = f"observed {observed.kind}"
-        if observed.kind == "symlink":
-            detail += f" with target {observed.data!r}"
         raise InstallError(
             f"incomplete compensation for service enablement {path}: "
-            f"expected symlink target {target!r}, {detail}"
+            f"expected symlink target {target!r}, observed "
+            f"{_describe_enablement(observed)}"
         )
 
     try:
@@ -1331,12 +1513,10 @@ def _restore_enablement_after_failed_disable(
                 f"incomplete compensation for service enablement {path}: "
                 f"an entry appeared during symlink creation ({observation_error})"
             ) from exc
-        detail = replacement.kind
-        if replacement.kind == "symlink":
-            detail += f" with target {replacement.data!r}"
         raise InstallError(
             f"incomplete compensation for service enablement {path}: "
-            f"an entry appeared during symlink creation; observed {detail}"
+            f"an entry appeared during symlink creation; observed "
+            f"{_describe_enablement(replacement)}"
         ) from exc
     except OSError as exc:
         raise InstallError(
@@ -1345,15 +1525,26 @@ def _restore_enablement_after_failed_disable(
         ) from exc
 
     restored = _observe_enablement(path)
-    if restored.kind == "symlink" and restored.data == target:
+    if (
+        restored.kind == "symlink"
+        and restored.data == target
+        and _snapshot_is_owned_enablement(path, unit_path, restored)
+    ):
         return
-    detail = restored.kind
-    if restored.kind == "symlink":
-        detail += f" with target {restored.data!r}"
     raise InstallError(
-        f"incomplete compensation for service enablement {path}: "
-        f"created symlink was not stable at the saved target; observed {detail}"
+        f"incomplete compensation for service enablement {path}: created "
+        f"symlink was not stable at the saved target; observed "
+        f"{_describe_enablement(restored)}"
     )
+
+
+def _restore_enablement_after_failed_disable(
+    path: pathlib.Path,
+    unit_path: pathlib.Path,
+    snapshot: _PathSnapshot,
+) -> None:
+    """Restore the exact pre-disable wants state without replacement."""
+    _restore_enablement_snapshot(path, unit_path, snapshot)
 
 
 def _remove_owned_root(root: pathlib.Path, manifest: dict) -> None:
@@ -1435,8 +1626,7 @@ def uninstall_server(
                 f"owned service unit must be a regular non-symlink file: {unit_path}"
             )
     enablement = _enablement_path(unit_dir)
-    _validate_enablement_link(enablement, unit_path)
-    enablement_snapshot = _snapshot_path(enablement)
+    enablement_snapshot = _snapshot_enablement(enablement, unit_path)
     stop_sleeper = time.sleep if sleeper is None else sleeper
 
     disable_failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
@@ -1467,20 +1657,8 @@ def uninstall_server(
             detail += "\n- service enablement restored for retry"
         raise InstallError(detail) from stop_error
 
-    if os.path.lexists(enablement):
-        # A successful disable normally removes the link itself; only a
-        # still-present entry needs removal. Revalidate before unlinking so a
-        # foreign replacement is never tolerated or deleted.
-        _validate_enablement_link(enablement, unit_path)
-        try:
-            enablement.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            detail = f"could not remove {enablement}: {exc}"
-            if disable_failure is not None:
-                detail = f"{detail}\n- {disable_failure}"
-            raise InstallError(f"server uninstall failed:\n- {detail}") from exc
+    enablement_removed = _remove_owned_enablement(enablement, unit_path)
+    if enablement_removed:
         removed.append(str(enablement))
 
     if disable_failure is not None and os.path.lexists(enablement):

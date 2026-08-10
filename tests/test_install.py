@@ -3,13 +3,16 @@
 Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
 """
 
+import errno
 import json
 import http.client
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import urllib.error
 
 import pytest
@@ -503,7 +506,7 @@ class StatefulSystemctl:
 
 
 class EnablementSystemctl(StatefulSystemctl):
-    """Stateful systemctl model that applies wants-link filesystem effects."""
+    """Stateful systemctl model paired with a real wants-path filesystem."""
 
     def __init__(
         self,
@@ -511,63 +514,36 @@ class EnablementSystemctl(StatefulSystemctl):
         *,
         active=False,
         enabled=False,
-        fail_after_enable=False,
-        remove_on_disable=True,
-        foreign_after_disable=False,
+        fail_once=None,
     ):
-        super().__init__(active=active, enabled=enabled)
+        super().__init__(
+            active=active,
+            enabled=enabled,
+            fail_once=fail_once,
+        )
         self.unit = pathlib.Path(unit_dir) / install.UNIT_NAME
         self.link = (
             pathlib.Path(unit_dir)
             / "default.target.wants"
             / install.UNIT_NAME
         )
-        self.fail_after_enable = fail_after_enable
-        self.remove_on_disable = remove_on_disable
-        self.foreign_after_disable = foreign_after_disable
 
-    def _write_owned_link(self):
-        if self.link.is_dir() and not self.link.is_symlink():
-            shutil.rmtree(self.link)
-        elif os.path.lexists(self.link):
-            self.link.unlink()
-        self.link.parent.mkdir(parents=True, exist_ok=True)
-        self.link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
 
-    def _link_is_owned(self):
-        if not self.link.is_symlink():
-            return False
-        target = pathlib.Path(os.readlink(self.link))
-        resolved = (
-            target
-            if target.is_absolute()
-            else self.link.parent / target
-        ).resolve(strict=False)
-        return resolved == self.unit.resolve(strict=False)
+class SystemctlEnableOverwriteProbe(EnablementSystemctl):
+    """Expose destructive enable delegation if production still invokes it."""
 
     def __call__(self, args, check=True):
         args = list(args)
-        command = args[0]
-        if command == "enable":
+        if args[0] == "enable":
             self.calls.append(args)
-            self._write_owned_link()
-            self.enabled = True
-            if self.fail_after_enable and not self.failed:
-                self.failed = True
-                return FakeCompleted(returncode=7, stderr="enable failed")
-            return FakeCompleted()
-        if command == "disable":
-            result = super().__call__(args, check=check)
-            if self.remove_on_disable and self._link_is_owned():
+            if self.link.is_dir() and not self.link.is_symlink():
+                shutil.rmtree(self.link)
+            elif os.path.lexists(self.link):
                 self.link.unlink()
-            if self.foreign_after_disable:
-                if self.link.is_dir() and not self.link.is_symlink():
-                    shutil.rmtree(self.link)
-                elif os.path.lexists(self.link):
-                    self.link.unlink()
-                self.link.parent.mkdir(parents=True, exist_ok=True)
-                self.link.write_text("foreign replacement\n")
-            return result
+            self.link.parent.mkdir(parents=True, exist_ok=True)
+            self.link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
+            self.enabled = True
+            return FakeCompleted()
         return super().__call__(args, check=check)
 
 
@@ -808,6 +784,30 @@ def test_load_service_endpoint_accepts_custom_port(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "port",
+    (
+        "\N{SUPERSCRIPT TWO}",
+        "9"
+        * (
+            sys.get_int_max_str_digits() + 1
+            if sys.get_int_max_str_digits()
+            else 10_000
+        ),
+    ),
+)
+def test_load_service_endpoint_rejects_unparseable_unicode_and_oversized_ports(
+    tmp_path, port
+):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"port": port}))
+
+    with pytest.raises(
+        install.PreflightError, match=re.escape(str(config))
+    ):
+        install._load_service_endpoint(config)
+
+
+@pytest.mark.parametrize(
     "bind_host,probe_host,url",
     (
         ("0.0.0.0", "127.0.0.1", "http://127.0.0.1:6123/health"),
@@ -894,6 +894,7 @@ def test_install_server_writes_manifest_config_and_unit(checkout, tmp_path):
 
     root = tmp_path / "share" / "free-tts-server"
     unit = tmp_path / "config" / "systemd" / "user" / install.UNIT_NAME
+    link = install._enablement_path(unit.parent)
     assert manifest["component"] == "server"
     assert manifest["root"] == str(root)
     assert manifest["unit"] == str(unit)
@@ -903,7 +904,9 @@ def test_install_server_writes_manifest_config_and_unit(checkout, tmp_path):
     assert str(root) in unit.read_text()
     assert venv == [root]
     assert ["daemon-reload"] in calls
-    assert ["enable", install.UNIT_NAME] in calls
+    assert ["enable", install.UNIT_NAME] not in calls
+    assert link.is_symlink()
+    assert os.readlink(link) == str(pathlib.Path("..") / install.UNIT_NAME)
     assert ["restart", install.UNIT_NAME] in calls
 
 
@@ -1126,17 +1129,122 @@ def test_install_server_rejects_upgrade_enablement_collision_before_mutation(
     assert runner.calls == []
 
 
-def test_install_server_fresh_enable_failure_restores_absent_enablement(
+@pytest.mark.parametrize("kind", ("file", "foreign-symlink"))
+def test_install_server_retains_collision_before_enablement_creation(
+    kind, checkout, tmp_path, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = SystemctlEnableOverwriteProbe(unit_dir)
+    real_run_systemctl = install._run_systemctl
+
+    def collide_after_reload(systemctl, args):
+        result = real_run_systemctl(systemctl, args)
+        if args == ["daemon-reload"]:
+            write_foreign_enablement(runner.link, kind, unit)
+        return result
+
+    monkeypatch.setattr(install, "_run_systemctl", collide_after_reload)
+
+    with pytest.raises(
+        install.InstallError, match="rollback was incomplete"
+    ) as excinfo:
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    if kind == "file":
+        assert runner.link.read_text() == "foreign\n"
+    else:
+        assert runner.link.is_symlink()
+        assert os.readlink(runner.link) == str(runner.link.parent / "foreign.service")
+    retained = list(root.parent.glob(".free-tts-server-failed-*"))
+    assert len(retained) == 1
+    assert str(retained[0]) in str(excinfo.value)
+    assert not unit.exists()
+
+
+def test_install_server_rejects_foreign_replacement_after_restart(
+    checkout, tmp_path, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = SystemctlEnableOverwriteProbe(unit_dir)
+    real_run_systemctl = install._run_systemctl
+
+    def replace_after_restart(systemctl, args):
+        result = real_run_systemctl(systemctl, args)
+        if args == ["restart", install.UNIT_NAME]:
+            runner.link.unlink()
+            runner.link.write_text("foreign after restart\n")
+        return result
+
+    monkeypatch.setattr(install, "_run_systemctl", replace_after_restart)
+
+    with pytest.raises(
+        install.InstallError, match="rollback was incomplete"
+    ) as excinfo:
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    assert runner.link.read_text() == "foreign after restart\n"
+    retained = list(root.parent.glob(".free-tts-server-failed-*"))
+    assert len(retained) == 1
+    assert str(retained[0]) in str(excinfo.value)
+    assert not unit.exists()
+
+
+def test_install_server_rollback_quarantines_replacement_after_observation(
+    checkout, tmp_path, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = SystemctlEnableOverwriteProbe(unit_dir)
+    runner.fail_once = "restart"
+    validations = 0
+    real_validate = install._validate_enablement_link
+
+    def validate_then_replace(path, unit_path):
+        nonlocal validations
+        result = real_validate(path, unit_path)
+        validations += 1
+        if validations == 2:
+            path.unlink()
+            path.write_text("foreign rollback replacement\n")
+        return result
+
+    monkeypatch.setattr(install, "_validate_enablement_link", validate_then_replace)
+
+    with pytest.raises(
+        install.InstallError, match="rollback was incomplete"
+    ) as excinfo:
+        _transaction_install(
+            checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
+        )
+
+    quarantined = list(runner.link.parent.glob(".*enablement-quarantine-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "foreign rollback replacement\n"
+    assert str(quarantined[0]) in str(excinfo.value)
+    retained = list(root.parent.glob(".free-tts-server-failed-*"))
+    assert len(retained) == 1
+    assert str(retained[0]) in str(excinfo.value)
+    assert not unit.exists()
+
+
+def test_install_server_fresh_restart_failure_restores_absent_enablement(
     checkout, tmp_path
 ):
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit = unit_dir / install.UNIT_NAME
-    runner = EnablementSystemctl(
-        unit_dir, fail_after_enable=True, remove_on_disable=False
-    )
+    runner = EnablementSystemctl(unit_dir, fail_once="restart")
 
-    with pytest.raises(install.InstallError, match="enable failed"):
+    with pytest.raises(install.InstallError, match="restart failed"):
         _transaction_install(
             checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
         )
@@ -1144,14 +1252,15 @@ def test_install_server_fresh_enable_failure_restores_absent_enablement(
     assert not os.path.lexists(runner.link)
     assert not root.exists()
     assert not unit.exists()
-    assert runner.calls[:3] == [
+    assert runner.calls == [
         ["daemon-reload"],
-        ["enable", install.UNIT_NAME],
-        ["disable", "--now", install.UNIT_NAME],
+        ["restart", install.UNIT_NAME],
+        ["stop", install.UNIT_NAME],
+        ["daemon-reload"],
     ]
 
 
-def test_install_server_upgrade_enable_failure_restores_exact_enablement(
+def test_install_server_upgrade_restart_failure_restores_exact_enablement(
     checkout, tmp_path
 ):
     root = tmp_path / "share" / "free-tts-server"
@@ -1166,12 +1275,11 @@ def test_install_server_upgrade_enable_failure_restores_exact_enablement(
     previous_target = os.readlink(runner.link)
     before_root = snapshot_tree(root)
     before_unit = unit.read_bytes()
-    runner.fail_after_enable = True
-    runner.remove_on_disable = False
+    runner.fail_once = "restart"
     runner.failed = False
     runner.calls.clear()
 
-    with pytest.raises(install.InstallError, match="enable failed"):
+    with pytest.raises(install.InstallError, match="restart failed"):
         _transaction_install(
             checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
         )
@@ -1181,20 +1289,25 @@ def test_install_server_upgrade_enable_failure_restores_exact_enablement(
     assert runner.link.is_symlink()
     assert os.readlink(runner.link) == previous_target
     assert runner.active is True
-    assert runner.enabled is True
+    assert ["enable", install.UNIT_NAME] not in runner.calls
 
 
 def test_install_server_rollback_preserves_new_foreign_enablement(
-    checkout, tmp_path
+    checkout, tmp_path, monkeypatch
 ):
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
-    runner = EnablementSystemctl(
-        unit_dir,
-        fail_after_enable=True,
-        remove_on_disable=False,
-        foreign_after_disable=True,
-    )
+    runner = EnablementSystemctl(unit_dir, fail_once="restart")
+    real_systemctl_error = install._systemctl_error
+
+    def replace_after_stop(systemctl, args):
+        failure = real_systemctl_error(systemctl, args)
+        if args == ["stop", install.UNIT_NAME]:
+            runner.link.unlink()
+            runner.link.write_text("foreign replacement\n")
+        return failure
+
+    monkeypatch.setattr(install, "_systemctl_error", replace_after_stop)
 
     with pytest.raises(
         install.InstallError, match="rollback was incomplete"
@@ -1222,7 +1335,6 @@ def test_install_server_success_creates_repairs_and_keeps_owned_enablement(
     assert runner.link.resolve(strict=False) == unit.resolve(strict=False)
 
     runner.link.unlink()
-    runner.enabled = False
     _transaction_install(
         checkout, root, unit_dir, runner, fake_venv_builder, healthy_fetch
     )
@@ -1290,7 +1402,20 @@ def _arm_install_failure(boundary, monkeypatch, root, runner):
             return real_write_unit(text, unit_dir)
 
         monkeypatch.setattr(install, "write_unit", failing_unit)
-    elif boundary in {"daemon-reload", "enable", "restart"}:
+    elif boundary == "enablement":
+        real_symlink = install.os.symlink
+
+        def failing_enablement(target, destination, *args, **kwargs):
+            destination = pathlib.Path(destination)
+            if (
+                destination.name == install.UNIT_NAME
+                and destination.parent.name == "default.target.wants"
+            ):
+                fail_once("enablement boundary failed")
+            return real_symlink(target, destination, *args, **kwargs)
+
+        monkeypatch.setattr(install.os, "symlink", failing_enablement)
+    elif boundary in {"daemon-reload", "restart"}:
         runner.fail_once = boundary
         runner.failed = False
     elif boundary == "active":
@@ -1359,7 +1484,7 @@ def test_install_server_publishes_complete_manifest_and_config_in_staged_root(
         "venv",
         "unit",
         "daemon-reload",
-        "enable",
+        "enablement",
         "restart",
         "active",
         "health",
@@ -1371,6 +1496,7 @@ def test_install_server_fresh_failure_cleans_up_and_retry_succeeds(
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit = unit_dir / "free-tts.service"
+    link = install._enablement_path(unit_dir)
     runner = StatefulSystemctl()
     builder, fetch, release = _arm_install_failure(
         boundary, monkeypatch, root, runner
@@ -1386,7 +1512,7 @@ def test_install_server_fresh_failure_cleans_up_and_retry_succeeds(
     assert not root.parent.exists()
     assert not unit_dir.exists()
     assert runner.active is False
-    assert runner.enabled is False
+    assert not os.path.lexists(link)
     assert_no_transaction_artifacts(root, unit_dir)
 
     release()
@@ -1399,13 +1525,22 @@ def test_install_server_fresh_failure_cleans_up_and_retry_succeeds(
     assert (root / "config.json").read_text() == '{"port": 5000}\n'
     assert unit.is_file()
     assert runner.active is True
-    assert runner.enabled is True
+    assert link.is_symlink()
+    assert os.readlink(link) == str(pathlib.Path("..") / install.UNIT_NAME)
     assert_no_transaction_artifacts(root, unit_dir)
 
 
 @pytest.mark.parametrize(
     "boundary",
-    ("manifest", "publish", "unit", "daemon-reload", "enable", "restart", "health"),
+    (
+        "manifest",
+        "publish",
+        "unit",
+        "daemon-reload",
+        "enablement",
+        "restart",
+        "health",
+    ),
 )
 def test_install_server_upgrade_failure_restores_exact_install_and_retries(
     boundary, checkout, tmp_path, monkeypatch
@@ -1413,6 +1548,7 @@ def test_install_server_upgrade_failure_restores_exact_install_and_retries(
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit = unit_dir / "free-tts.service"
+    link = install._enablement_path(unit_dir)
     runner = StatefulSystemctl()
 
     def initial_builder(target):
@@ -1430,6 +1566,7 @@ def test_install_server_upgrade_failure_restores_exact_install_and_retries(
     (root / "config.json").write_text('{"port": 6123}\n')
     before_root = snapshot_tree(root)
     before_unit = (unit.read_bytes(), stat.S_IMODE(unit.stat().st_mode))
+    before_enablement = os.readlink(link)
     (checkout / "server.py").write_text("# server v2\n")
     (checkout / "VERSION").write_text("2.2.0\n")
     builder, fetch, release = _arm_install_failure(
@@ -1444,7 +1581,8 @@ def test_install_server_upgrade_failure_restores_exact_install_and_retries(
     assert snapshot_tree(root) == before_root
     assert (unit.read_bytes(), stat.S_IMODE(unit.stat().st_mode)) == before_unit
     assert runner.active is True
-    assert runner.enabled is True
+    assert link.is_symlink()
+    assert os.readlink(link) == before_enablement
     assert_no_transaction_artifacts(root, unit_dir)
 
     release()
@@ -1456,7 +1594,8 @@ def test_install_server_upgrade_failure_restores_exact_install_and_retries(
     assert (root / "server.py").read_text() == "# server v2\n"
     assert (root / "config.json").read_text() == '{"port": 6123}\n'
     assert runner.active is True
-    assert runner.enabled is True
+    assert link.is_symlink()
+    assert os.readlink(link) == before_enablement
     assert_no_transaction_artifacts(root, unit_dir)
 
 
@@ -1702,7 +1841,10 @@ def test_uninstall_server_keeps_unowned_root(tmp_path):
 def write_enablement_link(unit_dir):
     link = unit_dir / "default.target.wants" / install.UNIT_NAME
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
+    if not os.path.lexists(link):
+        link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
+    assert link.is_symlink()
+    assert os.readlink(link) == str(pathlib.Path("..") / install.UNIT_NAME)
     return link
 
 
@@ -1908,6 +2050,7 @@ def test_uninstall_compensation_retains_unexpected_enablement_from_missing_snaps
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit = unit_dir / install.UNIT_NAME
     link = install._enablement_path(unit_dir)
+    link.unlink()
     link.parent.mkdir(parents=True, exist_ok=True)
     assert not os.path.lexists(link)
     runner = DisableCreatesOwnedEnablementSystemctl(link)
@@ -2014,6 +2157,99 @@ def test_uninstall_rejects_replaced_enablement_after_disable(checkout, tmp_path)
     assert root.is_dir()
 
 
+def test_uninstall_quarantines_replacement_after_removal_observation(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = StatefulSystemctl(active=True, enabled=True)
+    validations = 0
+    real_validate = install._validate_enablement_link
+
+    def validate_then_replace(path, unit_path):
+        nonlocal validations
+        result = real_validate(path, unit_path)
+        validations += 1
+        if validations == 2:
+            path.unlink()
+            path.write_text("foreign successful-uninstall replacement\n")
+        return result
+
+    monkeypatch.setattr(install, "_validate_enablement_link", validate_then_replace)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.uninstall_server(
+            root=root, unit_dir=unit_dir, systemctl=runner
+        )
+
+    quarantined = list(link.parent.glob(".*enablement-quarantine-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "foreign successful-uninstall replacement\n"
+    assert str(quarantined[0]) in str(excinfo.value)
+    assert unit.is_file()
+    assert root.is_dir()
+
+
+def test_uninstall_retains_original_path_collision_after_quarantine_move(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = StatefulSystemctl(active=True, enabled=True)
+    real_rename = install.os.rename
+
+    def rename_then_collide(source, target):
+        result = real_rename(source, target)
+        if pathlib.Path(source) == link:
+            link.write_text("foreign original-path collision\n")
+        return result
+
+    monkeypatch.setattr(install.os, "rename", rename_then_collide)
+
+    with pytest.raises(install.InstallError, match="incomplete cleanup"):
+        install.uninstall_server(
+            root=root, unit_dir=unit_dir, systemctl=runner
+        )
+
+    assert link.read_text() == "foreign original-path collision\n"
+    assert unit.is_file()
+    assert root.is_dir()
+
+
+def test_uninstall_tolerates_enablement_enoent_during_quarantine_move(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = write_enablement_link(unit_dir)
+    runner = StatefulSystemctl(active=True, enabled=True)
+    real_rename = install.os.rename
+
+    def disappear_before_rename(source, target):
+        if pathlib.Path(source) == link:
+            link.unlink()
+            raise FileNotFoundError(errno.ENOENT, "injected disappearance", str(link))
+        return real_rename(source, target)
+
+    monkeypatch.setattr(install.os, "rename", disappear_before_rename)
+
+    removed = install.uninstall_server(
+        root=root, unit_dir=unit_dir, systemctl=runner
+    )
+
+    assert not os.path.lexists(link)
+    assert str(unit) in removed
+    assert str(root) in removed
+
+
 @pytest.mark.parametrize("kind", ("file", "directory", "foreign-symlink"))
 def test_uninstall_rejects_foreign_enablement_before_mutation(
     kind, checkout, tmp_path
@@ -2024,6 +2260,7 @@ def test_uninstall_rejects_foreign_enablement_before_mutation(
     unit = unit_dir / install.UNIT_NAME
     link = unit_dir / "default.target.wants" / install.UNIT_NAME
     link.parent.mkdir(parents=True, exist_ok=True)
+    link.unlink()
     if kind == "file":
         link.write_text("foreign\n")
     elif kind == "directory":
@@ -2170,6 +2407,7 @@ def test_uninstall_failed_stop_preserves_absent_enablement(
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit = unit_dir / install.UNIT_NAME
     link = install._enablement_path(unit_dir)
+    link.unlink()
     assert not os.path.lexists(link)
     runner = DisableActivitySequenceSystemctl(link, ["deactivating"])
     monkeypatch.setattr(install.time, "sleep", lambda delay: None)
@@ -2367,6 +2605,34 @@ def test_main_rejects_unknown_command(capsys):
 def test_main_help_exits_zero(capsys):
     assert install.main(["--help"]) == 0
     assert "usage" in capsys.readouterr().out
+
+
+def test_main_install_server_aggregates_malformed_port_without_traceback(
+    checkout, tmp_path, monkeypatch, capsys
+):
+    config = checkout / "config.example.json"
+    config.write_text(json.dumps({"port": "\N{SUPERSCRIPT TWO}"}))
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    monkeypatch.setattr(install, "checkout_root", lambda: checkout)
+    monkeypatch.setattr(install, "server_root", lambda: root)
+    monkeypatch.setattr(install, "systemd_user_dir", lambda: unit_dir)
+    monkeypatch.setattr(
+        install,
+        "default_systemctl",
+        fake_systemctl(
+            {"is-system-running": FakeCompleted(stdout="running\n")}
+        ),
+    )
+
+    code = install.main(["install", "server"])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert str(config) in captured.out
+    assert "port" in captured.out
+    assert "Traceback" not in captured.out + captured.err
+    assert not root.exists()
 
 
 def test_main_status_prints_a_report(checkout, tmp_path, monkeypatch, capsys):
