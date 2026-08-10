@@ -196,3 +196,94 @@ def test_write_unit_creates_then_overwrites(tmp_path):
     install.write_unit("[Unit]\nDescription=two\n", unit_dir)
     assert path.read_text() == "[Unit]\nDescription=two\n"
     assert sorted(p.name for p in unit_dir.iterdir()) == [install.UNIT_NAME]
+
+
+class FakeCompleted:
+    """Stand-in for subprocess.CompletedProcess."""
+
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def fake_systemctl(responses=None, calls=None):
+    """Build a systemctl double returning canned answers per first argument."""
+    responses = responses or {}
+
+    def run(args, check=True):
+        if calls is not None:
+            calls.append(list(args))
+        return responses.get(args[0], FakeCompleted())
+
+    return run
+
+
+def test_check_python_rejects_old_interpreter():
+    with pytest.raises(install.PreflightError):
+        install.check_python((3, 10, 0))
+    install.check_python((3, 11, 0))
+
+
+def test_check_systemd_raises_with_linger_hint():
+    failing = fake_systemctl({"is-system-running": FakeCompleted(returncode=4)})
+
+    with pytest.raises(install.PreflightError) as excinfo:
+        install.check_systemd(systemctl=failing)
+
+    assert "linger" in str(excinfo.value)
+
+
+def test_check_systemd_accepts_degraded_session():
+    degraded = fake_systemctl(
+        {"is-system-running": FakeCompleted(returncode=1, stdout="degraded\n")}
+    )
+
+    install.check_systemd(systemctl=degraded)
+
+
+def test_probe_health_returns_none_when_unreachable():
+    def fetch(url, timeout):
+        raise OSError("connection refused")
+
+    assert install.probe_health(fetch=fetch) is None
+
+
+def test_check_port_free_when_nothing_answers():
+    def fetch(url, timeout):
+        raise OSError("connection refused")
+
+    assert install.check_port(fetch=fetch, systemctl=fake_systemctl()) == "free"
+
+
+def test_check_port_accepts_our_own_active_unit():
+    def fetch(url, timeout):
+        return {"service": "free-tts", "status": "ok"}
+
+    active = fake_systemctl({"is-active": FakeCompleted(stdout="active\n")})
+
+    assert install.check_port(fetch=fetch, systemctl=active) == "ours"
+
+
+def test_check_port_rejects_foreign_free_tts_owner():
+    def fetch(url, timeout):
+        return {"service": "free-tts", "status": "ok"}
+
+    inactive = fake_systemctl(
+        {"is-active": FakeCompleted(returncode=3, stdout="inactive\n")}
+    )
+
+    with pytest.raises(install.PreflightError) as excinfo:
+        install.check_port(fetch=fetch, systemctl=inactive)
+
+    assert "--force" in str(excinfo.value)
+    assert (
+        install.check_port(fetch=fetch, systemctl=inactive, force=True) == "forced"
+    )
+
+
+def test_check_port_rejects_unrelated_service():
+    def fetch(url, timeout):
+        return {"service": "something-else"}
+
+    with pytest.raises(install.PreflightError):
+        install.check_port(fetch=fetch, systemctl=fake_systemctl())

@@ -14,13 +14,18 @@ Stdlib-only: the installer runs before any dependency exists.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import contextlib
 import json
 import logging
 import os
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger("free-tts.install")
 
@@ -247,3 +252,111 @@ def write_unit(text: str, unit_dir: pathlib.Path) -> pathlib.Path:
     path = unit_dir / UNIT_NAME
     _atomic_write(path, text.encode("utf-8"), 0o644)
     return path
+
+
+MIN_PYTHON = (3, 11)
+DEFAULT_PORT = 5000
+_PROBE_TIMEOUT = 3.0
+
+
+class PreflightError(InstallError):
+    """A pre-flight check failed; nothing has been changed yet."""
+
+
+def default_systemctl(
+    args: list[str], check: bool = True
+) -> subprocess.CompletedProcess:
+    """Run `systemctl --user <args>` and capture its output."""
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def check_python(version: tuple[int, ...] | None = None) -> None:
+    """Reject interpreters older than the project floor."""
+    current = tuple(sys.version_info[:3]) if version is None else tuple(version)
+    if current[:2] < MIN_PYTHON:
+        raise PreflightError(
+            f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required; this "
+            f"interpreter is {current[0]}.{current[1]}. Re-run with a newer "
+            "python3."
+        )
+
+
+def check_systemd(*, systemctl: Callable[..., object] | None = None) -> None:
+    """Confirm a systemd user session is reachable."""
+    runner = systemctl or default_systemctl
+    try:
+        result = runner(["is-system-running"], check=False)
+    except OSError as exc:
+        raise PreflightError(f"cannot run systemctl --user: {exc}") from exc
+    output = str(getattr(result, "stdout", "") or "").strip()
+    if output in {"running", "degraded", "starting", "maintenance", "stopping"}:
+        return
+    raise PreflightError(
+        "no systemd user session is reachable (is-system-running said "
+        f"{output or 'nothing'!r}). Log in graphically, or enable a lingering "
+        "session with `loginctl enable-linger $USER`, then install again."
+    )
+
+
+def _fetch_json(url: str, timeout: float) -> object:
+    with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+        return json.loads(response.read().decode("utf-8"))
+
+
+def probe_health(
+    port: int = DEFAULT_PORT,
+    *,
+    fetch: Callable[[str, float], object] | None = None,
+) -> dict | None:
+    """Return the /health payload from a local server, or None."""
+    getter = fetch or _fetch_json
+    url = f"http://127.0.0.1:{port}/health"
+    try:
+        payload = getter(url, _PROBE_TIMEOUT)
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def unit_is_active(systemctl: Callable[..., object] | None = None) -> bool:
+    """True when our own unit is the active service."""
+    runner = systemctl or default_systemctl
+    try:
+        result = runner(["is-active", UNIT_NAME], check=False)
+    except OSError:
+        return False
+    return str(getattr(result, "stdout", "") or "").strip() == "active"
+
+
+def check_port(
+    *,
+    port: int = DEFAULT_PORT,
+    force: bool = False,
+    fetch: Callable[[str, float], object] | None = None,
+    systemctl: Callable[..., object] | None = None,
+) -> str:
+    """Classify who owns the server port before we bind it."""
+    payload = probe_health(port, fetch=fetch)
+    if payload is None:
+        return "free"
+    if payload.get("service") == "free-tts":
+        if unit_is_active(systemctl):
+            return "ours"
+        if force:
+            return "forced"
+        raise PreflightError(
+            f"port {port} already serves free-tts, but not through "
+            f"{UNIT_NAME}. Another supervisor probably owns it; stop that "
+            "owner first, or pass --force to install anyway."
+        )
+    if force:
+        return "forced"
+    raise PreflightError(
+        f"port {port} is already used by another service; free the port or "
+        "pass --force to install anyway."
+    )
