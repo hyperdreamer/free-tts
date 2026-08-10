@@ -72,6 +72,10 @@ class _GenerationToken:
         self._lock = threading.Lock()
         self.requests: set[str] = set()
 
+    def cancel(self) -> None:
+        """Mark this generation cancelled without taking the engine lock."""
+        self.cancelled.set()
+
     def add_request(self, request_id: str) -> None:
         with self._lock:
             self.requests.add(request_id)
@@ -137,6 +141,9 @@ class SpeechEngine:
         self.catalog: VoiceCatalog | None = None
 
         self._lock = threading.Lock()
+        # Serialises protocol output. Held across writes, so it must never be
+        # required by STOP or PAUSE to record cancellation intent.
+        self._emit_lock = threading.Lock()
         self._generation: _GenerationToken | None = None
         self._worker: threading.Thread | None = None
         self._registered = threading.Event()
@@ -248,7 +255,7 @@ class SpeechEngine:
             generation = self._generation
             if worker is None or not worker.is_alive() or generation is None:
                 return
-            generation.cancelled.set()
+            generation.cancel()
         outstanding = generation.snapshot_requests()
         if outstanding:
             threading.Thread(
@@ -317,12 +324,25 @@ class SpeechEngine:
         *,
         allow_cancelled: bool = False,
     ) -> bool:
-        """Check generation state and emit atomically with STOP invalidation."""
+        """Check generation state, then emit without holding the state lock.
+
+        Output is serialised by ``_emit_lock``. The state lock is released before
+        writing so a peer that has stopped reading stdout cannot prevent STOP or
+        PAUSE from recording intent. Post-STOP suppression is preserved by
+        re-checking under ``_emit_lock``: a writer that lost the race to STOP
+        observes the cancellation and writes nothing.
+        """
         with self._lock:
             if generation is not self._generation:
                 return False
             if generation.cancelled.is_set() and not allow_cancelled:
                 return False
+        with self._emit_lock:
+            with self._lock:
+                if generation is not self._generation:
+                    return False
+                if generation.cancelled.is_set() and not allow_cancelled:
+                    return False
             action()
             return True
 

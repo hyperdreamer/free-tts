@@ -1005,6 +1005,123 @@ def protocol_err_cant_speak():
     return protocol.ERR_CANT_SPEAK
 
 
+class TestCancellationUnderBlockedOutput:
+    """A peer that stops reading stdout must not block cancellation intent."""
+
+    def _blocked_engine(self, write_entered, release_write):
+        class BlockingIO(_FakeIO):
+            def send_audio(self, pcm, sample_rate=24000):
+                write_entered.set()
+                assert release_write.wait(5)
+                super().send_audio(pcm, sample_rate)
+
+        fake_io = BlockingIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            _FakeClient(),
+            decoder=lambda mp3, ffmpeg_path, sample_rate, cancel: b"\x01\x00" * 8,
+        )
+        return engine, fake_io
+
+    def test_stop_records_intent_while_a_write_is_blocked(self):
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        returned = threading.Event()
+        engine, _fake_io = self._blocked_engine(write_entered, release_write)
+
+        engine.handle_speak(SSML)
+        assert write_entered.wait(3)
+        generation = engine._generation
+
+        threading.Thread(
+            target=lambda: (engine.handle_stop(), returned.set()),
+            daemon=True,
+        ).start()
+        try:
+            assert returned.wait(2), "handle_stop blocked behind a stdout write"
+            assert generation.cancelled.is_set()
+        finally:
+            release_write.set()
+            engine.wait_idle(3)
+
+    def test_pause_records_intent_while_a_write_is_blocked(self):
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        returned = threading.Event()
+        engine, _fake_io = self._blocked_engine(write_entered, release_write)
+
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert write_entered.wait(3)
+        generation = engine._generation
+
+        threading.Thread(
+            target=lambda: (engine.handle_pause(), returned.set()),
+            daemon=True,
+        ).start()
+        try:
+            assert returned.wait(2), "handle_pause blocked behind a stdout write"
+            assert generation.pause_requested.is_set()
+        finally:
+            release_write.set()
+            engine.wait_idle(3)
+
+    def test_audio_after_stop_is_still_suppressed(self):
+        """The convoy fix must not reopen the post-STOP output race."""
+        audio_emit_entered = threading.Event()
+        release_audio_emit = threading.Event()
+
+        class GatedEmitLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._entries = 0
+
+            def __enter__(self):
+                self._lock.acquire()
+                self._entries += 1
+                if self._entries == 2:
+                    audio_emit_entered.set()
+                    assert release_audio_emit.wait(3)
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self._lock.release()
+
+        class TimelineIO(_FakeIO):
+            def send_audio(self, pcm, sample_rate=24000):
+                self.lines.append("AUDIO")
+                super().send_audio(pcm, sample_rate)
+
+        fake_io = TimelineIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            _FakeClient(),
+            decoder=lambda mp3, ffmpeg_path, sample_rate, cancel: b"\x01\x00" * 8,
+        )
+        engine._emit_lock = GatedEmitLock()
+        engine.handle_speak(SSML)
+        assert audio_emit_entered.wait(2)
+
+        try:
+            engine.handle_stop()
+            fake_io.lines.append("STOP_RETURNED")
+            release_audio_emit.set()
+            assert engine.wait_idle(3)
+
+            boundary = fake_io.lines.index("STOP_RETURNED")
+            assert not any(
+                line in {"701 BEGIN", "AUDIO"} or line.startswith("700:")
+                for line in fake_io.lines[boundary + 1 :]
+            )
+            assert fake_io.lines.count("703 STOP") == 1
+        finally:
+            release_audio_emit.set()
+            engine.wait_idle(3)
+
+
 class TestPauseFallback:
     """PAUSE is honoured even when no index mark is available."""
 
