@@ -1238,6 +1238,28 @@ class TestWorkerReclaimIsBounded:
             release_lookahead.set()
             engine.wait_idle(3)
 
+    def test_synthesis_timeout_ends_the_utterance_without_an_external_stop(self):
+        class TimingOutClient(_FakeClient):
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                self.requests.append((text, voice_name, rate, pitch))
+                raise TimeoutError("socket timed out")
+
+        engine, fake_io = _engine(client=TimingOutClient())
+        engine.handle_speak(SSML)
+
+        assert engine.wait_idle(3), "worker spun on an already-failed future"
+        assert fake_io.lines.count("703 STOP") == 1
+        assert "702 END" not in fake_io.lines
+
     def test_uncancelled_speech_still_waits_for_synthesis(self):
         """The bound applies to abandoned work only, never to wanted speech."""
         engine, fake_io = _engine()

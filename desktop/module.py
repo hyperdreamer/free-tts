@@ -525,7 +525,12 @@ class SpeechEngine:
             try:
                 return future.result(timeout=_FUTURE_POLL_INTERVAL)
             except FuturesTimeout:
-                pass
+                if future.done():
+                    # Not a poll timeout: the callable itself raised. On 3.11+
+                    # concurrent.futures.TimeoutError is builtin TimeoutError, so
+                    # only future.done() can tell the two apart. Re-read the
+                    # result so the real exception reaches the worker.
+                    return future.result()
             if self._should_abort(generation):
                 if deadline is None:
                     deadline = time.monotonic() + _CANCEL_DRAIN_SECONDS
