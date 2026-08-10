@@ -535,7 +535,7 @@ class SpeechEngine:
         finally:
             if pending is not None:
                 pending.cancel()
-            self._cancel_outstanding(generation)
+            self._bounded_cancel_outstanding(generation)
             # Queued work is dropped and the terminal event is not held behind a
             # running fetch: the fetch itself is bounded by _await_chunk and the
             # decoder's cancellation, so no thread is abandoned indefinitely.
@@ -706,6 +706,28 @@ class SpeechEngine:
         finally:
             generation.discard_request(request_id)
 
+    def _bounded_cancel_outstanding(
+        self, generation: _GenerationToken
+    ) -> None:
+        """Clean up without holding the terminal event past the deadline.
+
+        An admitted DELETE cannot be interrupted: ``urllib``'s timeout is a
+        per-read inactivity limit, so a trickling response outlives any absolute
+        budget. Delivery therefore runs on a thread this method owns and the
+        worker stops waiting at the generation's cleanup deadline. The helper
+        holds no protocol lock and no generation state, so it cannot emit output
+        or affect a later utterance.
+        """
+        deadline = generation.cleanup_deadline()
+        helper = threading.Thread(
+            target=self._cancel_outstanding,
+            args=(generation,),
+            name="free-tts-cleanup",
+            daemon=True,
+        )
+        helper.start()
+        helper.join(max(0.0, deadline - time.monotonic()))
+
     def _cancel_outstanding(self, generation: _GenerationToken) -> None:
         generation.begin_cleanup()
         self._cancel_requests(generation, generation.take_requests())
@@ -721,34 +743,15 @@ class SpeechEngine:
     def _cancel_requests(
         self, generation: _GenerationToken, request_ids: list[str]
     ) -> None:
-        """Deliver cancellation without holding the terminal event.
-
-        An admitted DELETE cannot be interrupted: ``urllib``'s timeout is a
-        per-read inactivity limit, so a trickling response outlives any absolute
-        budget. Delivery therefore runs on a thread this method owns, and the
-        caller stops waiting at the generation's cleanup deadline. The helper
-        holds no protocol lock and no generation state, so it cannot emit output
-        or affect a later utterance.
-        """
-        if not request_ids:
-            return
         deadline = generation.cleanup_deadline()
-
-        def deliver() -> None:
-            for request_id in request_ids:
-                self._client.cancel(  # type: ignore[attr-defined]
-                    request_id,
-                    still_wanted=lambda: self._cancellation_still_wanted(
-                        generation
-                    ),
-                    deadline=deadline,
-                )
-
-        helper = threading.Thread(
-            target=deliver, name="free-tts-cancel", daemon=True
-        )
-        helper.start()
-        helper.join(max(0.0, deadline - time.monotonic()))
+        for request_id in request_ids:
+            self._client.cancel(  # type: ignore[attr-defined]
+                request_id,
+                still_wanted=lambda: self._cancellation_still_wanted(
+                    generation
+                ),
+                deadline=deadline,
+            )
 
 
 def _configure_logging() -> None:

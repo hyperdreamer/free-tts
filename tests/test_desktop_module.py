@@ -630,6 +630,38 @@ class TestRecoveryIsCancellable:
         assert fake_io.lines[-1] == "702 END"
 
 
+class TestWorkerCleanupIsBounded:
+    """A wedged DELETE must not hold the worker past the cleanup deadline."""
+
+    def test_bounded_cleanup_returns_at_the_deadline(self):
+        delete_entered = threading.Event()
+        release_delete = threading.Event()
+
+        class BlockingClient(_FakeClient):
+            def cancel(self, request_id, *, still_wanted=None, deadline=None):
+                delete_entered.set()
+                assert release_delete.wait(5)
+                return super().cancel(
+                    request_id, still_wanted=still_wanted, deadline=deadline
+                )
+
+        engine, _ = _engine(client=BlockingClient())
+        generation = module._GenerationToken()
+        generation.cancelled.set()
+        generation.add_request("req-1")
+        generation.add_request("req-2")
+
+        try:
+            started = time.monotonic()
+            engine._bounded_cancel_outstanding(generation)
+            elapsed = time.monotonic() - started
+
+            assert delete_entered.wait(1), "cleanup never entered the DELETE"
+            assert elapsed < module._CLEANUP_DEADLINE_SECONDS + 1.0
+        finally:
+            release_delete.set()
+
+
 class TestErrorExitCleanup:
     """An internal failure must still cancel prefetched backend work."""
 
