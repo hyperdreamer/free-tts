@@ -84,6 +84,7 @@ class _GenerationToken:
         self.cleanup_started = threading.Event()
         self._lock = threading.Lock()
         self.requests: set[str] = set()
+        self._cleanup_deadline: float | None = None
 
     def cancel(self) -> None:
         """Mark this generation cancelled without taking the engine lock."""
@@ -120,6 +121,15 @@ class _GenerationToken:
     def snapshot_requests(self) -> list[str]:
         with self._lock:
             return sorted(self.requests)
+
+    def cleanup_deadline(self) -> float:
+        """One absolute cleanup budget shared by every id in this generation."""
+        with self._lock:
+            if self._cleanup_deadline is None:
+                self._cleanup_deadline = (
+                    time.monotonic() + _CLEANUP_DEADLINE_SECONDS
+                )
+            return self._cleanup_deadline
 
 
 def check_ffmpeg(
@@ -359,6 +369,8 @@ class SpeechEngine:
                     deadline = time.monotonic() + _RECOVERY_DEADLINE_SECONDS
                 elif time.monotonic() >= deadline:
                     raise Cancelled("recovery exceeded its cancellation deadline")
+        if self._recovery_abandoned(generation):
+            raise Cancelled("recovery finished after the generation was abandoned")
         error = outcome.get("error")
         if error is not None:
             raise error
@@ -669,10 +681,10 @@ class SpeechEngine:
         except Cancelled:
             raise
         except SynthError:
-            if self._should_abort_fetch(generation):
+            if self._recovery_abandoned(generation):
                 raise Cancelled("aborted instead of recovering backend")
             self._recover_backend(generation)
-            if self._should_abort_fetch(generation):
+            if self._recovery_abandoned(generation):
                 raise Cancelled("aborted before retrying synthesis")
             # A fresh id: the first POST's delivery is ambiguous, so reusing the
             # id could put two live requests under one name.
@@ -709,15 +721,34 @@ class SpeechEngine:
     def _cancel_requests(
         self, generation: _GenerationToken, request_ids: list[str]
     ) -> None:
-        deadline = time.monotonic() + _CLEANUP_DEADLINE_SECONDS
-        for request_id in request_ids:
-            self._client.cancel(  # type: ignore[attr-defined]
-                request_id,
-                still_wanted=lambda: self._cancellation_still_wanted(
-                    generation
-                ),
-                deadline=deadline,
-            )
+        """Deliver cancellation without holding the terminal event.
+
+        An admitted DELETE cannot be interrupted: ``urllib``'s timeout is a
+        per-read inactivity limit, so a trickling response outlives any absolute
+        budget. Delivery therefore runs on a thread this method owns, and the
+        caller stops waiting at the generation's cleanup deadline. The helper
+        holds no protocol lock and no generation state, so it cannot emit output
+        or affect a later utterance.
+        """
+        if not request_ids:
+            return
+        deadline = generation.cleanup_deadline()
+
+        def deliver() -> None:
+            for request_id in request_ids:
+                self._client.cancel(  # type: ignore[attr-defined]
+                    request_id,
+                    still_wanted=lambda: self._cancellation_still_wanted(
+                        generation
+                    ),
+                    deadline=deadline,
+                )
+
+        helper = threading.Thread(
+            target=deliver, name="free-tts-cancel", daemon=True
+        )
+        helper.start()
+        helper.join(max(0.0, deadline - time.monotonic()))
 
 
 def _configure_logging() -> None:

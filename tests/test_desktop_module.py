@@ -540,6 +540,86 @@ class TestRecoveryIsCancellable:
             release_recovery.set()
             engine.wait_idle(3)
 
+    def test_pause_after_recovery_completion_does_not_admit_retry(self):
+        recovery_entered = threading.Event()
+        release_recovery = threading.Event()
+        first_boundary_emitted = threading.Event()
+        retry_admitted = threading.Event()
+        release_retry = threading.Event()
+        retry_finished = threading.Event()
+
+        class TimelineIO(_FakeIO):
+            def index_mark(self, mark):
+                super().index_mark(mark)
+                if mark == "__spd_0":
+                    first_boundary_emitted.set()
+
+        class CompletingController(_FakeController):
+            def ensure_ready(self):
+                self.calls += 1
+                if self.calls > 1:
+                    recovery_entered.set()
+                    assert release_recovery.wait(10)
+
+        class RetryWedgedClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                from desktop.synth import SynthError
+
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    return self._audio
+                if self.calls == 2:
+                    assert first_boundary_emitted.wait(3)
+                    raise SynthError("backend vanished mid-utterance")
+                retry_admitted.set()
+                try:
+                    assert release_retry.wait(10)
+                finally:
+                    retry_finished.set()
+                return self._audio
+
+        fake_io = TimelineIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            CompletingController(),
+            RetryWedgedClient(),
+            decoder=lambda mp3, ffmpeg_path, sample_rate, cancel: b"\x01\x00" * 8,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert recovery_entered.wait(3)
+
+        try:
+            engine.handle_pause()
+            release_recovery.set()
+            assert retry_admitted.wait(0.25) is False
+            assert engine.wait_idle(3), "worker admitted a recovered POST after PAUSE"
+            terminal = [
+                line for line in fake_io.lines if line in {"703 STOP", "704 PAUSE"}
+            ]
+            assert len(terminal) == 1
+            assert fake_io.lines.count("702 END") == 0
+        finally:
+            release_recovery.set()
+            release_retry.set()
+            engine.wait_idle(3)
+            if retry_admitted.is_set():
+                assert retry_finished.wait(3)
+
     def test_recovery_still_succeeds_without_cancellation(self):
         """The deadline must not fire when nobody cancelled."""
         engine, fake_io, client, state = _lifecycle_engine(fail_first_post=True)
@@ -626,6 +706,83 @@ class TestErrorExitCleanup:
             allow_registration.set()
             registered.set()
             release_lookahead.set()
+            engine.wait_idle(3)
+
+    def test_wedged_delete_does_not_hold_the_terminal_event(self):
+        from desktop.audio import DecodeError
+
+        lookahead_entered = threading.Event()
+        release_lookahead = threading.Event()
+        lookahead_finished = threading.Event()
+        delete_entered = threading.Event()
+        release_delete = threading.Event()
+        delete_finished = threading.Event()
+
+        class WedgedDeleteClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def synthesize(
+                self,
+                text,
+                voice_name,
+                rate,
+                pitch,
+                request_id,
+                should_abort=None,
+                reserve_retry=None,
+            ):
+                self.calls += 1
+                self.requests.append((text, voice_name, rate, pitch))
+                if self.calls == 1:
+                    return self._audio
+                lookahead_entered.set()
+                try:
+                    assert release_lookahead.wait(10)
+                finally:
+                    lookahead_finished.set()
+                return self._audio
+
+            def cancel(self, request_id, *, still_wanted=None, deadline=None):
+                delete_entered.set()
+                try:
+                    assert release_delete.wait(10)
+                finally:
+                    delete_finished.set()
+                return True
+
+        def failing_decoder(mp3, ffmpeg_path, sample_rate, cancel):
+            assert lookahead_entered.wait(3)
+            raise DecodeError("forced current-chunk decode failure")
+
+        fake_io = _FakeIO()
+        engine = module.SpeechEngine(
+            fake_io,
+            settings.DEFAULTS,
+            _FakeController(),
+            WedgedDeleteClient(),
+            decoder=failing_decoder,
+        )
+        engine.handle_speak(TWO_CHUNK_SSML)
+        assert delete_entered.wait(3), "DELETE was never admitted"
+        started = time.monotonic()
+
+        try:
+            assert engine.wait_idle(module._CLEANUP_DEADLINE_SECONDS + 0.5)
+            elapsed = time.monotonic() - started
+            assert elapsed <= module._CLEANUP_DEADLINE_SECONDS + 0.25
+            assert release_delete.is_set() is False
+            terminal = [
+                line for line in fake_io.lines if line in {"703 STOP", "704 PAUSE"}
+            ]
+            assert terminal == ["703 STOP"]
+            assert fake_io.lines.count("702 END") == 0
+        finally:
+            release_delete.set()
+            release_lookahead.set()
+            assert delete_finished.wait(3)
+            assert lookahead_finished.wait(3)
             engine.wait_idle(3)
 
     def test_cleanup_intent_is_recorded_before_delete(self):
