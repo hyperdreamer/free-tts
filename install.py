@@ -1096,6 +1096,72 @@ def install_server(
     return manifest
 
 
+def _enablement_path(unit_dir: pathlib.Path) -> pathlib.Path:
+    """The enablement symlink that `systemctl enable` creates for our unit."""
+    return pathlib.Path(unit_dir) / "default.target.wants" / UNIT_NAME
+
+
+def _validate_enablement_link(
+    path: pathlib.Path, unit_path: pathlib.Path
+) -> bool:
+    """Return True for an owned enablement symlink, False when absent.
+
+    A regular file, directory, or symlink resolving outside the validated
+    unit path is foreign and raises before any uninstall mutation.
+    """
+    if not os.path.lexists(path):
+        return False
+    if not path.is_symlink():
+        raise OwnershipError(f"enablement path is not an owned symlink: {path}")
+    target = pathlib.Path(os.readlink(path))
+    resolved = _canonical(target if target.is_absolute() else path.parent / target)
+    if resolved != _canonical(unit_path):
+        raise OwnershipError(f"enablement symlink targets a foreign unit: {path}")
+    return True
+
+
+def _remove_owned_root(root: pathlib.Path, manifest: dict) -> None:
+    """Delete a validated install root, restoring ownership on partial failure.
+
+    The root is renamed to a reserved sibling before deletion, so a partial
+    rmtree cannot strand an ownerless tree at the canonical path. When a
+    partial tree remains, the validated manifest is rewritten into it and it
+    is renamed back to the canonical root so a later invocation can retry.
+    """
+    deleting = _reserve_sibling(root.parent, ".free-tts-server-delete-")
+    os.replace(root, deleting)
+    try:
+        shutil.rmtree(deleting)
+    except OSError as delete_error:
+        if not os.path.lexists(deleting):
+            return
+        compensation_errors = []
+        try:
+            _atomic_write(
+                manifest_path(deleting),
+                json.dumps(manifest, indent=2).encode("utf-8"),
+                0o644,
+            )
+        except BaseException as exc:
+            compensation_errors.append(f"could not restore ownership manifest: {exc}")
+        if not compensation_errors:
+            try:
+                if os.path.lexists(root):
+                    raise InstallError(f"canonical root was recreated at {root}")
+                os.replace(deleting, root)
+            except BaseException as exc:
+                compensation_errors.append(f"could not restore canonical root: {exc}")
+        if compensation_errors:
+            details = "; ".join(compensation_errors)
+            raise InstallError(
+                f"could not remove {root}: {delete_error}; retained partial tree at "
+                f"{deleting}; {details}"
+            ) from delete_error
+        raise InstallError(
+            f"could not remove {root}: {delete_error}; ownership restored for retry"
+        ) from delete_error
+
+
 def uninstall_server(
     *,
     root: pathlib.Path | None = None,
@@ -1124,11 +1190,31 @@ def uninstall_server(
             raise OwnershipError(
                 f"owned service unit must be a regular non-symlink file: {unit_path}"
             )
-        failure = _systemctl_error(
-            runner, ["disable", "--now", UNIT_NAME]
-        )
-        if failure is not None:
-            raise InstallError(f"server uninstall failed:\n- {failure}")
+    enablement = _enablement_path(unit_dir)
+    has_link = _validate_enablement_link(enablement, unit_path)
+
+    failure = _systemctl_error(runner, ["disable", "--now", UNIT_NAME])
+    if failure is not None and os.path.lexists(unit_path):
+        raise InstallError(f"server uninstall failed:\n- {failure}")
+
+    if not os.path.lexists(unit_path):
+        if _query_unit_state(runner, "is-active", "active"):
+            detail = f"{UNIT_NAME} is still active"
+            if failure is not None:
+                detail = f"{detail}\n- {failure}"
+            raise InstallError(f"server uninstall failed:\n- {detail}")
+
+    if has_link:
+        try:
+            enablement.unlink()
+        except OSError as exc:
+            detail = f"could not remove {enablement}: {exc}"
+            if failure is not None:
+                detail = f"{detail}\n- {failure}"
+            raise InstallError(f"server uninstall failed:\n- {detail}") from exc
+        removed.append(str(enablement))
+
+    if os.path.lexists(unit_path):
         try:
             unit_path.unlink()
         except OSError as exc:
@@ -1136,23 +1222,12 @@ def uninstall_server(
                 f"server uninstall failed:\n- could not remove {unit_path}: {exc}"
             ) from exc
         removed.append(str(unit_path))
-    elif _query_unit_state(runner, "is-active", "active"):
-        failure = _systemctl_error(
-            runner, ["disable", "--now", UNIT_NAME]
-        )
-        if failure is not None:
-            raise InstallError(f"server uninstall failed:\n- {failure}")
 
     failure = _systemctl_error(runner, ["daemon-reload"])
     if failure is not None:
         raise InstallError(f"server uninstall failed:\n- {failure}")
 
-    try:
-        shutil.rmtree(root)
-    except OSError as exc:
-        raise InstallError(
-            f"server uninstall failed:\n- could not remove {root}: {exc}"
-        ) from exc
+    _remove_owned_root(root, owned)
     removed.append(str(root))
     return removed
 

@@ -1433,6 +1433,156 @@ def test_uninstall_server_keeps_unowned_root(tmp_path):
     assert (root / "important.txt").exists()
 
 
+def write_enablement_link(unit_dir):
+    link = unit_dir / "default.target.wants" / install.UNIT_NAME
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(pathlib.Path("..") / install.UNIT_NAME)
+    return link
+
+
+class MissingFragmentSystemctl:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, args, check=True):
+        args = list(args)
+        self.calls.append(args)
+        if args[0] == "disable":
+            return FakeCompleted(returncode=1, stderr="Unit not found")
+        if args[0] == "is-active":
+            return FakeCompleted(returncode=3, stdout="inactive\n")
+        return FakeCompleted()
+
+
+def test_uninstall_removes_dangling_owned_enablement_without_fragment(
+    checkout, tmp_path
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    unit.unlink()
+    link = write_enablement_link(unit_dir)
+    runner = MissingFragmentSystemctl()
+
+    removed = install.uninstall_server(
+        root=root, unit_dir=unit_dir, systemctl=runner
+    )
+
+    assert str(link) in removed
+    assert str(root) in removed
+    assert not os.path.lexists(link)
+    assert not root.exists()
+    assert ["disable", "--now", install.UNIT_NAME] in runner.calls
+
+
+@pytest.mark.parametrize("kind", ("file", "directory", "foreign-symlink"))
+def test_uninstall_rejects_foreign_enablement_before_mutation(
+    kind, checkout, tmp_path
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    link = unit_dir / "default.target.wants" / install.UNIT_NAME
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "file":
+        link.write_text("foreign\n")
+    elif kind == "directory":
+        link.mkdir()
+    else:
+        link.symlink_to(tmp_path / "foreign.service")
+    before_root = snapshot_tree(root)
+    before_unit = unit.read_bytes()
+    runner = StatefulSystemctl(active=True, enabled=True)
+
+    with pytest.raises(install.OwnershipError):
+        install.uninstall_server(root=root, unit_dir=unit_dir, systemctl=runner)
+
+    assert snapshot_tree(root) == before_root
+    assert unit.read_bytes() == before_unit
+    assert os.path.lexists(link)
+    assert runner.calls == []
+
+
+def test_uninstall_partial_root_delete_restores_manifest_and_retries(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    runner = StatefulSystemctl(active=True, enabled=True)
+    real_rmtree = install.shutil.rmtree
+    failed = False
+
+    def partial_delete(path, *args, **kwargs):
+        nonlocal failed
+        path = pathlib.Path(path)
+        if path.name.startswith(".free-tts-server-delete-") and not failed:
+            failed = True
+            (path / install.MANIFEST_NAME).unlink()
+            (path / "server.py").unlink()
+            raise OSError("injected partial deletion")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(install.shutil, "rmtree", partial_delete)
+
+    with pytest.raises(install.InstallError, match="ownership restored"):
+        install.uninstall_server(root=root, unit_dir=unit_dir, systemctl=runner)
+
+    expected = install._expected_manifest(root, unit_dir)
+    assert (
+        install._load_manifest(root, expected, missing_ok=False)["component"]
+        == "server"
+    )
+    assert not (root / "server.py").exists()
+
+    removed = install.uninstall_server(
+        root=root, unit_dir=unit_dir, systemctl=runner
+    )
+    assert removed == [str(root)]
+    assert not root.exists()
+
+
+def test_uninstall_partial_delete_names_retained_tree_when_compensation_fails(
+    checkout, tmp_path, monkeypatch
+):
+    _install_server(checkout, tmp_path)
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    runner = StatefulSystemctl(active=True, enabled=True)
+    real_rmtree = install.shutil.rmtree
+    real_atomic_write = install._atomic_write
+
+    def partial_delete(path, *args, **kwargs):
+        path = pathlib.Path(path)
+        if path.name.startswith(".free-tts-server-delete-"):
+            (path / install.MANIFEST_NAME).unlink()
+            raise OSError("injected partial deletion")
+        return real_rmtree(path, *args, **kwargs)
+
+    def fail_manifest_restore(path, data, mode=0o644):
+        path = pathlib.Path(path)
+        if (
+            path.name == install.MANIFEST_NAME
+            and path.parent.name.startswith(".free-tts-server-delete-")
+        ):
+            raise OSError("injected receipt failure")
+        return real_atomic_write(path, data, mode)
+
+    monkeypatch.setattr(install.shutil, "rmtree", partial_delete)
+    monkeypatch.setattr(install, "_atomic_write", fail_manifest_restore)
+
+    with pytest.raises(install.InstallError) as excinfo:
+        install.uninstall_server(root=root, unit_dir=unit_dir, systemctl=runner)
+
+    retained = list(root.parent.glob(".free-tts-server-delete-*"))
+    assert len(retained) == 1
+    assert str(retained[0]) in str(excinfo.value)
+    assert "injected receipt failure" in str(excinfo.value)
+    assert not root.exists()
+
+
 class FakeDesktop:
     """Stand-in for the desktop.install module."""
 
