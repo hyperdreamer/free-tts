@@ -1248,7 +1248,7 @@ def _enablement_path(unit_dir: pathlib.Path) -> pathlib.Path:
 def _enablement_target(path: pathlib.Path, unit_path: pathlib.Path) -> str:
     """Return the fixed relative target for the validated wants path."""
     expected = pathlib.Path(unit_path).parent / "default.target.wants" / UNIT_NAME
-    if os.path.abspath(path) != os.path.abspath(expected):
+    if _canonical(path) != _canonical(expected):
         raise InstallError(
             f"enablement path is outside the expected wants directory: {path}"
         )

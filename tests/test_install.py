@@ -154,6 +154,22 @@ def test_systemd_user_dir_honours_xdg_config_home(tmp_path, monkeypatch):
     assert install.systemd_user_dir() == tmp_path / "config" / "systemd" / "user"
 
 
+def test_enablement_target_accepts_symlinked_config_home(tmp_path):
+    real_config = tmp_path / "real-config"
+    unit_dir = real_config / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    config_alias = tmp_path / "config"
+    config_alias.symlink_to(real_config, target_is_directory=True)
+    unit_path = unit_dir / install.UNIT_NAME
+    enablement_path = (
+        config_alias / "systemd" / "user" / "default.target.wants" / install.UNIT_NAME
+    )
+
+    assert install._enablement_target(enablement_path, unit_path) == (
+        "../free-tts.service"
+    )
+
+
 def test_publish_runtime_stages_entries(checkout, tmp_path):
     root = tmp_path / "share" / "free-tts-server"
     unit_dir = tmp_path / "config" / "systemd" / "user"
