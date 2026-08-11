@@ -38,6 +38,18 @@ def test_server_transaction_lock_rejects_a_second_open(isolated_server_runtime):
         pass
 
 
+def test_server_transaction_lock_preserves_body_oserror_and_releases_lock():
+    body_error = OSError("body disk failure")
+
+    with pytest.raises(OSError, match="body disk failure") as excinfo:
+        with install._server_transaction_lock():
+            raise body_error
+
+    assert excinfo.value is body_error
+    with install._server_transaction_lock():
+        pass
+
+
 def test_server_transaction_lock_reuses_stale_unlocked_file(
     isolated_server_runtime,
 ):
@@ -315,6 +327,34 @@ def test_uninstall_server_rejects_malformed_manifest_before_unit_mutation(tmp_pa
     assert calls == []
 
 
+def test_uninstall_server_rejects_oversized_manifest_without_mutation(tmp_path):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    root.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    manifest = root / install.MANIFEST_NAME
+    manifest.write_text(
+        '{"component": "server", "version": ' + ("9" * 5000) + "}"
+    )
+    unit = unit_dir / install.UNIT_NAME
+    unit.write_text("keep unit\n")
+    before_root = snapshot_tree(root)
+    before_unit_dir = snapshot_tree(unit_dir)
+    calls = []
+
+    with pytest.raises(install.OwnershipError) as excinfo:
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=fake_systemctl(calls=calls),
+        )
+
+    assert str(manifest) in str(excinfo.value)
+    assert snapshot_tree(root) == before_root
+    assert snapshot_tree(unit_dir) == before_unit_dir
+    assert calls == []
+
+
 def test_read_manifest_tolerates_corrupt_and_foreign(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -327,6 +367,56 @@ def test_read_manifest_tolerates_corrupt_and_foreign(tmp_path):
         json.dumps({"component": "something-else"}), encoding="utf-8"
     )
     assert install.read_manifest(root) is None
+
+
+def test_read_manifest_tolerates_oversized_unquoted_json_integer(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / install.MANIFEST_NAME).write_text(
+        '{"component": "server", "version": ' + ("9" * 5000) + "}"
+    )
+
+    assert install.read_manifest(root) is None
+
+
+def test_tolerant_json_readers_contain_recursion_error(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    server_manifest = root / install.MANIFEST_NAME
+    server_manifest.write_text("{}")
+    desktop_manifest = tmp_path / install.DESKTOP_MANIFEST_NAME
+    desktop_manifest.write_text("{}")
+
+    def fail_json_loads(payload):
+        raise RecursionError("nested JSON")
+
+    monkeypatch.setattr(install.json, "loads", fail_json_loads)
+
+    assert install.read_manifest(root) is None
+    assert install._read_json(desktop_manifest) is None
+
+
+def test_load_manifest_normalizes_recursion_error_with_path(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    unit_dir = tmp_path / "systemd" / "user"
+    root.mkdir()
+    manifest = root / install.MANIFEST_NAME
+    manifest.write_text("{}")
+
+    def fail_json_loads(payload):
+        raise RecursionError("nested JSON")
+
+    monkeypatch.setattr(install.json, "loads", fail_json_loads)
+
+    with pytest.raises(install.OwnershipError) as excinfo:
+        install._load_manifest(
+            root,
+            install._expected_manifest(root, unit_dir),
+            missing_ok=False,
+        )
+
+    assert str(manifest) in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 def test_read_version_falls_back_when_missing(tmp_path, checkout):
@@ -703,6 +793,18 @@ def test_probe_health_contains_non_http_protocol_errors():
     assert install.probe_health(fetch=fetch) is None
 
 
+def test_probe_health_contains_recursion_error(monkeypatch):
+    def fail_json_loads(payload):
+        raise RecursionError("nested JSON")
+
+    def fetch(url, timeout):
+        return install.json.loads("{}")
+
+    monkeypatch.setattr(install.json, "loads", fail_json_loads)
+
+    assert install.probe_health(fetch=fetch) is None
+
+
 def test_check_port_free_when_nothing_answers():
     def fetch(url, timeout):
         raise AssertionError("health fetch must not run for a proven-free port")
@@ -860,6 +962,22 @@ def test_load_service_endpoint_rejects_oversized_unquoted_json_integer(tmp_path)
 
     assert str(config) in str(exc.value)
     assert "JSON" in str(exc.value)
+
+
+def test_load_service_endpoint_normalizes_recursion_error(tmp_path, monkeypatch):
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+
+    def fail_json_loads(payload):
+        raise RecursionError("nested JSON")
+
+    monkeypatch.setattr(install.json, "loads", fail_json_loads)
+
+    with pytest.raises(install.PreflightError) as excinfo:
+        install._load_service_endpoint(config)
+
+    assert str(config) in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 @pytest.mark.parametrize(
@@ -1099,6 +1217,82 @@ def test_install_server_runs_preflight_before_touching_disk(checkout, tmp_path):
         )
 
     assert not (tmp_path / "share").exists()
+
+
+def test_install_server_preserves_venv_oserror_rolls_back_and_releases_lock(
+    checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    unit = unit_dir / install.UNIT_NAME
+    runner = StatefulSystemctl()
+    venv_error = OSError("venv disk failure")
+
+    def failing_builder(target):
+        assert target == root
+        assert (target / install.MANIFEST_NAME).is_file()
+        raise venv_error
+
+    with pytest.raises(OSError, match="venv disk failure") as excinfo:
+        _transaction_install(
+            checkout,
+            root,
+            unit_dir,
+            runner,
+            failing_builder,
+            healthy_fetch,
+        )
+
+    assert excinfo.value is venv_error
+    assert not os.path.lexists(root)
+    assert not os.path.lexists(unit)
+    assert runner.calls == []
+    with install._server_transaction_lock():
+        pass
+
+
+def test_install_server_rejects_oversized_upgrade_manifest_without_mutation(
+    checkout, tmp_path
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    root.mkdir(parents=True)
+    unit_dir.mkdir(parents=True)
+    manifest = root / install.MANIFEST_NAME
+    manifest.write_text(
+        '{"component": "server", "version": ' + ("9" * 5000) + "}"
+    )
+    (root / "keep.txt").write_text("keep runtime\n")
+    unit = unit_dir / install.UNIT_NAME
+    unit.write_text("keep unit\n")
+    before_root = snapshot_tree(root)
+    before_unit_dir = snapshot_tree(unit_dir)
+    systemctl_calls = []
+    venv_calls = []
+    network_calls = []
+
+    def occupancy_probe(host, port, timeout):
+        network_calls.append((host, port, timeout))
+        return False
+
+    with pytest.raises(install.OwnershipError) as excinfo:
+        install.install_server(
+            checkout,
+            root=root,
+            unit_dir=unit_dir,
+            venv_builder=lambda target: venv_calls.append(target),
+            systemctl=fake_systemctl(calls=systemctl_calls),
+            fetch=lambda url, timeout: pytest.fail("health fetch must not run"),
+            occupancy_probe=occupancy_probe,
+            preflight=lambda: None,
+        )
+
+    assert str(manifest) in str(excinfo.value)
+    assert snapshot_tree(root) == before_root
+    assert snapshot_tree(unit_dir) == before_unit_dir
+    assert systemctl_calls == []
+    assert venv_calls == []
+    assert network_calls == []
 
 
 def test_install_server_refuses_foreign_unit_when_root_is_missing(
@@ -1678,6 +1872,34 @@ def test_contended_uninstall_does_not_read_manifest_or_call_systemctl(
     assert calls == []
     assert not root.exists()
     assert not unit_dir.exists()
+
+
+def test_uninstall_server_preserves_manifest_oserror_and_releases_lock(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "share" / "free-tts-server"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    calls = []
+    manifest_error = OSError("manifest disk failure")
+
+    def failing_manifest_load(*args, **kwargs):
+        raise manifest_error
+
+    monkeypatch.setattr(install, "_load_manifest", failing_manifest_load)
+
+    with pytest.raises(OSError, match="manifest disk failure") as excinfo:
+        install.uninstall_server(
+            root=root,
+            unit_dir=unit_dir,
+            systemctl=fake_systemctl(calls=calls),
+        )
+
+    assert excinfo.value is manifest_error
+    assert calls == []
+    assert not root.exists()
+    assert not unit_dir.exists()
+    with install._server_transaction_lock():
+        pass
 
 
 def test_uninstall_server_removes_unit_and_root(checkout, tmp_path):
@@ -2594,6 +2816,24 @@ def test_status_tolerates_corrupt_desktop_manifest(tmp_path):
     assert report["desktop"]["installed"] is False
 
 
+def test_status_tolerates_oversized_unquoted_desktop_manifest(tmp_path):
+    desktop_root = tmp_path / "share" / "free-tts"
+    desktop_root.mkdir(parents=True)
+    (desktop_root / install.DESKTOP_MANIFEST_NAME).write_text(
+        '{"module": "free-tts", "version": ' + ("9" * 5000) + "}"
+    )
+
+    report = install.status(
+        root=tmp_path / "missing",
+        desktop_root=desktop_root,
+        unit_dir=tmp_path / "config" / "systemd" / "user",
+        systemctl=fake_systemctl(),
+    )
+
+    assert report["server"]["installed"] is False
+    assert report["desktop"]["installed"] is False
+
+
 def test_main_rejects_unknown_command(capsys):
     assert install.main(["frobnicate"]) == 2
 
@@ -2601,6 +2841,29 @@ def test_main_rejects_unknown_command(capsys):
 def test_main_help_exits_zero(capsys):
     assert install.main(["--help"]) == 0
     assert "usage" in capsys.readouterr().out
+
+
+def test_main_status_tolerates_oversized_server_manifest_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    root = tmp_path / "share" / "free-tts-server"
+    root.mkdir(parents=True)
+    (root / install.MANIFEST_NAME).write_text(
+        '{"component": "server", "version": ' + ("9" * 5000) + "}"
+    )
+    desktop_root = tmp_path / "share" / "free-tts"
+    unit_dir = tmp_path / "config" / "systemd" / "user"
+    monkeypatch.setattr(install, "server_root", lambda: root)
+    monkeypatch.setattr(install, "systemd_user_dir", lambda: unit_dir)
+    monkeypatch.setattr(install, "_desktop_root", lambda: desktop_root)
+    monkeypatch.setattr(install, "default_systemctl", fake_systemctl())
+
+    code = install.main(["status"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "server   not installed" in captured.out
+    assert "Traceback" not in captured.out + captured.err
 
 
 @pytest.mark.parametrize(

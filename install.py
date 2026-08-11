@@ -87,7 +87,7 @@ def read_manifest(root: pathlib.Path) -> dict | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(payload, dict) or payload.get("component") != COMPONENT:
         return None
@@ -147,8 +147,15 @@ def _load_manifest(
         raise OwnershipError("server manifest must be a regular owned file")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise OwnershipError(f"server manifest is corrupt: {exc}") from exc
+    except (
+        OSError,
+        json.JSONDecodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
+        raise OwnershipError(
+            f"server manifest is corrupt at {path}: {exc}"
+        ) from exc
     return _validate_manifest(payload, expected)
 
 
@@ -526,42 +533,44 @@ def _server_transaction_lock(
     descriptor = None
     locked = False
     try:
-        descriptor = os.open(
-            lock_path,
-            os.O_CREAT
-            | os.O_RDWR
-            | os.O_CLOEXEC
-            | os.O_NOFOLLOW,
-            0o600,
-        )
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise PreflightError(
-                f"installer lock must be a regular file: {lock_path}"
-            )
-        if metadata.st_uid != os.geteuid():
-            raise PreflightError(
-                f"installer lock is not owned by the current user: {lock_path}"
-            )
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise PreflightError(
-                f"installer lock has insecure permissions: {lock_path}"
-            )
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT
+                | os.O_RDWR
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PreflightError(
+                    f"installer lock must be a regular file: {lock_path}"
+                )
+            if metadata.st_uid != os.geteuid():
+                raise PreflightError(
+                    f"installer lock is not owned by the current user: {lock_path}"
+                )
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise PreflightError(
+                    f"installer lock has insecure permissions: {lock_path}"
+                )
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise PreflightError(
+                    "another server installer operation is active; "
+                    f"lock: {lock_path}"
+                ) from exc
+            locked = True
+        except PreflightError:
+            raise
+        except OSError as exc:
             raise PreflightError(
-                "another server installer operation is active; "
-                f"lock: {lock_path}"
+                f"could not open or lock installer lock {lock_path}: {exc}"
             ) from exc
-        locked = True
+
         yield
-    except PreflightError:
-        raise
-    except OSError as exc:
-        raise PreflightError(
-            f"could not open or lock installer lock {lock_path}: {exc}"
-        ) from exc
     finally:
         if descriptor is not None:
             if locked:
@@ -592,7 +601,7 @@ def _load_service_endpoint(path: pathlib.Path) -> ServiceEndpoint:
         )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise PreflightError(
             f"endpoint config is not readable JSON: {path}: {exc}"
         ) from exc
@@ -922,6 +931,7 @@ def probe_health(
         OSError,
         urllib.error.URLError,
         ValueError,
+        RecursionError,
         http.client.HTTPException,
     ):
         return None
@@ -1845,7 +1855,7 @@ def _read_json(path: pathlib.Path) -> dict | None:
     """Read a JSON object tolerantly; None on any problem."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
 
