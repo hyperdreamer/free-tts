@@ -40,6 +40,7 @@ let selectedVoice = DEFAULT_VOICE_FALLBACK;
 let activeGender = "all";     // "all" | "Male" | "Female"
 const activeAbortControllers = new Set();  // for cancelling in-flight TTS requests
 let sentencePipeline = null;      // { sentences, idx, cache, voice, rate, pitch }
+let activeDownload = null;        // { requestId, controller, button, idleLabel }
 
 function clampNumber(value, min, max, fallback = 0) {
   const num = Number.parseInt(value, 10);
@@ -333,16 +334,20 @@ speedInput.addEventListener("input", () => {
 // ---------------------------------------------------------------------------
 // TTS API call
 // ---------------------------------------------------------------------------
-async function callTTS(ssml, timeoutMs = 120000, { cancelExisting = false } = {}) {
+async function callTTS(ssml, timeoutMs = 120000, {
+  cancelExisting = false,
+  controller: externalController = null,
+  requestId = null,
+} = {}) {
   if (cancelExisting) cancelGeneration();
-  const controller = new AbortController();
+  const controller = externalController || new AbortController();
   activeAbortControllers.add(controller);
   const timeout = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const resp = await fetch(`${BACKEND_URL}/generate-and-download-tts`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ssml }),
+      body: JSON.stringify(requestId ? { ssml, request_id: requestId } : { ssml }),
       signal: controller.signal,
     });
     if (!resp.ok) {
@@ -357,12 +362,12 @@ async function callTTS(ssml, timeoutMs = 120000, { cancelExisting = false } = {}
 }
 
 function cancelGeneration() {
+  cancelActiveDownload();
   activeAbortControllers.forEach(controller => controller.abort());
   activeAbortControllers.clear();
   revokeSentenceCache(sentencePipeline?.cache);
   sentencePipeline = null;
   previewBtn.textContent = "▶ Preview Audio";
-  downloadTextBtn.textContent = "⬇ Download MP3";
 }
 
 function revokeSentenceCache(cache) {
@@ -409,6 +414,80 @@ function downloadBlob(blob, filename = "tts-output.mp3") {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// ---------------------------------------------------------------------------
+// Download flow (shared by both tabs)
+//
+// Downloads carry a request_id so cancelling can reach the server's
+// DELETE /tts-request/<id> route. Without it, aborting the browser fetch leaves
+// the server generating for minutes and holding its concurrency slot.
+// ---------------------------------------------------------------------------
+function makeRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "req-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+}
+
+// The request_id is registered only once the queued request reaches the server
+// handler; retry briefly so a just-clicked Cancel is not lost to that window.
+async function cancelServerRequest(requestId) {
+  const deadline = Date.now() + 5000;
+  do {
+    try {
+      const resp = await fetch(`${BACKEND_URL}/tts-request/${encodeURIComponent(requestId)}`, {
+        method: "DELETE",
+      });
+      if (resp.ok) return;
+    } catch {
+      // Server unreachable; the browser-side abort already stopped the download.
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  } while (Date.now() < deadline);
+}
+
+function restoreDownloadButton(state) {
+  state.button.textContent = state.idleLabel;
+  state.button.classList.remove("btn-stop-preview");
+}
+
+function cancelActiveDownload() {
+  const state = activeDownload;
+  if (!state) return;
+  activeDownload = null;
+  state.controller.abort();
+  restoreDownloadButton(state);
+  cancelServerRequest(state.requestId);
+}
+
+async function startDownload(ssml, button, idleLabel) {
+  // Clicking a download button while one is in flight cancels it.
+  if (activeDownload) {
+    cancelActiveDownload();
+    return;
+  }
+
+  // A download supersedes previews and voice samples.
+  cancelGeneration();
+
+  const requestId = makeRequestId();
+  const controller = new AbortController();
+  const state = { requestId, controller, button, idleLabel };
+  activeDownload = state;
+  button.textContent = "Cancel Downloading";
+  button.classList.add("btn-stop-preview");
+
+  try {
+    const blob = await callTTS(ssml, 0, { controller, requestId });  // no timeout for downloads
+    // A blob that lands after the user cancelled must not still save.
+    if (activeDownload === state) downloadBlob(blob);
+  } catch (err) {
+    if (err.name !== "AbortError") alert("Error: " + err.message);
+  } finally {
+    if (activeDownload === state) activeDownload = null;
+    restoreDownloadButton(state);
+  }
+}
+
 function showStopButton() {
   previewBtn.style.display = "none";
   stopBtn.style.display = "inline-flex";
@@ -425,25 +504,7 @@ function hideStopButton() {
 downloadSsmlBtn.addEventListener("click", async () => {
   const ssml = ssmlInput.value.trim();
   if (!ssml) return alert("Please enter SSML before downloading.");
-
-  // If already generating, cancel instead
-  if (activeAbortControllers.size > 0) {
-    cancelGeneration();
-    return;
-  }
-
-  downloadSsmlBtn.textContent = "Cancel Download";
-  downloadSsmlBtn.classList.add("btn-stop-preview");
-
-  try {
-    const blob = await callTTS(ssml, 0, { cancelExisting: true });  // no timeout for downloads
-    downloadBlob(blob);
-  } catch (err) {
-    if (err.name !== "AbortError") alert("Error: " + err.message);
-  } finally {
-    downloadSsmlBtn.textContent = "Download MP3";
-    downloadSsmlBtn.classList.remove("btn-stop-preview");
-  }
+  await startDownload(ssml, downloadSsmlBtn, "Download MP3");
 });
 
 // ---------------------------------------------------------------------------
@@ -550,12 +611,6 @@ async function handleTextGenerate(preview = false) {
   const text = textInputArea.value.trim();
   if (!text) return alert("Please enter text to synthesize.");
 
-  // If already generating, cancel instead
-  if (activeAbortControllers.size > 0) {
-    cancelGeneration();
-    return;
-  }
-
   const rate = clampNumber(speedSlider.value, -50, 200);
   const pitch = clampNumber(pitchSlider.value, -50, 50);
   const ssml = buildSSML(selectedVoice, text, rate, pitch);
@@ -566,18 +621,7 @@ async function handleTextGenerate(preview = false) {
     return;
   }
 
-  downloadTextBtn.textContent = "Cancel Download";
-  downloadTextBtn.classList.add("btn-stop-preview");
-
-  try {
-    const blob = await callTTS(ssml, 0, { cancelExisting: true });  // no timeout for downloads
-    downloadBlob(blob);
-  } catch (err) {
-    if (err.name !== "AbortError") alert("Error: " + err.message);
-  } finally {
-    downloadTextBtn.textContent = "⬇ Download MP3";
-    downloadTextBtn.classList.remove("btn-stop-preview");
-  }
+  await startDownload(ssml, downloadTextBtn, "⬇ Download MP3");
 }
 
 previewBtn.addEventListener("click", () => handleTextGenerate(true));
