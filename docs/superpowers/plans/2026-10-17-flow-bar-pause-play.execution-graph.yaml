@@ -1,0 +1,65 @@
+source_plan:
+  path: docs/superpowers/plans/2026-10-17-flow-bar-pause-play.md
+  sha256: 86c535fef3895b1c55b31504bd2a8513f09134475eb22b437d9bd5c276d4a5ca
+  commit_oid: ea441b2f3271aeca6bfd5056e52848cf7200a701
+schema_version: 1
+lanes:
+  - id: extension-sequential
+    task_ids: [T-001, T-002]
+    owns: ["extension/background.js", "extension/popup.js", "tests/extension_playback.test.cjs", "tests/test_media_session.py", "tests/test_extension_split_sentences.py", "tests/extension_dom_smoke.cjs", "tests/test_extension_playback.py"]
+    resources: []
+tasks:
+  - id: T-001
+    plan_task: 1
+    lane: extension-sequential
+    sequence: 1
+    category: worker-main-ordering-and-canonical-snapshots
+    depends_on: []
+    owns: ["extension/background.js", "extension/popup.js", "tests/extension_playback.test.cjs", "tests/test_media_session.py", "tests/test_extension_split_sentences.py"]
+    resources: []
+    produces: [{"id": "I-001","name": "PageOwner","signature": "`PageOwner = { tabId: number, leaseId: string, sessionId: string, lifecycleRevision: number }` for every published page-bound operation.","sha256": "50d86e8c3b661a0ce7ac9939f2a9bffaadbe87316211c84b4e37e7f353f7aa1f"},{"id": "I-002","name": "PlaybackSnapshot","signature": "`PlaybackSnapshot = { workerId: string, state: \"idle\" | \"playing\" | \"paused\", sessionId: string | null, viewRevision: number, intentRevision: number | null, mediaRevision: number | null, phase: \"idle\" | \"initializing\" | \"loading\" | \"ready\" | \"starting\" | \"playing\" | \"paused\" | \"ended\", audioStatus: \"none\" | \"starting\" | \"playing\" | \"paused\" | \"ended\" | \"error\", error: { code: string, message: string } | null }`.","sha256": "44f898d3e384cfb5f57bd01830635cf8c5c75709f10f78a63ed7d5615cd48a0d"},{"id": "I-003","name": "CommandResponse","signature": "`CommandResponse = PlaybackSnapshot & { ok: boolean, accepted: boolean, disposition: \"applied\" | \"superseded\" | \"ignored\" | \"failed\", pageApplied: boolean, commandError: { code: string, message: string } | null }`.","sha256": "5c1b66de30b7d0755137e63741f724497d320e869022058f614d8eff8e1c5cfc"},{"id": "I-004","name": "showControlBar/updateControlBar","signature": "`showControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` and `updateControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` as the stable renderer seam Task 2 completes.","sha256": "d10d2dbe64d4aec779215cbf3cb4e2ee576f6de525fc175b85257a04f4ce2eaa"}]
+    consumes: []
+    interfaces: {"produces": [{"id": "I-001","name": "PageOwner","signature": "`PageOwner = { tabId: number, leaseId: string, sessionId: string, lifecycleRevision: number }` for every published page-bound operation.","sha256": "50d86e8c3b661a0ce7ac9939f2a9bffaadbe87316211c84b4e37e7f353f7aa1f"},{"id": "I-002","name": "PlaybackSnapshot","signature": "`PlaybackSnapshot = { workerId: string, state: \"idle\" | \"playing\" | \"paused\", sessionId: string | null, viewRevision: number, intentRevision: number | null, mediaRevision: number | null, phase: \"idle\" | \"initializing\" | \"loading\" | \"ready\" | \"starting\" | \"playing\" | \"paused\" | \"ended\", audioStatus: \"none\" | \"starting\" | \"playing\" | \"paused\" | \"ended\" | \"error\", error: { code: string, message: string } | null }`.","sha256": "44f898d3e384cfb5f57bd01830635cf8c5c75709f10f78a63ed7d5615cd48a0d"},{"id": "I-003","name": "CommandResponse","signature": "`CommandResponse = PlaybackSnapshot & { ok: boolean, accepted: boolean, disposition: \"applied\" | \"superseded\" | \"ignored\" | \"failed\", pageApplied: boolean, commandError: { code: string, message: string } | null }`.","sha256": "5c1b66de30b7d0755137e63741f724497d320e869022058f614d8eff8e1c5cfc"},{"id": "I-004","name": "showControlBar/updateControlBar","signature": "`showControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` and `updateControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` as the stable renderer seam Task 2 completes.","sha256": "d10d2dbe64d4aec779215cbf3cb4e2ee576f6de525fc175b85257a04f4ce2eaa"}],"consumes": []}
+    validation:
+      - argv: ["node", "--check", "extension/background.js"]
+        cwd: .
+        timeout_seconds: 30
+      - argv: ["node", "--check", "extension/popup.js"]
+        cwd: .
+        timeout_seconds: 30
+      - argv: ["node", "--test", "tests/extension_playback.test.cjs"]
+        cwd: .
+        timeout_seconds: 120
+      - argv: ["/data/home/henry-arch/.local/state/pi/project-manager/runs/3feb48d1239aabaa64f716b74cb0652340d75c47efd854fad17b7270a3e22eb3/pm-run-20261017-032149-a3b5d4e1/verify-venv/bin/python", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests/test_media_session.py", "tests/test_extension_split_sentences.py"]
+        cwd: .
+        timeout_seconds: 120
+  - id: T-002
+    plan_task: 2
+    lane: extension-sequential
+    sequence: 2
+    category: gesture-render-and-browser-integration
+    depends_on: [T-001]
+    owns: ["extension/background.js", "tests/extension_dom_smoke.cjs", "tests/test_extension_playback.py"]
+    resources: []
+    produces: []
+    consumes: [{"id": "I-001","name": "PageOwner","signature": "`PageOwner = { tabId: number, leaseId: string, sessionId: string, lifecycleRevision: number }` for every published page-bound operation.","sha256": "50d86e8c3b661a0ce7ac9939f2a9bffaadbe87316211c84b4e37e7f353f7aa1f","producer": "T-001"},{"id": "I-002","name": "PlaybackSnapshot","signature": "`PlaybackSnapshot = { workerId: string, state: \"idle\" | \"playing\" | \"paused\", sessionId: string | null, viewRevision: number, intentRevision: number | null, mediaRevision: number | null, phase: \"idle\" | \"initializing\" | \"loading\" | \"ready\" | \"starting\" | \"playing\" | \"paused\" | \"ended\", audioStatus: \"none\" | \"starting\" | \"playing\" | \"paused\" | \"ended\" | \"error\", error: { code: string, message: string } | null }`.","sha256": "44f898d3e384cfb5f57bd01830635cf8c5c75709f10f78a63ed7d5615cd48a0d","producer": "T-001"},{"id": "I-003","name": "CommandResponse","signature": "`CommandResponse = PlaybackSnapshot & { ok: boolean, accepted: boolean, disposition: \"applied\" | \"superseded\" | \"ignored\" | \"failed\", pageApplied: boolean, commandError: { code: string, message: string } | null }`.","sha256": "5c1b66de30b7d0755137e63741f724497d320e869022058f614d8eff8e1c5cfc","producer": "T-001"},{"id": "I-004","name": "showControlBar/updateControlBar","signature": "`showControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` and `updateControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` as the stable renderer seam Task 2 completes.","sha256": "d10d2dbe64d4aec779215cbf3cb4e2ee576f6de525fc175b85257a04f4ce2eaa","producer": "T-001"}]
+    interfaces: {"produces": [],"consumes": [{"id": "I-001","name": "PageOwner","signature": "`PageOwner = { tabId: number, leaseId: string, sessionId: string, lifecycleRevision: number }` for every published page-bound operation.","sha256": "50d86e8c3b661a0ce7ac9939f2a9bffaadbe87316211c84b4e37e7f353f7aa1f","producer": "T-001"},{"id": "I-002","name": "PlaybackSnapshot","signature": "`PlaybackSnapshot = { workerId: string, state: \"idle\" | \"playing\" | \"paused\", sessionId: string | null, viewRevision: number, intentRevision: number | null, mediaRevision: number | null, phase: \"idle\" | \"initializing\" | \"loading\" | \"ready\" | \"starting\" | \"playing\" | \"paused\" | \"ended\", audioStatus: \"none\" | \"starting\" | \"playing\" | \"paused\" | \"ended\" | \"error\", error: { code: string, message: string } | null }`.","sha256": "44f898d3e384cfb5f57bd01830635cf8c5c75709f10f78a63ed7d5615cd48a0d","producer": "T-001"},{"id": "I-003","name": "CommandResponse","signature": "`CommandResponse = PlaybackSnapshot & { ok: boolean, accepted: boolean, disposition: \"applied\" | \"superseded\" | \"ignored\" | \"failed\", pageApplied: boolean, commandError: { code: string, message: string } | null }`.","sha256": "5c1b66de30b7d0755137e63741f724497d320e869022058f614d8eff8e1c5cfc","producer": "T-001"},{"id": "I-004","name": "showControlBar/updateControlBar","signature": "`showControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` and `updateControlBar(owner: PageOwner, snapshot: PlaybackSnapshot, modes: { loopEnabled: boolean, repeatCurrentEnabled: boolean }): Promise<\"rendered\" | \"deferred\">` as the stable renderer seam Task 2 completes.","sha256": "d10d2dbe64d4aec779215cbf3cb4e2ee576f6de525fc175b85257a04f4ce2eaa","producer": "T-001"}]}
+    validation:
+      - argv: ["node", "--check", "extension/background.js"]
+        cwd: .
+        timeout_seconds: 30
+      - argv: ["node", "--check", "extension/popup.js"]
+        cwd: .
+        timeout_seconds: 30
+      - argv: ["node", "--test", "tests/extension_playback.test.cjs"]
+        cwd: .
+        timeout_seconds: 120
+      - argv: ["node", "tests/extension_dom_smoke.cjs", "--chromium", "/usr/bin/chromium"]
+        cwd: .
+        timeout_seconds: 120
+      - argv: ["/data/home/henry-arch/.local/state/pi/project-manager/runs/3feb48d1239aabaa64f716b74cb0652340d75c47efd854fad17b7270a3e22eb3/pm-run-20261017-032149-a3b5d4e1/verify-venv/bin/python", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests/test_media_session.py", "tests/test_extension_split_sentences.py", "tests/test_extension_playback.py"]
+        cwd: .
+        timeout_seconds: 120
+      - argv: ["/data/home/henry-arch/.local/state/pi/project-manager/runs/3feb48d1239aabaa64f716b74cb0652340d75c47efd854fad17b7270a3e22eb3/pm-run-20261017-032149-a3b5d4e1/verify-venv/bin/python", "-m", "pytest", "-p", "no:cacheprovider", "-q"]
+        cwd: .
+        timeout_seconds: 120

@@ -1,0 +1,9 @@
+digraph execution {
+  rankdir=LR;
+  subgraph cluster_extension_sequential {
+    label="extension-sequential";
+    "T-001" [label="Task 1: Worker and MAIN ordered playback with executable VM regressions\nCapable"];
+    "T-002" [label="Task 2: Gesture lifecycle, versioned compact rendering, Chromium smoke, and pytest integration\nCapable"];
+  }
+  "T-001" -> "T-002";
+}
