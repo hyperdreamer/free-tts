@@ -281,3 +281,108 @@ test('W03 activation_executes_before_pause', async t => {
     await started; await h.finish();
   });
 });
+
+// F-1: loading must not strand ready bytes when a running intent executes
+// after activation, including when the no-effect activation completes last.
+test('F-1 running_intent_applies_after_load', async t => {
+  for (const state of ['initial', 'resumed']) await t.test(state, async () => {
+    const h = harness(); const started = h.start();
+    let resumed;
+    if (state === 'resumed') {
+      await h.ready(highlight); await started; await h.pause(highlight);
+      resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    }
+    const runningIntent = entry => entry.func.name === 'injectWorkerIntent' && !entry.args[0].paused;
+    await h.ready(entry => runningIntent(entry) || activation(entry));
+    const intent = h.scripts.pending(runningIntent), pipeline = h.worker.pipeline, attempt = pipeline.attempt;
+    const loader = attempt.loadPromise;
+    assert.equal(attempt.phase, 'ready'); assert.equal(attempt.dataUrl, 'data:audio/mpeg;base64,AQ==');
+    // A gated implementation dispatches no activation yet. Exercise any early
+    // activation in the unfixed implementation, keeping its completion pending.
+    const early = h.scripts.entries.find(entry => !entry.executed && activation(entry));
+    if (early) assert.equal(h.execute(early).disposition, 'no-effect');
+    assert.equal(h.audioSpy.constructors.length, 0); assert.equal(h.audioSpy.plays.length, 0);
+    h.execute(intent); await h.complete(intent);
+    await h.flush({ holdScript: entry => entry === early || activation(entry) });
+    if (early) await h.complete(early);
+    await h.flush();
+    const response = await (resumed || started);
+    assert.equal(response.disposition, 'applied'); assert.equal(response.pageApplied, true);
+    assert.equal(h.audioSpy.constructors.length, 1, 'ready attempt must activate after its running intent applies');
+    assert.equal(h.audioSpy.plays.length, 1); assert.equal(h.worker.pipeline, pipeline);
+    assert.equal(pipeline.attempt, attempt); assert.equal(attempt.loadPromise, loader);
+    assert.equal(h.fetches.filter(entry => entry.sentence === 1).length, 1, 'no replacement loader');
+    assert.equal((await h.snapshot()).state, 'playing');
+    await h.finish();
+  });
+});
+
+// F-3: desired worker state alone cannot acknowledge a redundant pause while
+// the accepted revision's MAIN boundary is still pending.
+test('F-3 redundant_pause_waits_for_main_receipt', async t => {
+  for (const order of ['applied', 'superseded']) await t.test(order, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const audio = h.audioSpy.plays[0].audio;
+    const first = h.send({ action: 'pausePlayback', source: 'popup' }, {}); await h.drain();
+    const pause = h.scripts.pending(entry => entry.func.name === 'injectWorkerIntent' && entry.args[0].paused);
+    let acknowledged = false;
+    const second = h.send({ action: 'pausePlayback', source: 'popup' }, {}); second.then(() => { acknowledged = true; });
+    await h.flush({ holdScript: entry => entry === pause });
+    assert.equal(acknowledged, false, 'redundant pause must not acknowledge before MAIN applies it');
+    assert.equal(audio.paused, false); assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, false);
+    assert.equal(h.scripts.entries.filter(entry => entry.func.name === 'injectWorkerIntent' && entry.args[0].paused).length, 1, 'one shared pause application');
+    let resumed;
+    if (order === 'superseded') {
+      resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+      await h.flush({ holdScript: entry => entry === pause });
+    }
+    h.execute(pause); await h.drain();
+    if (order === 'applied') assert.equal(acknowledged, false, 'execution alone is not the worker-facing receipt');
+    await h.complete(pause); await h.flush();
+    for (const response of await Promise.all([first, second])) {
+      assert.equal(response.accepted, true); assert.equal(response.disposition, order);
+      assert.equal(response.pageApplied, order === 'applied');
+      assert.equal(response.state, order === 'applied' ? 'paused' : 'playing');
+    }
+    assert.equal(audio.paused, order === 'applied');
+    if (resumed) await resumed; else h.assertPausedBar();
+    await h.finish();
+  });
+});
+
+// F-2: leaving the MAIN record playing/starting after direct pause suppresses
+// the next resume, and failing to invalidate its serial admits the old outcome.
+test('F-2 direct_media_pause_then_popup_resume', async t => {
+  for (const outcome of ['fulfilled', 'pending-fulfill', 'pending-reject']) await t.test(outcome, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const initial = h.audioSpy.plays[0], audio = initial.audio;
+    if (outcome === 'fulfilled') { initial.outcome.resolve(); await h.drain(); }
+    const media = h.page(7).navigator.mediaSession, record = h.page(7).__freeTtsPlayback;
+    media.handlers.get('pause')();
+    assert.equal(audio.paused, true, 'direct pause takes effect without the worker');
+    const boundary = h.audioSpy.media.length;
+    const synced = h.send(h.messages.at(-1).data); await h.flush(); await synced;
+    if (outcome === 'pending-reject') initial.outcome.reject(new Error('invalidated direct pause'));
+    else initial.outcome.resolve();
+    await h.drain();
+    assert.equal(h.audioSpy.media.slice(boundary).some(change => change.value === 'playing'), false, 'direct pause fences the old play outcome');
+    const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {}); await h.flush();
+    const response = await resumed;
+    assert.equal(h.audioSpy.plays.length, 2, 'popup resume must play the directly paused Audio');
+    assert.equal(response.disposition, 'applied'); assert.equal(response.pageApplied, true);
+    assert.equal(h.audioSpy.plays[1].audio, audio); assert.equal(audio.currentTime, 3);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(audio.paused, false);
+    assert.equal(record.audioStatus, 'starting'); assert.equal(record.audioError, null);
+    assert.equal(h.audioSpy.writes.filter(write => write.field === 'currentTime').length, 0);
+    // The direct play handler must use the same live invocation bookkeeping too.
+    media.handlers.get('pause')();
+    assert.equal(record.desiredPaused, true); assert.equal(record.audioStatus, 'paused');
+    media.handlers.get('play')();
+    assert.equal(record.desiredPaused, false); assert.equal(record.audioStatus, 'starting');
+    assert.equal(h.audioSpy.plays.length, 3); assert.equal(h.audioSpy.plays[2].audio, audio);
+    assert.equal(media.playbackState, 'paused', 'direct play is not audible success before settlement');
+    h.audioSpy.plays[2].outcome.resolve(); await h.drain();
+    assert.equal(record.audioStatus, 'playing'); assert.equal(media.playbackState, 'playing');
+    await h.finish();
+  });
+});
