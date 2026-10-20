@@ -2,8 +2,24 @@ digraph execution {
   rankdir=LR;
   subgraph cluster_extension_sequential {
     label="extension-sequential";
-    "T-001" [label="Task 1: Worker and MAIN ordered playback with executable VM regressions\nCapable"];
-    "T-002" [label="Task 2: Gesture lifecycle, versioned compact rendering, Chromium smoke, and pytest integration\nCapable"];
+    "T-001" [label="Task 1: VM harness scaffolding and pause-before-activation ordering\nCapable"];
+    "T-002" [label="Task 2: Resume identity, ordered toggles, and pending-load continuation\nCapable"];
+    "T-003" [label="Task 3: Ready-paused resume and qualified completion observation\nCapable"];
+    "T-004" [label="Task 4: Stop, replacement, and teardown ownership fences\nCapable"];
+    "T-005" [label="Task 5: Navigation attempts, poll identity, and late failures\nCapable"];
+    "T-006" [label="Task 6: Media ownership, relay tokens, canonical responses, and popup\nCapable"];
+    "T-007" [label="Task 7: Loop/repeat, retained errors, and worker/media command reconciliation\nCapable"];
+    "T-008" [label="Task 8: Bar gesture lifecycle, cancellation, drag, and versioned rendering\nCapable"];
+    "T-009" [label="Task 9: Genuine selection, double-click, stale tickets, and render ordering\nCapable"];
+    "T-010" [label="Task 10: Pytest wrapper, mutation sensitivity, and final validation\nCapable"];
   }
   "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-003" -> "T-004";
+  "T-004" -> "T-005";
+  "T-005" -> "T-006";
+  "T-006" -> "T-007";
+  "T-007" -> "T-008";
+  "T-008" -> "T-009";
+  "T-009" -> "T-010";
 }
