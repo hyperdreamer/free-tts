@@ -5,9 +5,61 @@ const DEFAULT_SERVER = "http://localhost:5000";
 const PRELOAD_AHEAD = 2;  // pre-fetch this many sentences ahead
 const FETCH_TIMEOUT_MS = 120000;
 
-// Pipeline state
+// Pipeline state. Revisions are scoped to this worker; opaque IDs are identities.
+const workerId = crypto.randomUUID();
+let lifecycleRevision = 0;
+let viewRevision = 0;
+let lastError = null;
+let startRequestSerial = 0;
+let pendingStart = null;
+const pageLeases = new Map();
 let activePlayback = { tabId: null };
-let sentencePipeline = null;  // { sentences, currentIdx, cache, tabId, voice, serverUrl, speed, isPaused, loopEnabled, repeatCurrentEnabled, _pausedAtEnd }
+let sentencePipeline = null;
+
+function ownsPipeline(pipeline, attempt = null) {
+  return !!pipeline && sentencePipeline === pipeline && !pipeline.cancelled &&
+    activePlayback.sessionId === pipeline.sessionId && activePlayback.lifecycleRevision === pipeline.lifecycleRevision &&
+    (!attempt || (pipeline.attempt === attempt && !attempt.retired && pipeline.currentIdx === attempt.idx));
+}
+
+function buildPlaybackSnapshot(pipeline = sentencePipeline) {
+  const attempt = pipeline?.attempt;
+  return {
+    workerId, state: pipeline ? (pipeline.isPaused ? "paused" : "playing") : "idle",
+    sessionId: pipeline?.sessionId ?? null, viewRevision,
+    intentRevision: pipeline?.intentRevision ?? null, mediaRevision: pipeline?.mediaRevision ?? null,
+    phase: attempt?.phase ?? "idle", audioStatus: attempt?.audioStatus ?? "none", error: lastError,
+  };
+}
+
+function commandResponse(accepted, receipt = null, commandError = null) {
+  return { ...buildPlaybackSnapshot(), ok: !commandError, accepted,
+    disposition: commandError ? "failed" : !accepted ? "ignored" : receipt?.disposition === "stale" || receipt?.disposition === "superseded-by-media" ? "superseded" : "applied",
+    pageApplied: !!receipt && ["applied", "idempotent"].includes(receipt.disposition), commandError };
+}
+
+function workerIntent(pipeline) {
+  return { leaseId: pipeline.leaseId, sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision,
+    attemptId: pipeline.attempt?.attemptId ?? null, intentRevision: pipeline.intentRevision,
+    mediaBase: pipeline.mediaRevision, paused: pipeline.isPaused };
+}
+
+function pageOwner(pipeline) {
+  return { tabId: pipeline.tabId, leaseId: pipeline.leaseId, sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision };
+}
+
+function startTicket() {
+  if (pendingStart) pendingStart.cancelled = true;
+  return pendingStart = { requestId: crypto.randomUUID(), requestSerial: ++startRequestSerial, cancelled: false };
+}
+
+function playbackModes(pipeline) {
+  return { loopEnabled: pipeline.loopEnabled, repeatCurrentEnabled: pipeline.repeatCurrentEnabled };
+}
+
+function setAttemptPhase(pipeline, attempt, phase) {
+  if (ownsPipeline(pipeline, attempt) && attempt.phase !== phase) { attempt.phase = phase; viewRevision++; }
+}
 
 function logError(context, error) {
   console.error(`free-tts background: ${context}`, error);
@@ -53,31 +105,19 @@ function clearPlayback() {
   sentencePipeline = null;
 }
 
+function clearOwnedPlayback(pipeline) {
+  if (sentencePipeline === pipeline) { clearPlayback(); viewRevision++; }
+}
+
 // --- Messages from popup ---------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === "speakSentences") {
-    return sendAsyncResponse(sendResponse, chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-      if (tab?.id) {
-        return startSentenceTTS(tab.id, msg.text).then(() => ({ ok: true }));
-      }
-      return { ok: false, error: "No active tab" };
-    }));
+  if (["speakSentences", "getPlaybackState", "pausePlayback", "resumePlayback", "togglePlayback"].includes(msg.action)) {
+    return sendAsyncResponse(sendResponse, acceptRuntimeCommand(msg, sender));
   }
   if (msg.action === "stopPlayback") {
     return sendAsyncResponse(sendResponse, stopPlayback().then(() => ({ ok: true })));
   }
-  if (msg.action === "getPlaybackState") {
-    if (sentencePipeline?.isPaused) sendResponse({ state: "paused" });
-    else if (sentencePipeline) sendResponse({ state: "playing" });
-    else sendResponse({ state: "idle" });
-    return false;
-  }
-  if (msg.action === "pausePlayback") {
-    return sendAsyncResponse(sendResponse, pausePlayback().then(() => ({ ok: true })));
-  }
-  if (msg.action === "resumePlayback") {
-    return sendAsyncResponse(sendResponse, resumePlayback().then(() => ({ ok: true })));
-  }
+
   // Media keys already paused/played the Audio element in the page; only sync
   // worker state (pipeline + control bar + context menu) without re-issuing
   // audio control.
@@ -122,15 +162,16 @@ chrome.commands.onCommand.addListener(async (command) => {
       await stopPlayback();
       return;
     }
+    const ticket = startTicket();
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) return;
+    if (!tab?.id || ticket.cancelled) return;
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => window.getSelection()?.toString() || document.body.innerText || "",
       });
       const text = results?.[0]?.result?.trim();
-      if (text) await startSentenceTTS(tab.id, text);
+      if (text && !ticket.cancelled) await startSentenceTTS(tab.id, text, ticket);
     } catch (error) {
       // scripting permission may not be available on all URLs
       logError("handling keyboard shortcut", error);
@@ -140,65 +181,188 @@ chrome.commands.onCommand.addListener(async (command) => {
 });
 
 // --- Stop playback ---------------------------------------------------------
-async function stopPlayback() {
-  sentencePipeline = null;
-  if (activePlayback.tabId) {
-    try {
-      await cleanupMediaSession(activePlayback.tabId);
-      await chrome.scripting.executeScript({
-        target: { tabId: activePlayback.tabId },
-        world: "MAIN",
-        func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
-      });
-      await cleanupPageHighlighting(activePlayback.tabId);
-      await hideControlBar(activePlayback.tabId);
-    } catch (error) {
-      logError("stopping playback in page", error);
-    }
+async function stopPlayback(pipeline = sentencePipeline, cancelStarts = true) {
+  if (cancelStarts && pendingStart) { pendingStart.cancelled = true; pendingStart = null; }
+  const tabId = pipeline?.tabId ?? activePlayback.tabId;
+  if (pipeline) {
+    pipeline.cancelled = true;
+    pipeline.attempt.retired = true;
+    clearTimeout(pipeline.attempt.pollTimer);
+    clearTimeout(pipeline.attempt.cacheTimer);
+    pipeline.attempt.cacheWake?.();
+    lifecycleRevision++;
+    viewRevision++;
   }
-  clearPlayback();
+  if (tabId) {
+    try {
+      await cleanupMediaSession(tabId);
+      await chrome.scripting.executeScript({
+        target: { tabId }, world: "MAIN",
+        func: (owner) => {
+          const record = window.__freeTtsPlayback;
+          if (owner && (record?.sessionId !== owner.sessionId || record.lifecycleRevision !== owner.lifecycleRevision)) return;
+          if (record) { record.desiredPaused = true; record.startSerial++; }
+          const audio = window.__freeTtsAudio;
+          if (audio) { audio.pause(); audio.src = ""; }
+          if (record) { record.audio = null; record.audioId = null; record.audioStatus = "none"; record.audioRevision++; }
+          window.__freeTtsAudio = null;
+        }, args: [pipeline && { sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision }],
+      });
+      await cleanupPageHighlighting(tabId);
+      await hideControlBar(tabId);
+    } catch (error) { logError("stopping playback in page", error); }
+  }
+  clearOwnedPlayback(pipeline);
 }
 
 // --- Pause / Resume ---------------------------------------------------------
-async function pausePlayback() {
-  if (!sentencePipeline) return;
-  sentencePipeline.isPaused = true;
-  // Stop audio in the tab
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: sentencePipeline.tabId },
-      world: "MAIN",
-      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); } },
-    });
-  } catch (error) {
-    logError("pausing playback in page", error);
+async function acceptRuntimeCommand(msg, sender) {
+  if (msg.action === "getPlaybackState") return buildPlaybackSnapshot();
+  if (msg.action === "speakSentences") {
+    if (typeof msg.text !== "string" || !msg.text.trim()) return commandResponse(false, null, { code: "invalid-argument", message: "No text" });
+    const ticket = startTicket();
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (ticket.cancelled) return commandResponse(false);
+    if (!tab?.id) return commandResponse(false, null, { code: "invalid-argument", message: "No active tab" });
+    return startSentenceTTS(tab.id, msg.text, ticket);
   }
-  await updateControlBar(sentencePipeline.tabId, true);
+  const pipeline = sentencePipeline;
+  if (!pipeline || (sender.tab && (sender.tab.id !== pipeline.tabId || msg.sessionId !== pipeline.sessionId || msg.lifecycleRevision !== pipeline.lifecycleRevision))) return commandResponse(false);
+  return msg.action === "pausePlayback" || (msg.action === "togglePlayback" && !pipeline.isPaused) ? pausePlayback(pipeline) : resumePlayback(pipeline);
 }
 
-async function resumePlayback() {
-  if (!sentencePipeline || !sentencePipeline.isPaused) return;
-  sentencePipeline.isPaused = false;
-  await updateControlBar(sentencePipeline.tabId, false);
-  // If we paused after the current sentence finished, the page's audio element is
-  // already terminated — re-fetch and play the sentence instead of trying to play a dead element.
-  if (sentencePipeline._pausedAtEnd) {
-    sentencePipeline._pausedAtEnd = false;
-    await playNextSentence();
-    return;
+async function pausePlayback(pipeline = sentencePipeline) {
+  return changePausedState(pipeline, true);
+}
+
+async function resumePlayback(pipeline = sentencePipeline) {
+  return changePausedState(pipeline, false);
+}
+
+async function changePausedState(pipeline, paused) {
+  if (!ownsPipeline(pipeline)) return commandResponse(false);
+  if (pipeline.isPaused === paused) return commandResponse(true);
+  pipeline.isPaused = paused;
+  pipeline.localIntentFloor = ++pipeline.intentRevision;
+  viewRevision++;
+  const capability = workerIntent(pipeline);
+  const receipt = await applyWorkerIntent(pipeline, capability);
+  if (ownsPipeline(pipeline)) {
+    if (!pipeline.isPaused) {
+      if (pipeline._pausedAtEnd) { pipeline._pausedAtEnd = false; pipeline.attempt.retired = true; }
+      void playNextSentence(pipeline);
+    }
+    await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
   }
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: sentencePipeline.tabId },
-      world: "MAIN",
-      func: () => {
-        const audio = window.__freeTtsAudio;
-        if (audio && !audio.ended) audio.play().catch(() => {});
-      },
-    });
-  } catch (error) {
-    logError("resuming playback in page", error);
+  return commandResponse(true, receipt);
+}
+
+async function applyWorkerIntent(pipeline, capability) {
+  await pipeline.installPromise;
+  if (!ownsPipeline(pipeline)) return null;
+  const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: injectWorkerIntent, args: [capability] });
+  if (ownsPipeline(pipeline)) {
+    adoptPageReceipt(pipeline, pipeline.attempt, result?.result);
+    if (pipeline.attempt.audioId) scheduleCompletionPoll(pipeline, pipeline.attempt);
   }
+  return result?.result;
+}
+
+function adoptPageReceipt(pipeline, attempt, receipt) {
+  if (!ownsPipeline(pipeline, attempt) || !receipt || receipt.sessionId !== pipeline.sessionId || receipt.lifecycleRevision !== pipeline.lifecycleRevision ||
+      receipt.intentRevision !== pipeline.intentRevision || receipt.mediaRevision < pipeline.mediaRevision) return;
+  pipeline.isPaused = receipt.paused;
+  pipeline.mediaRevision = receipt.mediaRevision;
+  if (receipt.attemptId !== attempt.attemptId || receipt.audioRevision <= attempt.audioRevision) return;
+  attempt.audioId = receipt.audioId;
+  attempt.audioRevision = receipt.audioRevision;
+  attempt.startSerial = receipt.startSerial;
+  attempt.audioStatus = receipt.audioStatus;
+  if (receipt.audioId && receipt.audioStatus !== "error") setAttemptPhase(pipeline, attempt, receipt.audioStatus);
+  viewRevision++;
+}
+
+// The short install barrier contains no storage, fetch, highlight, or play wait.
+async function installPlayback(pipeline) {
+  const owner = pageOwner(pipeline);
+  await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN", func: injectPlaybackSession, args: [owner, workerId] });
+  if (!ownsPipeline(pipeline)) return;
+  await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, func: (binding) => {
+    const previous = window.__freeTtsView;
+    if (previous?.leaseId === binding.leaseId && previous.lifecycleRevision >= binding.lifecycleRevision) return;
+    window.__freeTtsView = { ...binding, viewRevision: 0, barCreated: false, pendingRender: null };
+  }, args: [owner] });
+  if (!ownsPipeline(pipeline)) return;
+  await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN", func: injectSelectAttempt, args: [workerIntent(pipeline)] });
+}
+
+function injectPlaybackSession(owner, workerToken) {
+  const previous = window.__freeTtsPlayback;
+  if (previous?.leaseId === owner.leaseId && previous.lifecycleFloor >= owner.lifecycleRevision) return;
+  if (previous?.audio) { previous.audio.pause(); previous.audio.src = ""; }
+  const record = window.__freeTtsPlayback = { ...owner, workerId: workerToken, lifecycleFloor: owner.lifecycleRevision,
+    workerIntentRevision: 0, mediaRevision: 0, mediaSequence: 0, desiredPaused: true, attemptFloor: 0, attemptId: null,
+    audio: null, audioId: null, audioStatus: "none", startSerial: 0, audioRevision: 0, audioError: null };
+  window.__freeTtsAudio = null;
+  record.receipt = (disposition) => ({ leaseId: record.leaseId, sessionId: record.sessionId, lifecycleRevision: record.lifecycleRevision,
+    attemptId: record.attemptId, intentRevision: record.workerIntentRevision, mediaRevision: record.mediaRevision, paused: record.desiredPaused,
+    audioId: record.audioId, audioStatus: record.audioStatus, startSerial: record.audioId ? record.startSerial : null, audioRevision: record.audioRevision, disposition });
+  record.play = () => {
+    if (record !== window.__freeTtsPlayback || record.desiredPaused || !record.audio || record.audio.ended || ["starting", "playing"].includes(record.audioStatus)) return;
+    const audio = record.audio, serial = ++record.startSerial, attemptId = record.attemptId;
+    record.audioStatus = "starting"; record.audioError = null; record.audioRevision++;
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    const live = () => record === window.__freeTtsPlayback && record.audio === audio && record.attemptId === attemptId && record.startSerial === serial && !record.desiredPaused;
+    const settled = (error) => {
+      if (!live()) return;
+      record.audioStatus = error ? "error" : "playing";
+      record.audioError = error ? { code: "play-rejection", message: error.message || String(error) } : null;
+      record.audioRevision++;
+      if (!error && "mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      window.postMessage({ __freeTtsMedia: true, action: "audioPlaybackEvent", ...record.receipt("applied"), audioError: record.audioError }, "*");
+    };
+    try { Promise.resolve(audio.play()).then(() => settled(null), settled); } catch (error) { settled(error); }
+  };
+}
+
+function injectSelectAttempt(capability) {
+  const record = window.__freeTtsPlayback;
+  if (!record || record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.attemptId <= record.attemptFloor) return;
+  record.startSerial++;
+  if (record.audio) { record.audio.pause(); record.audio.src = ""; record.audioRevision++; }
+  record.attemptId = record.attemptFloor = capability.attemptId;
+  record.audio = window.__freeTtsAudio = null;
+  record.audioId = null; record.audioStatus = "none";
+}
+
+function injectWorkerIntent(capability) {
+  const record = window.__freeTtsPlayback;
+  if (!record) return null;
+  if (record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.intentRevision < record.workerIntentRevision) return record.receipt("stale");
+  if (capability.intentRevision === record.workerIntentRevision) return record.receipt("idempotent");
+  record.workerIntentRevision = capability.intentRevision;
+  if (capability.mediaBase !== record.mediaRevision) return record.receipt("superseded-by-media");
+  record.desiredPaused = capability.paused;
+  if (capability.paused) {
+    record.startSerial++; record.audioError = null;
+    if (record.audio) { record.audio.pause(); record.audioStatus = "paused"; record.audioRevision++; }
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+  } else if (record.attemptId === capability.attemptId) record.play();
+  return record.receipt("applied");
+}
+
+function injectActivation(capability) {
+  const record = window.__freeTtsPlayback;
+  if (!record) return null;
+  if (record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision ||
+      record.attemptId !== capability.attemptId || record.workerIntentRevision !== capability.intentRevision || record.mediaRevision !== capability.mediaRevision || record.desiredPaused || record.audioStatus === "ended") return record.receipt("no-effect");
+  if (!record.audio) {
+    const audio = new Audio(capability.dataUrl);
+    record.audio = window.__freeTtsAudio = audio;
+    record.audioId = `${record.sessionId}:${record.attemptId}`; record.audioStatus = "none"; record.audioRevision++;
+  }
+  record.play();
+  return record.receipt("applied");
 }
 
 // Sync worker state after a media key already paused/resumed the Audio element
@@ -279,7 +443,7 @@ function injectMediaSession() {
     artist: "Text-to-Speech",
     album: document.title || "Web Page",
   });
-  navigator.mediaSession.playbackState = "playing";
+  navigator.mediaSession.playbackState = "paused";
 
   // Keepalive: ping the worker so prev/next/stop stay responsive while paused.
   if (window.__freeTtsKeepalive) clearInterval(window.__freeTtsKeepalive);
@@ -344,11 +508,20 @@ async function getRepeatCurrentState(tabId) {
   }
 }
 
-async function showControlBar(tabId, isPaused, loopEnabled = true, repeatCurrentEnabled = false) {
+async function showControlBar(owner, snapshot, modes) {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (paused, initialLoopEnabled, initialRepeatCurrent) => {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: owner.tabId },
+      func: (binding, supplied, suppliedModes) => {
+        const view = window.__freeTtsView;
+        if (!view || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
+        if (view.barCreated) return "rendered";
+        const pending = view.pendingRender;
+        const latest = pending && pending.snapshot.viewRevision > supplied.viewRevision ? pending : { snapshot: supplied, modes: suppliedModes };
+        const paused = latest.snapshot.state === "paused";
+        const initialLoopEnabled = latest.modes.loopEnabled, initialRepeatCurrent = latest.modes.repeatCurrentEnabled;
+        view.viewRevision = latest.snapshot.viewRevision;
+        view.pendingRender = null;
         // Remove existing bar
         if (typeof window.__freeTtsCleanupControlBar === "function") {
           window.__freeTtsCleanupControlBar();
@@ -365,6 +538,7 @@ async function showControlBar(tabId, isPaused, loopEnabled = true, repeatCurrent
           const button = document.createElement("button");
           button.id = id;
           button.title = title;
+          button.setAttribute("aria-label", title);
           button.textContent = text;
           bar.appendChild(button);
         });
@@ -416,6 +590,7 @@ async function showControlBar(tabId, isPaused, loopEnabled = true, repeatCurrent
           b.addEventListener("mouseleave", () => b.style.background = "none");
         });
         document.body.appendChild(bar);
+        view.barCreated = true;
 
         // --- Drag to move ---
         let drag = false, startX, startY, startLeft, startTop;
@@ -441,9 +616,7 @@ async function showControlBar(tabId, isPaused, loopEnabled = true, repeatCurrent
         bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
         bar.querySelector("#free-tts-next").addEventListener("click", () => chrome.runtime.sendMessage({ action: "nextSentence" }));
         bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
-          const btn = document.getElementById("free-tts-toggle");
-          if (btn.textContent === "⏸") chrome.runtime.sendMessage({ action: "pausePlayback" });
-          else chrome.runtime.sendMessage({ action: "resumePlayback" });
+          chrome.runtime.sendMessage({ action: "togglePlayback", source: "bar", sessionId: binding.sessionId, lifecycleRevision: binding.lifecycleRevision });
         });
         bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
 
@@ -499,26 +672,50 @@ async function showControlBar(tabId, isPaused, loopEnabled = true, repeatCurrent
           document.getElementById("free-tts-bar")?.remove();
           delete window.__freeTtsCleanupControlBar;
         };
+        return "rendered";
       },
-      args: [isPaused, loopEnabled, repeatCurrentEnabled],
+      args: [pageOwner(owner), snapshot, modes],
     });
+    return result?.result;
   } catch (error) {
     logError("showing control bar", error);
+    return "deferred";
   }
 }
 
-async function updateControlBar(tabId, isPaused) {
+async function updateControlBar(owner, snapshot, modes) {
+  // Existing navigation callers still supply a tab ID; render canonical state.
+  if (typeof owner === "number") { owner = sentencePipeline; snapshot = buildPlaybackSnapshot(owner); modes = owner && playbackModes(owner); }
+  const pipeline = sentencePipeline;
+  if (!ownsPipeline(pipeline) || !owner || owner.leaseId !== pipeline.leaseId || owner.sessionId !== pipeline.sessionId || owner.lifecycleRevision !== pipeline.lifecycleRevision) return "deferred";
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (paused) => {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: owner.tabId },
+      func: (binding, current, currentModes) => {
+        const view = window.__freeTtsView;
+        if (!view || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
+        if (current.viewRevision < view.viewRevision) return "rendered";
+        if (!view.barCreated) {
+          if (!view.pendingRender || current.viewRevision >= view.pendingRender.snapshot.viewRevision) view.pendingRender = { snapshot: current, modes: currentModes };
+          return "deferred";
+        }
         const btn = document.getElementById("free-tts-toggle");
-        if (btn) btn.textContent = paused ? "▶" : "⏸";
+        if (!btn) throw new Error("Control bar is missing");
+        const paused = current.state === "paused", title = paused ? "Resume" : "Pause";
+        btn.textContent = paused ? "▶" : "⏸";
+        btn.title = title;
+        btn.setAttribute("aria-label", title);
+        document.getElementById("free-tts-loop").checked = currentModes.loopEnabled;
+        document.getElementById("free-tts-repeat-current").checked = currentModes.repeatCurrentEnabled;
+        view.viewRevision = current.viewRevision;
+        return "rendered";
       },
-      args: [isPaused],
+      args: [pageOwner(owner), snapshot, modes],
     });
+    return result?.result;
   } catch (error) {
     logError("updating control bar", error);
+    return "deferred";
   }
 }
 
@@ -607,28 +804,35 @@ function splitSentences(text) {
 }
 
 // --- In-page sentence wrapping + highlight + scroll -----------------------
-async function initPageHighlighting(tabId, sentences) {
+async function initPageHighlighting(tabId, sentences, pipeline = sentencePipeline) {
   const { highlightColor } = await chrome.storage.sync.get({ highlightColor: "#fff3cd" });
+  if (!ownsPipeline(pipeline)) return;
   const safeHighlightColor = normalizeColor(highlightColor);
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (sents, color) => {
+      func: (sents, color, owner) => {
+        const view = window.__freeTtsView;
+        if (!view || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision) return;
         window.__freeTtsSentences = sents;
         window.__freeTtsColor = color;
       },
-      args: [sentences, safeHighlightColor],
+      args: [sentences, safeHighlightColor, pageOwner(pipeline)],
     });
   } catch (error) {
     logError("initializing page highlighting", error);
   }
 }
 
-async function highlightCurrentSentence(tabId, idx) {
+async function highlightCurrentSentence(tabId, idx, pipeline = sentencePipeline, attempt = pipeline?.attempt) {
+  if (!ownsPipeline(pipeline, attempt)) return;
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (idx) => {
+      func: (idx, owner, attemptId) => {
+        const view = window.__freeTtsView;
+        if (!view || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision || attemptId < (view.attemptFloor || 0)) return;
+        view.attemptFloor = attemptId;
         const color = window.__freeTtsColor || "#fff3cd";
         const sentence = window.__freeTtsSentences[idx];
         if (!sentence) return;
@@ -671,7 +875,7 @@ async function highlightCurrentSentence(tabId, idx) {
           window.scrollTo({ left: 0, top: r.top + window.scrollY - window.innerHeight / 3, behavior: "smooth" });
         }
       },
-      args: [idx],
+      args: [idx, pageOwner(pipeline), attempt.attemptId],
     });
   } catch (error) {
     logError("highlighting current sentence", error);
@@ -728,162 +932,162 @@ async function fetchSentenceAudio(serverUrl, voice, speed, sentence) {
 }
 
 // --- Main sentence TTS pipeline --------------------------------------------
-async function startSentenceTTS(tabId, text) {
-  if (!tabId || !text?.trim()) return;
-
-  const { serverUrl, voice, speed } = await chrome.storage.sync.get({
-    serverUrl: DEFAULT_SERVER,
-    voice: "en-US-AvaMultilingualNeural",
-    speed: 0,
-  });
-
+async function startSentenceTTS(tabId, text, ticket = null) {
+  if (!tabId || typeof text !== "string" || !text.trim()) return commandResponse(false);
   const sentences = splitSentences(text);
-  if (sentences.length === 0) return;
-
-  await stopPlayback();
-  const cache = new Map();  // idx → dataUrl
-  sentencePipeline = {
-    sentences,
-    currentIdx: 0,
-    cache,
-    tabId,
-    voice,
-    serverUrl: normalizeServerUrl(serverUrl),
-    speed: normalizeSpeed(speed),
-    isPaused: false,
-    loopEnabled: true,
-    repeatCurrentEnabled: false,
+  if (!sentences.length) return commandResponse(false);
+  ticket ||= startTicket();
+  if (ticket.cancelled || ticket !== pendingStart) return commandResponse(false);
+  if (sentencePipeline) void stopPlayback(sentencePipeline, false);
+  if (!pageLeases.has(tabId)) pageLeases.set(tabId, crypto.randomUUID());
+  const pipeline = sentencePipeline = {
+    tabId, leaseId: pageLeases.get(tabId), sessionId: crypto.randomUUID(), lifecycleRevision: ++lifecycleRevision,
+    sentences, currentIdx: 0, cache: new Map(), voice: null, serverUrl: null, speed: 0, isPaused: false,
+    loopEnabled: true, repeatCurrentEnabled: false, intentRevision: 1, localIntentFloor: 1,
+    mediaRevision: 0, lastMediaSequence: 0, nextAttemptId: 0, attempt: null, cancelled: false, initialized: false,
   };
-  activePlayback = { tabId };
-  await showControlBar(tabId, false, sentencePipeline.loopEnabled, false);
-
-  // Set up Media Session for system media keys (play/pause/prev/next)
-  await setupMediaSession(tabId);
-
-  // Show first sentence immediately
-  await initPageHighlighting(tabId, sentences);
-
-  // Pre-fetch first few sentences
-  const preloadCount = Math.min(PRELOAD_AHEAD, sentences.length);
-  for (let i = 0; i < preloadCount; i++) {
-    fetchSentenceAudio(serverUrl, voice, speed, sentences[i])
-      .then(url => cache.set(i, url))
-      .catch((error) => logError(`preloading sentence ${i}`, error));
-  }
-
-  // Wait a bit for first sentence to cache, then play
-  await playNextSentence();
+  activePlayback = pageOwner(pipeline);
+  lastError = null;
+  viewRevision++;
+  createAttempt(pipeline, "initializing");
+  const capability = workerIntent(pipeline);
+  pipeline.installPromise = installPlayback(pipeline);
+  pipeline.initializationPromise = initializePlayback(pipeline).catch(error => {
+    if (ownsPipeline(pipeline)) { logError("initializing playback", error); lastError = { code: "settings-failure", message: error.message }; void stopPlayback(pipeline, false); }
+  });
+  pipeline.installPromise.then(() => {
+    if (ownsPipeline(pipeline)) void showControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+  }).catch(error => logError("installing playback", error));
+  const receipt = await applyWorkerIntent(pipeline, capability);
+  if (ownsPipeline(pipeline)) await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+  return commandResponse(true, receipt);
 }
 
-async function playNextSentence() {
-  if (!sentencePipeline) return;
-  const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = sentencePipeline;
-  const startIdx = currentIdx;  // guard: exit if external action changed index
+function createAttempt(pipeline, phase = "loading") {
+  if (pipeline.attempt) { pipeline.attempt.retired = true; clearTimeout(pipeline.attempt.pollTimer); }
+  return pipeline.attempt = { attemptId: ++pipeline.nextAttemptId, idx: pipeline.currentIdx, phase, retired: false,
+    dataUrl: null, loadPromise: null, activationRequest: null, audioId: null, audioStatus: "none", audioRevision: -1,
+    startSerial: null, pollTimer: null, pollInFlight: false };
+}
+
+async function initializePlayback(pipeline) {
+  const settings = await chrome.storage.sync.get({ serverUrl: DEFAULT_SERVER, voice: "en-US-AvaMultilingualNeural", speed: 0 });
+  if (!ownsPipeline(pipeline)) return;
+  pipeline.serverUrl = normalizeServerUrl(settings.serverUrl); pipeline.voice = settings.voice; pipeline.speed = normalizeSpeed(settings.speed);
+  await pipeline.installPromise;
+  if (!ownsPipeline(pipeline)) return;
+  await setupMediaSession(pipeline.tabId);
+  if (!ownsPipeline(pipeline)) return;
+  await initPageHighlighting(pipeline.tabId, pipeline.sentences, pipeline);
+  if (!ownsPipeline(pipeline)) return;
+  pipeline.initialized = true;
+  setAttemptPhase(pipeline, pipeline.attempt, "loading");
+  for (let idx = 0; idx < Math.min(PRELOAD_AHEAD, pipeline.sentences.length); idx++) preloadSentence(pipeline, idx);
+  await playNextSentence(pipeline, pipeline.attempt);
+}
+
+function preloadSentence(pipeline, idx) {
+  fetchSentenceAudio(pipeline.serverUrl, pipeline.voice, pipeline.speed, pipeline.sentences[idx])
+    .then(url => { if (ownsPipeline(pipeline)) pipeline.cache.set(idx, url); })
+    .catch(error => logError(`preloading sentence ${idx}`, error));
+}
+
+async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
+  if (!ownsPipeline(pipeline) || !pipeline.initialized) return;
+  const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = pipeline;
+  const startIdx = currentIdx;
   if (currentIdx >= sentences.length) {
-    // Check repeat-current state first, then loop state
-    const repeatCurrent = await getRepeatCurrentState(tabId);
-    if (repeatCurrent) {
-      // Replay the first sentence (since we already reached the end, go back to 0 and replay it)
-      sentencePipeline.currentIdx = 0;
-      await playNextSentence();
-      return;
-    }
-    const loopEnabled = await getLoopState(tabId);
-    if (loopEnabled) {
-      sentencePipeline.currentIdx = 0;
-      await playNextSentence();
-      return;
-    }
+    if (pipeline.repeatCurrentEnabled || pipeline.loopEnabled) { pipeline.currentIdx = 0; return playNextSentence(pipeline); }
+    // Keep finalization bound to this owner across the existing cleanup awaits.
+    const clearPlayback = () => clearOwnedPlayback(pipeline);
     await cleanupMediaSession(tabId);
     await cleanupPageHighlighting(tabId);
     await hideControlBar(tabId);
     clearPlayback();
     return;
   }
-
-  // Wait for current sentence to be cached (with timeout)
-  let dataUrl = cache.get(currentIdx);
-  if (!dataUrl) {
+  if (!attempt) {
+    attempt = pipeline.attempt;
+    if (arguments.length === 0 || attempt.retired || attempt.idx !== currentIdx) {
+      attempt = createAttempt(pipeline);
+      pipeline.intentRevision++; pipeline.localIntentFloor = pipeline.intentRevision; viewRevision++;
+      await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: injectSelectAttempt, args: [workerIntent(pipeline)] });
+      if (!ownsPipeline(pipeline, attempt)) return;
+      await applyWorkerIntent(pipeline, workerIntent(pipeline));
+    }
+  }
+  if (!ownsPipeline(pipeline, attempt)) return;
+  if (!attempt.loadPromise) attempt.loadPromise = (async () => {
+    let dataUrl = cache.get(startIdx);
     const start = Date.now();
     while (!dataUrl && Date.now() - start < 10000) {
-      await new Promise(r => setTimeout(r, 200));
-      dataUrl = cache.get(currentIdx);
-      if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) return;  // cancelled or index changed
+      await new Promise(resolve => { attempt.cacheWake = resolve; attempt.cacheTimer = setTimeout(resolve, 200); });
+      if (!ownsPipeline(pipeline, attempt)) return;
+      dataUrl = cache.get(startIdx);
     }
-  }
-  if (!dataUrl) {
-    // Fallback: fetch directly
-    try {
-      dataUrl = await fetchSentenceAudio(serverUrl, voice, speed, sentences[currentIdx]);
-      if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) return;  // index changed during fetch
-      cache.set(currentIdx, dataUrl);
-    } catch (error) {
-      logError(`fetching sentence ${currentIdx}`, error);
-      clearPlayback();
-      return;
+    if (!dataUrl) {
+      dataUrl = await fetchSentenceAudio(serverUrl, voice, speed, sentences[startIdx]);
+      if (!ownsPipeline(pipeline, attempt)) return;
+      cache.set(startIdx, dataUrl);
     }
-  }
-
-  // Pre-fetch upcoming sentences
-  for (let i = currentIdx + 1; i < currentIdx + 1 + PRELOAD_AHEAD && i < sentences.length; i++) {
-    if (!cache.has(i)) {
-      fetchSentenceAudio(serverUrl, voice, speed, sentences[i])
-        .then(url => cache.set(i, url))
-        .catch((error) => logError(`preloading sentence ${i}`, error));
+    if (!ownsPipeline(pipeline, attempt)) return;
+    for (let idx = startIdx + 1; idx < startIdx + 1 + PRELOAD_AHEAD && idx < sentences.length; idx++) {
+      if (!cache.has(idx)) preloadSentence(pipeline, idx);
     }
-  }
-
-  // Highlight current and scroll
-  await highlightCurrentSentence(tabId, currentIdx);
-  if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) return;  // index changed during highlight
-
-  // Play
+    await highlightCurrentSentence(tabId, startIdx, pipeline, attempt);
+    if (!ownsPipeline(pipeline, attempt)) return;
+    attempt.dataUrl = dataUrl;
+    setAttemptPhase(pipeline, attempt, "ready");
+  })();
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: (url) => {
-        if (window.__freeTtsAudio) { window.__freeTtsAudio.pause(); }
-        const a = new Audio(url);
-        a.play().catch(() => {});
-        window.__freeTtsAudio = a;
-        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
-      },
-      args: [dataUrl],
-    });
+    await attempt.loadPromise;
+    if (ownsPipeline(pipeline, attempt) && !pipeline.isPaused) requestActivation(pipeline, attempt);
+  } catch (error) {
+    if (ownsPipeline(pipeline, attempt)) { logError(`fetching sentence ${startIdx}`, error); lastError = { code: "load-failure", message: error.message }; void stopPlayback(pipeline, false); }
+  }
+}
 
-    // Wait for audio to end (polling approach)
-    await new Promise((resolve) => {
-      const check = setInterval(async () => {
-        if (!sentencePipeline || sentencePipeline.currentIdx !== startIdx) { clearInterval(check); resolve(); return; }
-        try {
-          const [result] = await chrome.scripting.executeScript({
-            target: { tabId },
-            world: "MAIN",
-            func: () => window.__freeTtsAudio?.ended ?? true,
-          });
-          if (result?.result) { clearInterval(check); resolve(); }
-        } catch { clearInterval(check); resolve(); }
-      }, 500);
-    });
+function requestActivation(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || !attempt.dataUrl) return;
+  const capability = { leaseId: pipeline.leaseId, sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision,
+    attemptId: attempt.attemptId, intentRevision: pipeline.intentRevision, mediaRevision: pipeline.mediaRevision, dataUrl: attempt.dataUrl };
+  const previous = attempt.activationRequest;
+  if (previous?.intentRevision === capability.intentRevision && previous.mediaRevision === capability.mediaRevision) return;
+  const request = attempt.activationRequest = { intentRevision: capability.intentRevision, mediaRevision: capability.mediaRevision, promise: null };
+  request.promise = chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: injectActivation, args: [capability] })
+    .then(([result]) => {
+      if (!ownsPipeline(pipeline, attempt) || pipeline.intentRevision !== capability.intentRevision || pipeline.mediaRevision !== capability.mediaRevision) return;
+      adoptPageReceipt(pipeline, attempt, result?.result);
+      if (attempt.audioId) scheduleCompletionPoll(pipeline, attempt);
+    }).catch(error => {
+      if (ownsPipeline(pipeline, attempt) && pipeline.intentRevision === capability.intentRevision) { logError("activating audio", error); lastError = { code: "page-operation-failure", message: error.message }; void stopPlayback(pipeline, false); }
+    }).finally(() => { if (ownsPipeline(pipeline, attempt) && attempt.activationRequest === request) attempt.activationRequest = null; });
+}
 
-    // Move to next sentence or pause — only if index hasn't been changed externally
-    if (sentencePipeline && sentencePipeline.currentIdx === startIdx) {
-      if (sentencePipeline.isPaused) {
-        // Don't advance — mark that we paused at end-of-sentence so resume can re-fetch
-        sentencePipeline._pausedAtEnd = true;
-      } else {
-        // Check if repeat-current is enabled; if so, don't advance the index
-        const repeatCurrent = await getRepeatCurrentState(tabId);
-        if (!repeatCurrent) {
-          sentencePipeline.currentIdx++;
-        }
-        await playNextSentence();
-      }
+function scheduleCompletionPoll(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt) || attempt.pollTimer || attempt.pollInFlight || attempt.phase === "ended") return;
+  attempt.pollTimer = setTimeout(() => { attempt.pollTimer = null; void pollCompletion(pipeline, attempt); }, 500);
+}
+
+async function pollCompletion(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt)) return;
+  attempt.pollInFlight = true;
+  try {
+    const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: (owner, attemptId, audioId) => {
+      const record = window.__freeTtsPlayback;
+      if (!record || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId || record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId || record.audioId !== audioId || !record.audio) return { owned: false };
+      return { ...record.receipt("applied"), owned: true, ended: record.audio.ended };
+    }, args: [pageOwner(pipeline), attempt.attemptId, attempt.audioId] });
+    if (!ownsPipeline(pipeline, attempt)) return;
+    if (result?.result?.owned && result.result.ended) {
+      setAttemptPhase(pipeline, attempt, "ended");
+      if (pipeline.isPaused) pipeline._pausedAtEnd = true;
+      else { attempt.retired = true; if (!pipeline.repeatCurrentEnabled) pipeline.currentIdx++; void playNextSentence(pipeline); }
     }
   } catch (error) {
-    logError(`playing sentence ${currentIdx}`, error);
-    clearPlayback();
+    if (ownsPipeline(pipeline, attempt)) logError("polling playback", error);
+  } finally {
+    if (ownsPipeline(pipeline, attempt)) { attempt.pollInFlight = false; scheduleCompletionPoll(pipeline, attempt); }
   }
 }
 
