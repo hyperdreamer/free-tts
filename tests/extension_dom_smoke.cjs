@@ -55,8 +55,8 @@ async function captureCallbacks() {
 function fixtureBootstrap(bundle) {
   const callbacks = Object.fromEntries(Object.entries(bundle.captured).map(([name, call]) => [name, { ...call, func: (0, eval)(`(${call.source})`) }]));
   const run = (name, args = callbacks[name].args) => callbacks[name].func(...args);
-  const messages = [], errors = [], timers = new Map(), listeners = [];
-  let now = 0, nextTimer = 1, lifecycle = 1, revision = 1, owner, snapshot;
+  const messages = [], errors = [], timers = new Map(), listeners = [], pageEvents = [];
+  let now = 0, nextTimer = 1, lifecycle = 1, revision = 1, owner, snapshot, heldSelectionTimer;
   const add = EventTarget.prototype.addEventListener, remove = EventTarget.prototype.removeEventListener;
   EventTarget.prototype.addEventListener = function (type, callback, options) {
     const capture = typeof options === 'boolean' ? options : !!options?.capture;
@@ -94,6 +94,9 @@ function fixtureBootstrap(bundle) {
     return Promise.resolve({ ...snapshot, ok: true, accepted: true, disposition: 'applied', pageApplied: false, commandError: null });
   } } };
   const paragraph = document.getElementById('fixture-text'), text = paragraph.firstChild;
+  for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) {
+    add.call(paragraph, type, event => pageEvents.push({ type, detail: event.detail, trusted: event.isTrusted }));
+  }
   const mouse = (target, type, extra = {}) => target.dispatchEvent(new MouseEvent(type, {
     bubbles: true, composed: true, cancelable: true, button: 0, clientX: 40, clientY: 160, ...extra,
   }));
@@ -106,11 +109,27 @@ function fixtureBootstrap(bundle) {
     const bar = document.getElementById('free-tts-bar'), toggle = bar?.querySelector('#free-tts-toggle');
     return bar && { html: bar.outerHTML, left: bar.style.left, top: bar.style.top,
       toggle: [toggle.textContent, toggle.title, toggle.getAttribute('aria-label')],
+      buttons: [...bar.querySelectorAll('button')].map(button => ({ id: button.id, text: button.textContent,
+        title: button.title, name: button.getAttribute('aria-label') })),
+      inputs: [...bar.querySelectorAll('input')].map(input => ({ id: input.id, name: input.getAttribute('aria-label') })),
       loop: bar.querySelector('#free-tts-loop').checked, repeat: bar.querySelector('#free-tts-repeat-current').checked };
   };
+  const selectionState = () => {
+    const selection = window.getSelection();
+    return { anchor: selection.anchorNode?.parentNode?.id || null, anchorOffset: selection.anchorOffset,
+      focus: selection.focusNode?.parentNode?.id || null, focusOffset: selection.focusOffset,
+      text: selection.toString(), collapsed: selection.isCollapsed };
+  };
   const documentListeners = () => listeners.filter(item => item.target === document || item.target === window).length;
-  const state = () => ({ messages: structuredClone(messages), errors: [...errors], timers: timers.size,
-    listeners: documentListeners(), owner: { ...owner }, attrs: attrs() });
+  const state = () => {
+    const view = window.__freeTtsView;
+    return { messages: structuredClone(messages), errors: [...errors], timers: timers.size,
+      timerQueue: [...timers.values()].map(timer => ({ id: timer.id, remaining: timer.due - now })),
+      events: [...pageEvents], selection: selectionState(), listeners: documentListeners(), owner: { ...owner }, attrs: attrs(),
+      view: { leaseId: view.leaseId, sessionId: view.sessionId, lifecycleRevision: view.lifecycleRevision,
+        retired: view.retired, barCreated: view.barCreated, viewRevision: view.viewRevision,
+        pendingRevision: view.pendingRender?.snapshot.viewRevision ?? null } };
+  };
   const targets = name => {
     const bar = document.getElementById('free-tts-bar');
     if (name === 'background') return bar;
@@ -139,10 +158,38 @@ function fixtureBootstrap(bundle) {
       if (owner) hide();
       if (timers.size) throw new Error('Cleanup left fixture timers');
       if (documentListeners()) throw new Error('Cleanup left document/window listeners');
-      lifecycle++; revision += 10; messages.length = 0; errors.length = 0;
+      lifecycle++; revision += 10; messages.length = 0; errors.length = 0; pageEvents.length = 0;
+      if (heldSelectionTimer) throw new Error('Unreleased selection callback');
       create(deferred); select(0); return state();
     },
     state, attrs, run, select, targets,
+    pageMouse(type, detail = 1) { mouse(paragraph, type, { detail }); return state(); },
+    reverseSelection() {
+      window.getSelection().setBaseAndExtent(text, 32, text, 16);
+      document.dispatchEvent(new Event('selectionchange'));
+      return state();
+    },
+    holdSelectionTimer() {
+      if (timers.size !== 1 || heldSelectionTimer) throw new Error('Expected one unheld selection callback');
+      heldSelectionTimer = [...timers.values()][0];
+      timers.delete(heldSelectionTimer.id);
+      return state();
+    },
+    releaseSelectionTimer() {
+      if (!heldSelectionTimer || heldSelectionTimer.due > now) throw new Error('Held selection callback is not due');
+      const timer = heldSelectionTimer; heldSelectionTimer = null; timer.callback();
+      return state();
+    },
+    replaceOwner(deferred = false) {
+      const previousOwner = { ...owner };
+      hide(); lifecycle++; revision += 10; create(deferred);
+      return { ...state(), previousOwner };
+    },
+    wordPoint() {
+      const range = document.createRange(); range.setStart(text, 16); range.setEnd(text, 22);
+      const rect = range.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    },
     retain() { select(0, 15); },
     pending() {
       select(0); mouse(paragraph, 'mousedown'); select(16, 32); mouse(paragraph, 'mouseup');
@@ -193,7 +240,7 @@ function fixtureBootstrap(bundle) {
       run('hide', [oldOwner, oldOwner.lifecycleRevision + 1]);
       run('show', [oldOwner, oldSnapshot, bundle.modes]);
       run('show', [owner, snapshot, bundle.modes]);
-      return { ...state(), afterHide, beforeListeners, before, sameBar: successor === targets('background') };
+      return { ...state(), oldOwner, afterHide, beforeListeners, before, sameBar: successor === targets('background') };
     },
     renderPending() {
       const paused = { ...snapshot, state: 'paused', viewRevision: snapshot.viewRevision + 2 };
@@ -202,6 +249,37 @@ function fixtureBootstrap(bundle) {
       const before = attrs();
       run('update', [owner, snapshot, bundle.modes]);
       return { ...state(), deferred, shown, before };
+    },
+    renderOrder() {
+      const stages = [];
+      const record = name => stages.push({ name, ...state() });
+      const older = { ...snapshot, viewRevision: snapshot.viewRevision + 1 };
+      const paused = { ...snapshot, state: 'paused', viewRevision: snapshot.viewRevision + 2 };
+      const pausedModes = { loopEnabled: false, repeatCurrentEnabled: true };
+      record('before creation');
+      const deferred = run('update', [owner, paused, pausedModes]); record('paused deferred');
+      run('update', [owner, older, bundle.modes]); record('older deferred');
+      const shown = run('show', [owner, snapshot, bundle.modes]); record('created paused');
+      run('update', [owner, older, bundle.modes]); record('older update');
+      run('show', [owner, older, bundle.modes]); record('older repeated show');
+      const running = { ...snapshot, viewRevision: snapshot.viewRevision + 3 };
+      run('update', [owner, running, bundle.modes]); record('newer running');
+      run('update', [owner, paused, pausedModes]); record('old paused update');
+      const newest = { ...paused, viewRevision: snapshot.viewRevision + 4 };
+      run('update', [owner, newest, pausedModes]); record('newest paused');
+      const oldOwner = { ...owner }, oldBar = targets('background');
+      const oldRender = window.__freeTtsView.renderControlBarSnapshot, oldCleanup = window.__freeTtsCleanupControlBar;
+      this.replaceOwner(true);
+      const successorPaused = { ...snapshot, state: 'paused', viewRevision: snapshot.viewRevision + 1 };
+      run('update', [owner, successorPaused, pausedModes]); record('successor deferred');
+      run('show', [owner, snapshot, bundle.modes]); record('successor created paused');
+      const successor = targets('background');
+      oldRender(successor, { ...newest, viewRevision: revision + 100 }, bundle.modes); record('old renderer');
+      run('update', [oldOwner, { ...snapshot, sessionId: oldOwner.sessionId, viewRevision: revision + 100 }, bundle.modes]); record('old owner update');
+      run('hide', [oldOwner, oldOwner.lifecycleRevision + 1]); record('old owner hide');
+      oldCleanup(); record('old cleanup');
+      run('show', [oldOwner, { ...newest, viewRevision: revision + 100 }, bundle.modes]); record('old owner show');
+      return { ...state(), stages, deferred, shown, oldOwner, replacedBar: oldBar !== successor, sameBar: successor === targets('background') };
     },
     cleanup() { hide(); return state(); },
   };
@@ -272,9 +350,172 @@ const controlCases = [
 function assertMessages(result, actions, label) {
   assert.deepEqual(result.errors, [], `${label}: browser errors/rejections`);
   assert.deepEqual(result.messages, actions.map(action => ({ source: 'bar', leaseId: result.owner.leaseId,
-    sessionId: result.owner.sessionId, lifecycleRevision: result.owner.lifecycleRevision, ...action })), `${label}: complete bound messages (no selection jump)`);
+    sessionId: result.owner.sessionId, lifecycleRevision: result.owner.lifecycleRevision, ...action })), `${label}: complete bound messages`);
   assert.equal(result.timers, 0, `${label}: no pending selection timer`);
+  assert.deepEqual(result.timerQueue, [], `${label}: timer queue is empty`);
   assert.equal(result.attrs.loop && result.attrs.repeat, false, `${label}: exclusive modes`);
+  assert.equal(result.view.leaseId, result.owner.leaseId, `${label}: exact live lease`);
+  assert.equal(result.view.sessionId, result.owner.sessionId, `${label}: exact live session`);
+  assert.equal(result.view.lifecycleRevision, result.owner.lifecycleRevision, `${label}: exact live lifecycle`);
+  assert.equal(result.view.retired, false, `${label}: live view`);
+}
+
+function assertSelection(result, start, end, text, label) {
+  assert.deepEqual(result.selection, { anchor: 'fixture-text', anchorOffset: start,
+    focus: 'fixture-text', focusOffset: end, text, collapsed: start === end }, `${label}: exact page selection`);
+}
+
+function assertToggle(result, paused, label) {
+  assert.deepEqual(result.attrs.toggle, paused ? ['▶', 'Resume', 'Resume'] : ['⏸', 'Pause', 'Pause'], `${label}: synchronized icon/title/accessible name`);
+  assert.deepEqual(result.attrs.buttons, [
+    { id: 'free-tts-prev', text: '⏮', title: 'Previous', name: 'Previous' },
+    { id: 'free-tts-toggle', text: paused ? '▶' : '⏸', title: paused ? 'Resume' : 'Pause', name: paused ? 'Resume' : 'Pause' },
+    { id: 'free-tts-next', text: '⏭', title: 'Next', name: 'Next' },
+    { id: 'free-tts-close', text: '✕', title: 'Stop', name: 'Stop' },
+  ], `${label}: compact icon controls retain explicit names`);
+  assert.deepEqual(result.attrs.inputs, [
+    { id: 'free-tts-loop', name: 'Repeat All' },
+    { id: 'free-tts-repeat-current', name: 'Repeat Current Sentence' },
+  ], `${label}: mode controls retain explicit names`);
+}
+
+async function runSelectionCases(cdp, sessionId) {
+  const evaluate = expression => cdp.evaluate(expression, sessionId);
+  const failures = [];
+  const cases = [
+    ['G05 genuine_page_selection', async label => {
+      const queued = await evaluate('__fixture.reset(); __fixture.pageMouse("mousedown"); __fixture.select(16, 32); __fixture.pageMouse("mouseup")');
+      assert.deepEqual(queued.messages, [], `${label}: mouseup defers jump`);
+      assert.deepEqual(queued.timerQueue.map(timer => timer.remaining), [100], `${label}: one 100 ms timer`);
+      assertSelection(queued, 16, 32, 'Second sentence.', label);
+      const before = await evaluate('__advance(99); __fixture.state()');
+      assert.deepEqual(before.messages, [], `${label}: no jump at 99 ms`);
+      assert.deepEqual(before.timerQueue.map(timer => timer.remaining), [1], `${label}: one millisecond remains`);
+      const selected = await evaluate('__advance(1); __fixture.state()');
+      assertMessages(selected, [{ action: 'jumpToSentence', idx: 1 }], `${label}/100ms`);
+      assertSelection(selected, 16, 32, 'Second sentence.', label);
+      assertToggle(selected, false, label);
+      // Neither an unmatched mouseup nor a full unchanged page gesture is proof
+      // of a new selection. An intermediate selection change is proof.
+      const retained = await evaluate('__fixture.pageMouse("mouseup"); __fixture.pageMouse("mousedown"); __fixture.pageMouse("mouseup"); __advance(100); __fixture.state()');
+      assertMessages(retained, [{ action: 'jumpToSentence', idx: 1 }], `${label}/retained`);
+      const reselected = await evaluate('__fixture.pageMouse("mousedown"); __fixture.select(0); __fixture.select(16, 32); __fixture.pageMouse("mouseup"); __advance(100); __fixture.state()');
+      assertMessages(reselected, [{ action: 'jumpToSentence', idx: 1 }, { action: 'jumpToSentence', idx: 1 }], `${label}/reselected`);
+      assertSelection(reselected, 16, 32, 'Second sentence.', label);
+    }],
+    ['G06 genuine_double_click_sequence', async label => {
+      const first = await evaluate('__fixture.reset(); __fixture.pageMouse("mousedown"); __fixture.pageMouse("mouseup"); __fixture.pageMouse("click")');
+      assertMessages(first, [], `${label}/first collapsed click`);
+      assertSelection(first, 0, 0, '', label);
+      const second = await evaluate('__fixture.pageMouse("mousedown", 2); __fixture.select(16, 22); __fixture.pageMouse("mouseup", 2); __fixture.pageMouse("click", 2)');
+      assert.deepEqual(second.messages, [], `${label}: second mouseup has not jumped yet`);
+      assert.deepEqual(second.timerQueue.map(timer => timer.remaining), [100], `${label}: second mouseup queues exactly one timer`);
+      const doubled = await evaluate('__fixture.pageMouse("dblclick", 2)');
+      const synthetic = await evaluate('__advance(150); __fixture.state()');
+      assertMessages(synthetic, [{ action: 'jumpToSentence', idx: 1 }], `${label}/synthetic no duplicate jump`);
+      assertMessages(doubled, [{ action: 'jumpToSentence', idx: 1 }], `${label}/synthetic immediate`);
+      assertSelection(synthetic, 16, 22, 'Second', label);
+      assert.deepEqual(synthetic.events, [
+        { type: 'mousedown', detail: 1, trusted: false }, { type: 'mouseup', detail: 1, trusted: false }, { type: 'click', detail: 1, trusted: false },
+        { type: 'mousedown', detail: 2, trusted: false }, { type: 'mouseup', detail: 2, trusted: false }, { type: 'click', detail: 2, trusted: false },
+        { type: 'dblclick', detail: 2, trusted: false },
+      ], `${label}: explicit first/second click sequence`);
+      // A completed earlier drag selection and a later double-click are two
+      // deliberate navigation attempts; only the second mouseup is suppressed.
+      const dragged = await evaluate('__fixture.reset(); __fixture.pageMouse("mousedown"); __fixture.select(16, 32); __fixture.pageMouse("mouseup"); __advance(100); __fixture.state()');
+      assertMessages(dragged, [{ action: 'jumpToSentence', idx: 1 }], `${label}/earlier drag`);
+      const afterDrag = await evaluate('__fixture.select(0); __fixture.pageMouse("mousedown"); __fixture.pageMouse("mouseup"); __fixture.pageMouse("click"); __fixture.pageMouse("mousedown", 2); __fixture.select(16, 22); __fixture.pageMouse("mouseup", 2); __fixture.pageMouse("click", 2); __fixture.pageMouse("dblclick", 2); __advance(150); __fixture.state()');
+      assertMessages(afterDrag, [{ action: 'jumpToSentence', idx: 1 }, { action: 'jumpToSentence', idx: 1 }], `${label}/fresh double-click after drag`);
+      assertSelection(afterDrag, 16, 22, 'Second', label);
+      await evaluate('__fixture.reset()');
+      const point = await evaluate('__fixture.wordPoint()');
+      for (const clickCount of [1, 2]) {
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount }, sessionId);
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', buttons: 0, clickCount }, sessionId);
+        if (clickCount === 1) {
+          const collapsed = await evaluate('__fixture.state()');
+          assertMessages(collapsed, [], `${label}/CDP first collapsed click`);
+          assert.equal(collapsed.selection.collapsed, true, `${label}: real first click is collapsed`);
+        }
+      }
+      const actual = await evaluate('__advance(150); __fixture.state()');
+      assertMessages(actual, [{ action: 'jumpToSentence', idx: 1 }], `${label}/CDP no duplicate jump`);
+      assertSelection(actual, 16, 22, 'Second', `${label}/CDP`);
+      assertToggle(actual, false, label);
+      assert.deepEqual(actual.events, [
+        { type: 'mousedown', detail: 1, trusted: true }, { type: 'mouseup', detail: 1, trusted: true }, { type: 'click', detail: 1, trusted: true },
+        { type: 'mousedown', detail: 2, trusted: true }, { type: 'mouseup', detail: 2, trusted: true }, { type: 'click', detail: 2, trusted: true },
+        { type: 'dblclick', detail: 2, trusted: true },
+      ], `${label}: Chromium generates the complete trusted double-click sequence`);
+    }],
+    ['G07 selection_ticket_freshness', async label => {
+      for (const boundary of ['new-gesture', 'selection-changed', 'endpoints-changed', 'replaced-owner']) {
+        const original = await evaluate('__fixture.reset(); __fixture.pending(); __fixture.holdSelectionTimer()');
+        const change = boundary === 'new-gesture' ? '__fixture.pageMouse("mousedown"); __fixture.select(0, 15); __fixture.pageMouse("mouseup")'
+          : boundary === 'selection-changed' ? '__fixture.select(0, 15)'
+          : boundary === 'endpoints-changed' ? '__fixture.reverseSelection()'
+          : '__fixture.replaceOwner(); __fixture.pageMouse("mousedown"); __fixture.select(0, 15); __fixture.pageMouse("mouseup")';
+        const changed = await evaluate(`${change}; __advance(50); __fixture.releaseSelectionTimer()`);
+        assert.deepEqual(changed.messages, [], `${label}/${boundary}: released old callback cannot jump`);
+        const hasSecondTicket = ['new-gesture', 'replaced-owner'].includes(boundary);
+        if (hasSecondTicket) {
+          assert.deepEqual(changed.timerQueue.map(timer => timer.remaining), [50], `${label}/${boundary}: second ticket retains its own timer`);
+          const early = await evaluate('__advance(49); __fixture.state()');
+          assert.deepEqual(early.messages, [], `${label}/${boundary}: second ticket cannot jump at 99 ms`);
+          const current = await evaluate('__advance(1); __fixture.state()');
+          assertMessages(current, [{ action: 'jumpToSentence', idx: 0 }], `${label}/${boundary}: only the second ticket jumps`);
+          assertSelection(current, 0, 15, 'First sentence.', label);
+          if (boundary === 'replaced-owner') {
+            assert.deepEqual(current.owner, { tabId: 7, leaseId: original.owner.leaseId,
+              sessionId: `fixture-session-${original.owner.lifecycleRevision + 2}`, lifecycleRevision: original.owner.lifecycleRevision + 2 }, `${label}: exact successor owner`);
+          } else assert.deepEqual(current.owner, original.owner, `${label}: same session new gesture`);
+        } else {
+          assertMessages(changed, [], `${label}/${boundary}`);
+          if (boundary === 'endpoints-changed') assertSelection(changed, 32, 16, 'Second sentence.', label);
+          else assertSelection(changed, 0, 15, 'First sentence.', label);
+          const next = await evaluate('__fixture.pageMouse("mousedown"); __fixture.select(0); __fixture.select(16, 32); __fixture.pageMouse("mouseup"); __advance(100); __fixture.state()');
+          assertMessages(next, [{ action: 'jumpToSentence', idx: 1 }], `${label}/${boundary}: genuine next ticket still works`);
+        }
+      }
+    }],
+    ['G08 render_attributes_order', async label => {
+      const result = await evaluate('__fixture.reset(true); __fixture.renderOrder()');
+      assert.equal(result.deferred, 'deferred', `${label}: missing initial bar defers rendering`);
+      assert.equal(result.shown, 'rendered', `${label}: delayed creation succeeds`);
+      for (const stage of result.stages) {
+        assert.deepEqual(stage.messages, [], `${label}/${stage.name}: render has no command effect`);
+        assert.deepEqual(stage.errors, [], `${label}/${stage.name}: no errors`);
+        assert.deepEqual(stage.timerQueue, [], `${label}/${stage.name}: no timers`);
+        assertSelection(stage, 0, 0, '', `${label}/${stage.name}`);
+        if (['before creation', 'paused deferred', 'older deferred', 'successor deferred'].includes(stage.name)) {
+          assert.equal(stage.attrs, null, `${label}/${stage.name}: bar creation is pending`);
+          assert.equal(stage.view.barCreated, false, `${label}/${stage.name}: not falsely rendered`);
+          if (stage.name !== 'before creation') assert.ok(stage.view.pendingRevision > 0, `${label}/${stage.name}: newest pending snapshot retained`);
+        } else {
+          const paused = !['newer running', 'old paused update'].includes(stage.name);
+          assertMessages(stage, [], `${label}/${stage.name}`);
+          assertToggle(stage, paused, `${label}/${stage.name}`);
+          assert.equal(stage.attrs.loop, !paused, `${label}/${stage.name}: accepted loop mode`);
+          assert.equal(stage.attrs.repeat, paused, `${label}/${stage.name}: accepted repeat mode`);
+          assert.equal(stage.view.pendingRevision, null, `${label}/${stage.name}: no obsolete pending render`);
+        }
+      }
+      assert.deepEqual(result.owner, { tabId: 7, leaseId: result.oldOwner.leaseId,
+        sessionId: `fixture-session-${result.oldOwner.lifecycleRevision + 2}`, lifecycleRevision: result.oldOwner.lifecycleRevision + 2 }, `${label}: exact successor owner`);
+      assert.equal(result.replacedBar, true, `${label}: new session creates a new bar`);
+      assert.equal(result.sameBar, true, `${label}: old update/hide/show cannot replace successor bar`);
+      const successor = result.stages.find(stage => stage.name === 'successor created paused');
+      for (const stage of result.stages.slice(result.stages.indexOf(successor) + 1)) {
+        assert.deepEqual(stage.attrs, successor.attrs, `${label}/${stage.name}: all successor attributes preserved`);
+        assert.deepEqual(stage.view, successor.view, `${label}/${stage.name}: successor ordering fences preserved`);
+      }
+    }],
+  ];
+  for (const [label, run] of cases) {
+    try { await run(label); console.log(`PASS ${label}`); }
+    catch (error) { console.error(`FAIL ${label}: ${error.message}`); failures.push(error); }
+  }
+  if (failures.length) throw new AggregateError(failures, 'Selection/render gesture cases failed');
 }
 
 async function runGestureCases(cdp, sessionId) {
@@ -336,6 +577,9 @@ async function runGestureCases(cdp, sessionId) {
   assertMessages(replacement, [], 'G04 teardown_replacement_timers');
   assert.deepEqual(replacement.afterHide, { timers: 0, listeners: 0, barListeners: 0 }, 'G04 removes timers and every document/window/bar listener');
   assert.equal(replacement.listeners, replacement.beforeListeners, 'G04 successor owns one listener set');
+  assert.deepEqual(replacement.owner, { tabId: 7, leaseId: replacement.oldOwner.leaseId,
+    sessionId: `fixture-session-${replacement.oldOwner.lifecycleRevision + 2}`, lifecycleRevision: replacement.oldOwner.lifecycleRevision + 2 }, 'G04 exact successor owner');
+  assertSelection(replacement, 16, 32, 'Second sentence.', 'G04 successor retains page selection');
   assert.equal(replacement.sameBar, true, 'G04 repeated live show and old cleanup preserve successor identity');
   assert.deepEqual(replacement.attrs, replacement.before, 'G04 old controls/cleanup/render leave successor attributes unchanged');
   const rendered = await evaluate('__fixture.reset(true); __fixture.renderPending()');
@@ -347,6 +591,10 @@ async function runGestureCases(cdp, sessionId) {
   assert.equal(cleaned.timers, 0); assert.equal(cleaned.listeners, 0); assert.equal(cleaned.attrs, null);
   assert.deepEqual(cleaned.errors, []);
   console.log('PASS G04 teardown_replacement_timers (including deferred versioned creation)');
+  await runSelectionCases(cdp, sessionId);
+  const final = await evaluate('__fixture.cleanup()');
+  assert.equal(final.timers, 0); assert.deepEqual(final.timerQueue, []);
+  assert.equal(final.listeners, 0); assert.equal(final.attrs, null); assert.deepEqual(final.errors, []);
 }
 
 async function terminateBrowser(browser, cdp) {
@@ -407,7 +655,7 @@ async function runDomSmoke(argv) {
     if (cdp?.stderr) console.error(`Chromium stderr:\n${cdp.stderr}`);
     throw failure;
   }
-  console.log('PASS extension DOM smoke G01-G04; Chromium terminated and temporary files removed');
+  console.log('PASS extension DOM smoke G01-G08; Chromium terminated and temporary files removed');
 }
 
 module.exports = { runDomSmoke };
