@@ -267,8 +267,7 @@ async function changePausedState(pipeline, paused) {
   const acceptedSnapshot = buildPlaybackSnapshot(pipeline);
   const acceptedRender = updateControlBar(pipeline, acceptedSnapshot, playbackModes(pipeline));
   if (replayCompletedAttempt) {
-    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
-      func: injectSelectAttempt, args: [workerIntent(pipeline)] });
+    await selectAttempt(pipeline, attempt);
     if (!ownsPipeline(pipeline, attempt)) return commandResponse(false);
   }
   const receipt = await applyWorkerIntent(pipeline, workerIntent(pipeline));
@@ -331,7 +330,7 @@ async function installPlayback(pipeline) {
     window.__freeTtsView = { ...binding, viewRevision: 0, barCreated: false, pendingRender: null };
   }, args: [owner] });
   if (!ownsPipeline(pipeline)) return;
-  await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN", func: injectSelectAttempt, args: [workerIntent(pipeline)] });
+  await selectAttempt(pipeline, pipeline.attempt);
 }
 
 function injectPlaybackSession(owner, workerToken) {
@@ -372,14 +371,34 @@ function injectPlaybackSession(owner, workerToken) {
   };
 }
 
+function selectAttempt(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt)) return Promise.resolve(null);
+  if (!attempt.selectionPromise) {
+    const capability = workerIntent(pipeline);
+    attempt.selectionPromise = chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
+      func: injectSelectAttempt, args: [capability] }).then(([result]) => {
+      if (!ownsPipeline(pipeline, attempt)) return null;
+      attempt.selectionReceipt = result?.result;
+      // Selection, loading, and running intent may finish in any order. Each
+      // boundary continues the same attempt once the other two are confirmed.
+      requestActivation(pipeline, attempt);
+      return attempt.selectionReceipt;
+    });
+  }
+  return attempt.selectionPromise;
+}
+
 function injectSelectAttempt(capability) {
   const record = window.__freeTtsPlayback;
-  if (!record || record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.attemptId <= record.attemptFloor) return;
+  if (!record) return null;
+  if (record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.attemptId < record.attemptFloor) return record.receipt("stale");
+  if (capability.attemptId === record.attemptId) return record.receipt("idempotent");
   record.startSerial++;
   if (record.audio) { record.audio.pause(); record.audio.src = ""; record.audioRevision++; }
   record.attemptId = record.attemptFloor = capability.attemptId;
   record.audio = window.__freeTtsAudio = null;
   record.audioId = null; record.audioStatus = "none";
+  return record.receipt("applied");
 }
 
 function injectWorkerIntent(capability) {
@@ -413,17 +432,15 @@ function injectActivation(capability) {
 // in the page. Updates the pipeline flag, context menu, and control bar without
 // re-issuing audio control (the page already did it, with lower latency).
 async function syncPausedState(paused) {
-  if (!sentencePipeline || sentencePipeline.isPaused === paused) return;
-  // If resuming from a paused-at-end state, re-fetch the sentence
-  if (!paused && sentencePipeline._pausedAtEnd) {
-    sentencePipeline._pausedAtEnd = false;
-    sentencePipeline.isPaused = false;
-    await updateControlBar(sentencePipeline.tabId, false);
-    await playNextSentence();
-    return;
+  const pipeline = sentencePipeline;
+  if (!ownsPipeline(pipeline) || pipeline.isPaused === paused) return;
+  // An ended Audio cannot resume directly in MAIN; replay through the same
+  // captured-owner continuation used by explicit resume.
+  if (!paused && pipeline.attempt.completionObservedWhilePaused && !pipeline.attempt.completionConsumed) {
+    return changePausedState(pipeline, false);
   }
-  sentencePipeline.isPaused = paused;
-  await updateControlBar(sentencePipeline.tabId, paused);
+  pipeline.isPaused = paused;
+  await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
 }
 
 // --- Media Session (system media keys) --------------------------------------
@@ -1018,7 +1035,8 @@ function createAttempt(pipeline, phase = "loading") {
     previous.cacheWake = null;
   }
   return pipeline.attempt = { attemptId: ++pipeline.nextAttemptId, idx: pipeline.currentIdx, phase, retired: false,
-    dataUrl: null, loadPromise: null, activationRequest: null, audioId: null, audioStatus: "none", audioRevision: -1,
+    dataUrl: null, loadPromise: null, selectionPromise: null, selectionReceipt: null,
+    activationRequest: null, audioId: null, audioStatus: "none", audioRevision: -1,
     startSerial: null, pollTimer: null, pollInFlight: false, completionObserved: false,
     completionObservedWhilePaused: false, completionConsumed: false };
 }
@@ -1064,7 +1082,7 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
     if (arguments.length === 0 || attempt.retired || attempt.idx !== currentIdx) {
       attempt = createAttempt(pipeline);
       pipeline.intentRevision++; pipeline.localIntentFloor = pipeline.intentRevision; viewRevision++;
-      await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: injectSelectAttempt, args: [workerIntent(pipeline)] });
+      await selectAttempt(pipeline, attempt);
       if (!ownsPipeline(pipeline, attempt)) return;
       await applyWorkerIntent(pipeline, workerIntent(pipeline));
     }
@@ -1103,8 +1121,12 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
 function requestActivation(pipeline, attempt) {
   if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || !attempt.dataUrl || attempt.audioStatus === "ended" ||
       ["starting", "playing"].includes(attempt.audioStatus) || attempt.completionObserved) return;
-  // Loading and intent application race independently. Whichever finishes last
-  // continues the ready attempt, but never ahead of its confirmed running intent.
+  const selection = attempt.selectionReceipt;
+  if (!selection || selection.leaseId !== pipeline.leaseId || selection.sessionId !== pipeline.sessionId ||
+      selection.lifecycleRevision !== pipeline.lifecycleRevision || selection.attemptId !== attempt.attemptId ||
+      !["applied", "idempotent"].includes(selection.disposition)) return;
+  // Loading, selection, and intent application race independently. Whichever
+  // finishes last continues the ready attempt after both page boundaries apply.
   const application = pipeline.intentApplication, receipt = application?.receipt;
   if (!receipt || application.capability.attemptId !== attempt.attemptId || receipt.leaseId !== pipeline.leaseId ||
       receipt.sessionId !== pipeline.sessionId || receipt.lifecycleRevision !== pipeline.lifecycleRevision ||

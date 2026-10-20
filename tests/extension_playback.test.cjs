@@ -724,6 +724,109 @@ test('W09 end_observed_paused_replay', async () => {
   await h.finish();
 });
 
+// F-4: MAIN play cannot replay an ended element itself; media resume must
+// consume the same attempt-owned paused completion as an explicit resume.
+test('W09 F-4 media_resume_after_paused_completion', async () => {
+  const h = harness();
+  const started = h.start(); await h.ready(); await started;
+  const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
+  const endedAudio = h.page(7).__freeTtsAudio;
+  await h.pause();
+  const poll = await startOwnedEndPoll(h, endedAttempt);
+  await finishOwnedEndPoll(h, poll);
+  assert.equal(endedAttempt.completionObservedWhilePaused, true);
+  assert.equal(endedAttempt.completionConsumed, false);
+
+  const fetchCount = h.fetches.length;
+  h.page(7).navigator.mediaSession.handlers.get('play')();
+  assert.equal(h.audioSpy.plays.length, 1, 'direct media play cannot play ended A');
+  const notification = h.messages.at(-1);
+  assert.equal(notification.world, 'MAIN');
+  assert.equal(notification.data.action, 'mediaResume');
+  const resumed = h.send(notification.data, { tab: { id: 7 } });
+  await h.flush(); await resumed;
+  await h.clock.advance(2000); await h.flush();
+
+  const replay = pipeline.attempt;
+  assert.notEqual(replay, endedAttempt, 'media resume must create a fresh replay attempt');
+  assert.notEqual(replay.attemptId, endedAttempt.attemptId);
+  assert.equal(replay.idx, 0); assert.equal(pipeline.currentIdx, 0);
+  assert.equal(endedAttempt.retired, true); assert.equal(endedAttempt.completionConsumed, true);
+  assert.equal(pipeline.isPaused, false);
+  assert.equal(h.audioSpy.constructors.length, 2);
+  assert.equal(h.audioSpy.plays.length, 2, 'one media replay');
+  assert.notEqual(h.audioSpy.plays[1].audio, endedAudio);
+  assert.equal(h.page(7).__freeTtsPlayback.attemptId, replay.attemptId);
+  assert.equal(h.fetches.length, fetchCount, 'replay uses retained session bytes');
+  const scriptCount = h.scripts.entries.length;
+  await h.worker.poll(pipeline, endedAttempt); await h.drain();
+  assert.equal(h.scripts.entries.length, scriptCount, 'old completion cannot advance the media replay');
+  assert.equal(pipeline.attempt, replay);
+  await h.finish();
+});
+
+// F-5: a redundant resume must share replay selection readiness. Otherwise
+// its early no-effect activation can coalesce away the creator's later start.
+test('W09 F-5 duplicate_resume_during_paused_end_selection', async t => {
+  for (const boundary of ['selection-execution', 'selection-receipt']) await t.test(boundary, async () => {
+    const h = harness();
+    const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
+    await h.pause();
+    const poll = await startOwnedEndPoll(h, endedAttempt);
+    await finishOwnedEndPoll(h, poll);
+    assert.equal(endedAttempt.completionObservedWhilePaused, true);
+    const fetchCount = h.fetches.length;
+
+    const first = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    const replay = pipeline.attempt;
+    assert.notEqual(replay, endedAttempt);
+    assert.equal(replay.idx, 0);
+    const selectingReplay = entry => entry.func.name === 'injectSelectAttempt' && entry.args[0].attemptId === replay.attemptId;
+    await h.flush({ holdScript: entry => selectingReplay(entry) || activation(entry) });
+    const selection = h.scripts.pending(selectingReplay);
+    if (boundary === 'selection-receipt') h.execute(selection);
+
+    const second = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    await h.flush({ holdScript: entry => entry === selection || activation(entry) });
+    const loader = replay.loadPromise;
+    assert.ok(loader, 'the redundant resume may prepare bytes while selection is pending');
+    assert.equal(replay.dataUrl, 'data:audio/mpeg;base64,AQ==');
+    // Exercise an ungated implementation's activation before selection, holding
+    // its no-effect receipt until after the replay creator has finished.
+    const early = h.scripts.entries.find(entry => !entry.executed && activation(entry) && entry.args[0].attemptId === replay.attemptId);
+    if (early) {
+      const receipt = h.execute(early);
+      if (boundary === 'selection-execution') assert.equal(receipt.disposition, 'no-effect');
+    }
+    assert.equal(h.audioSpy.constructors.length, 1, 'activation must await the matching selection receipt');
+    assert.equal(h.audioSpy.plays.length, 1, 'selection readiness cannot be inferred from intent application');
+
+    if (!selection.executed) h.execute(selection);
+    await h.complete(selection);
+    await h.flush({ holdScript: entry => entry === early });
+    await Promise.all([first, second]);
+    if (early) await h.complete(early);
+    await h.flush(); await h.clock.advance(2000); await h.flush();
+
+    assert.equal(pipeline.attempt, replay);
+    assert.equal(h.page(7).__freeTtsPlayback.attemptId, replay.attemptId);
+    assert.equal(endedAttempt.retired, true); assert.equal(endedAttempt.completionConsumed, true);
+    assert.equal(replay.loadPromise, loader, 'both resumes share one loader');
+    assert.equal(h.fetches.length, fetchCount);
+    assert.equal(h.audioSpy.constructors.length, 2, 'replay must activate after selection despite the earlier same-tuple request');
+    assert.equal(h.audioSpy.plays.length, 2, 'two resumes produce one replay');
+    assert.equal(h.audioSpy.plays[1].audio, h.page(7).__freeTtsAudio);
+    assert.equal(replay.audioId, h.page(7).__freeTtsPlayback.audioId);
+    assert.ok(replay.pollTimer, 'the replay retains its completion observer');
+    assert.equal([...h.clock.timers.values()].filter(timer => timer.due === h.clock.now + 500).length, 1);
+    const redundant = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    await h.flush(); await redundant;
+    assert.equal(h.audioSpy.constructors.length, 2); assert.equal(h.audioSpy.plays.length, 2);
+    await h.finish();
+  });
+});
+
 test('W10 end_observed_after_resume', async t => {
   for (const policy of ['modes-off', 'repeat-current', 'loop-at-last']) await t.test(policy, async () => {
     const h = harness();
