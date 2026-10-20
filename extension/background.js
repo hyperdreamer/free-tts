@@ -346,7 +346,9 @@ function applyWorkerIntent(pipeline, capability) {
     }
     return application.receipt;
   })().catch(error => {
-    if (pipeline.intentApplication === application && pipeline.intentRevision === capability.intentRevision) {
+    // Direct media can supersede this application without changing worker R.
+    if (pipeline.intentApplication === application && pipeline.intentRevision === capability.intentRevision &&
+        pipeline.mediaRevision === capability.mediaBase) {
       failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
     }
     return null;

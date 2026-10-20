@@ -2476,6 +2476,49 @@ test('W29 early_audio_outcome', async t => {
       await h.finish();
     });
   }
+  // F-11: an intent can remain current by worker R while a newer direct media
+  // pause supersedes its captured M. Neither transport nor receipt failure may
+  // retire that newer paused session or dispose its resumable Audio.
+  for (const crossing of ['applied', 'superseded-by-media']) for (const failure of ['reject', 'no-receipt', 'invalid-receipt']) {
+    await t.test(`older-worker-intent-${crossing}-${failure}-after-media-pause`, async () => {
+      const fixture = crossing === 'superseded-by-media' ? await pausedCrossingFixture() : null;
+      const h = fixture?.h || harness();
+      if (!fixture) { const started = h.start(); await h.ready(); await started; await h.pause(); }
+      const pipeline = h.worker.pipeline, attempt = pipeline.attempt, record = h.page(7).__freeTtsPlayback;
+      const audio = record.audio, audioId = record.audioId;
+      const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {}); await h.drain();
+      const pending = h.scripts.pending(workerIntentRequest), capability = pending.args[0], receipt = h.execute(pending);
+      assert.equal(receipt.disposition, crossing);
+      assert.deepEqual([capability.intentRevision, capability.mediaBase], fixture ? [5, 2] : [3, 0]);
+      if (fixture) assert.deepEqual([receipt.intentRevision, receipt.mediaRevision, receipt.startSerial, receipt.audioRevision], [5, 3, 4, 13]);
+      assert.equal(pending.completion.settled, false, 'hold worker intent completion after its MAIN execution');
+
+      const mediaPause = h.mediaAction(7, 'pause'), delivered = h.send(h.deliverRelay(7, mediaPause));
+      await h.flush({ holdScript: entry => entry === pending }); await delivered;
+      const snapshot = await h.snapshot(), plays = h.audioSpy.plays.length, effects = h.audioSpy.effects.length;
+      assert.deepEqual([pipeline.intentRevision, pipeline.mediaRevision], fixture ? [5, 4] : [3, 1]);
+      assert.equal(snapshot.state, 'paused'); assert.equal(snapshot.audioStatus, 'paused'); assert.equal(snapshot.error, null);
+      assert.equal(attempt.observationRequest, null, 'newer media pause has completed its fresh observation');
+      assert.equal(attempt.observationNeeded, false); assert.equal(attempt.audioRevision, record.audioRevision);
+      assert.equal(attempt.audioId, audioId); assert.equal(audio.paused, true); assert.equal(audio.currentTime, 3);
+      assert.equal(pipeline.intentApplication.capability, capability, 'the application reference remains current despite its obsolete media base');
+      assert.ok(pipeline.mediaRevision > capability.mediaBase);
+
+      if (failure === 'reject') await h.fail(pending, new Error('superseded worker intent rejected'));
+      else await h.complete(pending, failure === 'no-receipt' ? null : { ...receipt, sessionId: 'wrong-session' });
+      await h.flush(); const response = await resumed;
+      assert.equal(h.worker.pipeline, pipeline, 'an old media-base intent failure cannot retire the newer media pause');
+      assert.equal(pipeline.attempt, attempt); assert.equal(pipeline.cancelled, false); assert.equal(attempt.retired, false);
+      assert.deepEqual(await h.snapshot(), snapshot, 'obsolete intent failure leaves the canonical paused state intact');
+      assert.equal(h.page(7).__freeTtsPlayback, record); assert.equal(record.audio, audio); assert.equal(record.audioId, audioId);
+      assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(audio.paused, true); assert.equal(audio.currentTime, 3);
+      assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, plays);
+      assert.equal(h.audioSpy.effects.length, effects, 'obsolete failure performs no media teardown or Audio disposal');
+      assert.equal(response.sessionId, pipeline.sessionId); assert.equal(response.state, 'paused'); assert.equal(response.error, null);
+      assert.equal(response.commandError, null); assert.equal(response.disposition, 'superseded'); assert.equal(response.pageApplied, false);
+      h.assertPausedBar(); await h.finish();
+    });
+  }
   for (const outcome of ['fulfill', 'reject']) for (const superseding of ['none', 'pause', 'navigation', 'replacement']) await t.test(`activation-receipt-${outcome}-${superseding}`, async () => {
     const h = harness(); const started = h.start(); await h.ready(activation); await started;
     const request = h.scripts.pending(activation), receipt = h.execute(request), attempt = h.worker.pipeline.attempt;
