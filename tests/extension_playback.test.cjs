@@ -136,7 +136,7 @@ function harness() {
       const result = worker.__worker.start(tabId, text);
       const owner = worker.__worker.pipeline;
       if (owner) {
-        const binding = { source: 'bar', sessionId: owner.sessionId, lifecycleRevision: owner.lifecycleRevision };
+        const binding = { source: 'bar', leaseId: owner.leaseId, sessionId: owner.sessionId, lifecycleRevision: owner.lifecycleRevision };
         void api.send({ ...binding, action: 'setLoopState', enabled: false }, { tab: { id: tabId } });
         void api.send({ ...binding, action: 'setRepeatCurrentState', enabled: false }, { tab: { id: tabId } });
       }
@@ -348,6 +348,151 @@ test('F-3 redundant_pause_waits_for_main_receipt', async t => {
     if (resumed) await resumed; else h.assertPausedBar();
     await h.finish();
   });
+});
+
+test('W04 stale_resume_both_execution_orders', async t => {
+  for (const order of ['resume-before-pause', 'pause-before-resume']) await t.test(order, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started; await h.pause();
+    const pipeline = h.worker.pipeline, audio = h.audioSpy.constructors[0].audio;
+    const initialPlayCount = h.audioSpy.plays.length;
+    const isIntent = entry => entry.func.name === 'injectWorkerIntent';
+    const isToggleRender = entry => entry.world === 'ISOLATED' && entry.source.includes('const paused = current.state');
+    const resume = h.send({ action: 'resumePlayback', source: 'popup' }, {}); await h.drain();
+    const resumeIntent = h.scripts.pending(entry => isIntent(entry) && entry.args[0].paused === false);
+    const delayedResumeRender = h.scripts.pending(isToggleRender);
+    assert.ok(delayedResumeRender, 'the accepted-state render is dispatched independently of the MAIN receipt');
+    let resumeReceipt;
+    let pause;
+    if (order === 'resume-before-pause') {
+      resumeReceipt = h.execute(resumeIntent);
+      pause = h.send({ action: 'pausePlayback', source: 'popup' }, {}); await h.drain();
+      const pauseIntent = h.scripts.pending(entry => isIntent(entry) && entry.args[0].paused === true);
+      h.execute(pauseIntent); await h.complete(pauseIntent); await h.drain();
+      const pauseRenders = h.scripts.entries.filter(entry => !entry.executed && isToggleRender(entry) && entry !== delayedResumeRender);
+      assert.ok(pauseRenders.length >= 1);
+      for (const pauseRender of pauseRenders) { h.execute(pauseRender); await h.complete(pauseRender); }
+      await pause;
+      await h.complete(resumeIntent);
+      h.execute(delayedResumeRender); await h.complete(delayedResumeRender);
+    } else {
+      pause = h.send({ action: 'pausePlayback', source: 'popup' }, {}); await h.drain();
+      const pauseIntent = h.scripts.pending(entry => isIntent(entry) && entry.args[0].paused === true);
+      const pauseReceipt = h.execute(pauseIntent); await h.complete(pauseIntent); await h.drain();
+      const pauseRenders = h.scripts.entries.filter(entry => !entry.executed && isToggleRender(entry) && entry !== delayedResumeRender);
+      assert.ok(pauseRenders.length >= 1);
+      for (const pauseRender of pauseRenders) { h.execute(pauseRender); await h.complete(pauseRender); }
+      await pause;
+      assert.equal(pauseReceipt.disposition, 'applied');
+      resumeReceipt = h.execute(resumeIntent); await h.complete(resumeIntent);
+      h.execute(delayedResumeRender); await h.complete(delayedResumeRender);
+    }
+    await h.flush();
+    const resumeResponse = await resume;
+    assert.equal(resumeReceipt.disposition, order === 'resume-before-pause' ? 'applied' : 'stale');
+    assert.equal(resumeResponse.state, 'paused');
+    assert.equal((await h.snapshot()).state, 'paused');
+    assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, true);
+    assert.equal(audio.paused, true);
+    assert.equal(h.audioSpy.plays.length, order === 'resume-before-pause' ? initialPlayCount + 1 : initialPlayCount,
+      'only a resume that executes before pause may invoke play');
+    h.assertPausedBar();
+    assert.equal(h.worker.pipeline, pipeline);
+    await h.finish();
+  });
+});
+
+test('W05 rapid_toggle_parity', async t => {
+  for (const count of [2, 3]) await t.test(`${count}-toggles`, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, owner = { leaseId: pipeline.leaseId, sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision };
+    const button = h.page(7, 'ISOLATED').document.getElementById('free-tts-toggle');
+    const beforeRevision = pipeline.intentRevision, beforeState = pipeline.isPaused;
+    button.textContent = '▶'; button.title = 'Resume'; button.setAttribute('aria-label', 'Resume');
+    button.listeners.get('click')[0]();
+    const firstMessage = h.messages.at(-1).data;
+    assert.equal(firstMessage.action, 'togglePlayback', 'the command is derived from worker state, never the stale glyph');
+    assert.equal(firstMessage.source, 'bar'); assert.equal(firstMessage.leaseId, owner.leaseId);
+    assert.equal(firstMessage.sessionId, owner.sessionId); assert.equal(firstMessage.lifecycleRevision, owner.lifecycleRevision);
+
+    const invalidBindings = [
+      [{ ...firstMessage, leaseId: 'wrong-lease' }, { tab: { id: 7 } }],
+      [firstMessage, { tab: { id: 8 } }],
+      [{ ...firstMessage, sessionId: 'wrong-session' }, { tab: { id: 7 } }],
+      [{ ...firstMessage, lifecycleRevision: owner.lifecycleRevision + 1 }, { tab: { id: 7 } }],
+      [firstMessage, {}],
+    ];
+    for (const [message, sender] of invalidBindings) {
+      assert.equal((await h.send(message, sender)).accepted, false, 'unbound or stale bar origins are ignored');
+    }
+    assert.equal(pipeline.intentRevision, beforeRevision);
+    assert.equal(pipeline.isPaused, beforeState);
+
+    const responses = [h.send(firstMessage, { tab: { id: 7 } })];
+    for (let i = 1; i < count; i++) responses.push(h.send({ ...firstMessage }, { tab: { id: 7 } }));
+    assert.equal(pipeline.intentRevision, beforeRevision + count);
+    assert.equal(pipeline.isPaused, count % 2 === 0 ? beforeState : !beforeState);
+    await h.drain();
+    const intents = h.scripts.entries.filter(entry => entry.func.name === 'injectWorkerIntent' && entry.args[0].intentRevision > beforeRevision);
+    const isToggleRender = entry => entry.world === 'ISOLATED' && entry.source.includes('const paused = current.state');
+    assert.equal(intents.length, count);
+    const descending = [...intents].sort((a, b) => b.args[0].intentRevision - a.args[0].intentRevision);
+    const renders = h.scripts.entries.filter(entry => !entry.executed && isToggleRender(entry));
+    assert.equal(renders.length, count);
+    const rendersNewestFirst = [...renders].sort((a, b) => b.args[1].viewRevision - a.args[1].viewRevision);
+    for (const entry of descending) h.execute(entry);
+    for (const entry of rendersNewestFirst) h.execute(entry);
+    for (const entry of rendersNewestFirst.slice().reverse()) await h.complete(entry);
+    for (const entry of descending.slice().reverse()) await h.complete(entry);
+    await h.drain();
+    const refreshes = h.scripts.entries.filter(entry => !entry.executed && isToggleRender(entry));
+    for (const entry of refreshes.slice().reverse()) h.execute(entry);
+    for (const entry of refreshes) await h.complete(entry);
+    await h.flush(); await Promise.all(responses);
+
+    const paused = count % 2 === 0 ? beforeState : !beforeState;
+    assert.equal((await h.snapshot()).state, paused ? 'paused' : 'playing');
+    assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, paused);
+    const rendered = h.page(7, 'ISOLATED').document.getElementById('free-tts-toggle');
+    const action = paused ? 'Resume' : 'Pause';
+    assert.equal(rendered.textContent, paused ? '▶' : '⏸');
+    assert.equal(rendered.title, action); assert.equal(rendered.getAttribute('aria-label'), action);
+    await h.finish();
+  });
+});
+
+test('W06 unfinished_resume_identity', async () => {
+  const h = harness(); const started = h.start(); await h.ready(); await started;
+  const pipeline = h.worker.pipeline, attempt = pipeline.attempt;
+  const originalAudio = h.audioSpy.constructors[0].audio, originalId = pipeline.attempt.audioId;
+  const fetchCount = h.fetches.length, constructorCount = h.audioSpy.constructors.length;
+  const currentTime = originalAudio.currentTime, initialPlayCount = h.audioSpy.plays.length;
+  await h.pause();
+  const activationCount = h.scripts.entries.filter(activation).length;
+  const resumePromise = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+  await h.flush();
+  const resume = await resumePromise;
+  const playCountAfterResume = h.audioSpy.plays.length;
+  const redundantPromise = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+  await h.flush();
+  const redundant = await redundantPromise;
+
+  assert.equal(resume.accepted, true); assert.equal(redundant.accepted, true);
+  assert.equal(h.worker.pipeline.attempt, attempt);
+  assert.equal(pipeline.attempt.audioId, originalId); assert.equal(originalId, `${pipeline.sessionId}:${attempt.attemptId}`);
+  assert.equal(h.audioSpy.constructors.length, constructorCount);
+  assert.equal(h.audioSpy.constructors[0].audio, originalAudio);
+  assert.equal(originalAudio.currentTime, currentTime);
+  assert.equal(h.audioSpy.writes.filter(write => write.field === 'currentTime').length, 0);
+  assert.equal(h.fetches.length, fetchCount);
+  assert.equal(playCountAfterResume, initialPlayCount + 1, 'resume invokes play once on the unfinished Audio');
+  assert.equal(h.audioSpy.plays.length, playCountAfterResume, 'redundant resume does not invoke play again');
+  assert.equal(h.scripts.entries.filter(activation).length, activationCount,
+    'a known unfinished Audio resumes through its identity, not a replacement activation');
+  assert.ok(attempt.pollTimer, 'the attempt retains its one completion observer');
+  assert.equal([...h.clock.timers.values()].filter(timer => timer.due === h.clock.now + 500).length, 1);
+  assert.equal(h.page(7).__freeTtsPlayback.audioId, originalId);
+  assert.equal(h.page(7).__freeTtsPlayback.audio, originalAudio);
+  await h.finish();
 });
 
 // F-2: leaving the MAIN record playing/starting after direct pause suppresses

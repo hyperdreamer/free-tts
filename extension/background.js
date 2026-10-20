@@ -227,7 +227,9 @@ async function acceptRuntimeCommand(msg, sender) {
     return startSentenceTTS(tab.id, msg.text, ticket);
   }
   const pipeline = sentencePipeline;
-  if (!pipeline || (sender.tab && (sender.tab.id !== pipeline.tabId || msg.sessionId !== pipeline.sessionId || msg.lifecycleRevision !== pipeline.lifecycleRevision))) return commandResponse(false);
+  if (!pipeline || (sender.tab
+    ? msg.source !== "bar" || sender.tab.id !== pipeline.tabId || msg.leaseId !== pipeline.leaseId || msg.sessionId !== pipeline.sessionId || msg.lifecycleRevision !== pipeline.lifecycleRevision
+    : msg.source === "bar")) return commandResponse(false);
   return msg.action === "pausePlayback" || (msg.action === "togglePlayback" && !pipeline.isPaused) ? pausePlayback(pipeline) : resumePlayback(pipeline);
 }
 
@@ -246,15 +248,22 @@ async function changePausedState(pipeline, paused) {
     pipeline.localIntentFloor = ++pipeline.intentRevision;
     viewRevision++;
   }
+  const acceptedSnapshot = buildPlaybackSnapshot(pipeline);
+  const acceptedRender = updateControlBar(pipeline, acceptedSnapshot, playbackModes(pipeline));
   const capability = workerIntent(pipeline);
   const receipt = await applyWorkerIntent(pipeline, capability);
+  let currentRender = Promise.resolve();
   if (ownsPipeline(pipeline)) {
     if (!pipeline.isPaused) {
       if (pipeline._pausedAtEnd) { pipeline._pausedAtEnd = false; pipeline.attempt.retired = true; }
       void playNextSentence(pipeline);
     }
-    await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+    const currentSnapshot = buildPlaybackSnapshot(pipeline);
+    if (currentSnapshot.viewRevision !== acceptedSnapshot.viewRevision || currentSnapshot.state !== acceptedSnapshot.state) {
+      currentRender = updateControlBar(pipeline, currentSnapshot, playbackModes(pipeline));
+    }
   }
+  await Promise.all([acceptedRender, currentRender]);
   return commandResponse(true, receipt || { disposition: "stale" });
 }
 
@@ -326,9 +335,11 @@ function injectPlaybackSession(owner, workerToken) {
   record.play = () => {
     if (record !== window.__freeTtsPlayback || record.desiredPaused || !record.audio || record.audio.ended || ["starting", "playing"].includes(record.audioStatus)) return;
     const audio = record.audio, serial = ++record.startSerial, attemptId = record.attemptId;
+    const intentRevision = record.workerIntentRevision, audioId = record.audioId;
     record.audioStatus = "starting"; record.audioError = null; record.audioRevision++;
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
-    const live = () => record === window.__freeTtsPlayback && record.audio === audio && record.attemptId === attemptId && record.startSerial === serial && !record.desiredPaused;
+    const live = () => record === window.__freeTtsPlayback && record.audio === audio && record.audioId === audioId &&
+      record.attemptId === attemptId && record.workerIntentRevision === intentRevision && record.startSerial === serial && !record.desiredPaused;
     const settled = (error) => {
       if (!live()) return;
       record.audioStatus = error ? "error" : "playing";
@@ -528,6 +539,8 @@ async function showControlBar(owner, snapshot, modes) {
         if (view.barCreated) return "rendered";
         const pending = view.pendingRender;
         const latest = pending && pending.snapshot.viewRevision > supplied.viewRevision ? pending : { snapshot: supplied, modes: suppliedModes };
+        const sendBarMessage = message => chrome.runtime.sendMessage({ ...message, source: "bar", leaseId: binding.leaseId,
+          sessionId: binding.sessionId, lifecycleRevision: binding.lifecycleRevision });
         const paused = latest.snapshot.state === "paused";
         const initialLoopEnabled = latest.modes.loopEnabled, initialRepeatCurrent = latest.modes.repeatCurrentEnabled;
         view.viewRevision = latest.snapshot.viewRevision;
@@ -626,7 +639,7 @@ async function showControlBar(owner, snapshot, modes) {
         bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
         bar.querySelector("#free-tts-next").addEventListener("click", () => chrome.runtime.sendMessage({ action: "nextSentence" }));
         bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
-          chrome.runtime.sendMessage({ action: "togglePlayback", source: "bar", sessionId: binding.sessionId, lifecycleRevision: binding.lifecycleRevision });
+          sendBarMessage({ action: "togglePlayback" });
         });
         bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
 
@@ -1058,7 +1071,7 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
 }
 
 function requestActivation(pipeline, attempt) {
-  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || !attempt.dataUrl) return;
+  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || !attempt.dataUrl || ["starting", "playing"].includes(attempt.audioStatus)) return;
   // Loading and intent application race independently. Whichever finishes last
   // continues the ready attempt, but never ahead of its confirmed running intent.
   const application = pipeline.intentApplication, receipt = application?.receipt;
