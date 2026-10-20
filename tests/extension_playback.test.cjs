@@ -138,6 +138,7 @@ function harness() {
     holdTabQueries(value = true) { holdTabQueries = value; },
     shortcut: () => commandListener('speak-selection'),
     closeTab: tabId => tabRemoved?.(tabId),
+    navigateTab(tabId) { pages.delete(tabId); },
     start(text = 'First sentence. Second sentence.', tabId = 7) {
       const result = worker.__worker.start(tabId, text);
       const owner = worker.__worker.pipeline;
@@ -1067,6 +1068,45 @@ test('navigation_dispatched_before_replacement_is_owner_bound', async () => {
   await h.finish();
 });
 
+// F-7: optional API failures must not escape MAIN setup and retire ordinary
+// bar/audio playback; one unsupported handler must not suppress the others.
+test('F-7 optional_media_setup_failure_is_nonfatal', async t => {
+  for (const failure of ['play', 'pause', 'previoustrack', 'nexttrack', 'stop', 'metadata-constructor', 'metadata-write', 'unsupported-api']) await t.test(failure, async () => {
+    const h = harness(), main = h.page(7), media = main.navigator.mediaSession;
+    function unavailable() { throw new Error('optional media setup unavailable'); };
+    if (failure === 'unsupported-api') delete main.navigator.mediaSession;
+    else if (failure === 'metadata-constructor') main.MediaMetadata = unavailable;
+    else if (failure === 'metadata-write') {
+      main.navigator.mediaSession = new Proxy(media, {
+        set(target, key, value) { if (key === 'metadata' && value !== null) unavailable(); return Reflect.set(target, key, value); },
+      });
+    } else {
+      const register = media.setActionHandler;
+      media.setActionHandler = function (action, fn) { if (action === failure && fn !== null) unavailable(); return register.call(this, action, fn); };
+    }
+    const started = h.start(), pipeline = h.worker.pipeline;
+    await h.ready(); const response = await started;
+    assert.equal(response.ok, true); assert.equal(response.pageApplied, true);
+    assert.equal((await h.snapshot()).state, 'playing'); assert.equal((await h.snapshot()).error, null);
+    assert.equal(h.worker.pipeline, pipeline); assert.equal(pipeline.cancelled, false);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+    const audio = main.__freeTtsAudio;
+    assert.equal(audio.paused, false); assert.ok(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'));
+    assert.ok(h.logs.length > 0, 'optional Media Session failure is logged');
+    if (failure !== 'unsupported-api') {
+      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'stop']) {
+        if (action !== failure) assert.equal(typeof media.handlers.get(action), 'function', `${action} remains available`);
+      }
+      assert.equal([...h.clock.timers.values()].filter(timer => timer.repeat === 25000).length, 1);
+    }
+    await h.pause(); h.assertPausedBar(); assert.equal(audio.paused, true);
+    const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {}); await h.flush(); await resumed;
+    assert.equal(main.__freeTtsAudio, audio); assert.equal(audio.paused, false);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 2);
+    await h.finish();
+  });
+});
+
 test('current_setup_failure_retires_only_captured_owner', async () => {
   const h = harness(); const first = h.start();
   await h.flush({ holdScript: mediaSetup });
@@ -1167,7 +1207,13 @@ test('terminal_cleanup_cannot_clear_successor', async t => {
       assert.ok(audio); assert.ok(bar);
       const media = h.page(7).navigator.mediaSession, handler = media.handlers.get('play'), metadata = media.metadata;
       if (!held.executed) h.execute(held);
-      await h.complete(held); await h.flush(); await first; if (terminalResult) await terminalResult;
+      await h.complete(held); await h.flush(); await first;
+      if (terminalResult) {
+        const response = await terminalResult;
+        assert.equal(response.pageApplied, part !== 'media' || boundary === 'completion',
+          'F-8: a retirement rejected by a successor has no MAIN application receipt');
+        assert.equal(response.sessionId, successor.sessionId);
+      }
       assert.equal(h.worker.pipeline, successor); assert.equal(h.worker.active.sessionId, successor.sessionId);
       assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(audio.paused, false);
       assert.equal(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'), bar);
@@ -1199,7 +1245,9 @@ test('retirement_cleanup_order_and_failure_continuation', async t => {
     }
     await h.flush(); const response = await stopped;
     assert.equal(response.ok, failure === 'none');
+    assert.equal(response.pageApplied, failure !== 'injection', 'F-8: dispatch alone cannot acknowledge MAIN retirement');
     if (failure !== 'none') assert.equal(response.commandError.code, 'cleanup-failure');
+    if (failure === 'injection') assert.equal(h.page(7).__freeTtsAudio.paused, false, 'failed MAIN cleanup never paused the Audio');
     assert.equal((await h.snapshot()).state, 'idle');
     assert.equal(view.document.getElementById('free-tts-bar'), null);
     assert.equal(view.document.querySelectorAll('.free-tts-highlight-overlay').length, 0);
@@ -1224,6 +1272,37 @@ test('retirement_cleanup_order_and_failure_continuation', async t => {
     }
     for (const play of h.audioSpy.plays) play.outcome.resolve();
     await h.flush(); h.assertNoUnintendedTimers();
+  });
+});
+
+// F-8: only a valid captured MAIN receipt acknowledges stop. Later isolated
+// cleanup failures still report the MAIN application that actually occurred.
+test('F-8 stop_requires_owned_main_retirement_receipt', async t => {
+  for (const failure of ['missing-main-receipt', 'wrong-main-owner', 'wrong-retirement-floor', 'isolated-highlights', 'isolated-bar']) await t.test(failure, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const audio = h.page(7).__freeTtsAudio;
+    const stopped = h.send({ action: 'stopPlayback', source: 'popup' }, {});
+    let failed;
+    if (failure.endsWith('receipt') || failure.startsWith('wrong-')) {
+      const main = h.scripts.pending(entry => entry.func.name === 'clearMediaSession');
+      const receipt = h.execute(main);
+      await h.complete(main, failure === 'missing-main-receipt' ? null : { ...receipt,
+        ...(failure === 'wrong-main-owner' ? { sessionId: 'unrelated-session' } : { retirementRevision: main.args[1] + 1 }) });
+    } else {
+      const predicate = failure === 'isolated-highlights' ? retiredHighlights : retiredBar;
+      await h.flush({ holdScript: predicate }); failed = h.scripts.pending(predicate);
+      await h.fail(failed, new Error('isolated cleanup unavailable'));
+    }
+    await h.flush(); const response = await stopped;
+    assert.equal(response.ok, false); assert.equal(response.accepted, true);
+    assert.equal(response.disposition, 'failed'); assert.equal(response.commandError.code, 'cleanup-failure');
+    assert.equal(response.pageApplied, failure.startsWith('isolated-'));
+    assert.equal(response.state, 'idle'); assert.equal(response.sessionId, null);
+    assert.equal(audio.paused, true); assert.equal(audio.src, ''); assert.equal(h.page(7).__freeTtsAudio, null);
+    if (failure === 'isolated-highlights') assert.equal(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'), null,
+      'bar cleanup continues after highlight cleanup failed');
+    if (failed) h.execute(failed);
+    await h.finish();
   });
 });
 
@@ -1264,6 +1343,29 @@ test('lease_and_retirement_fences_survive_idle', async t => {
     assert.equal(context[key].lifecycleFloor, floor); assertIdlePage(h);
     await h.finish();
   });
+});
+
+// F-6: a worker's per-tab entry outlives a document. A fresh document must
+// establish both world records again, and subsequent starts must still work.
+test('F-6 playback_recovers_after_page_navigation', async () => {
+  const h = harness(); const first = h.start(); await h.ready(); await first;
+  const lease = h.worker.leases.get(7), oldMain = h.page(7), oldView = h.page(7, 'ISOLATED');
+  await h.finish(); h.navigateTab(7);
+  assert.notEqual(h.page(7), oldMain); assert.notEqual(h.page(7, 'ISOLATED'), oldView);
+  for (let restart = 1; restart <= 2; restart++) {
+    const started = h.start(), pipeline = h.worker.pipeline;
+    await h.ready(); const response = await started;
+    assert.equal(response.ok, true, `start ${restart} after navigation succeeds`);
+    assert.equal(response.pageApplied, true); assert.equal(response.sessionId, pipeline.sessionId);
+    assert.equal(h.worker.leases.get(7), lease, 'the worker retains its per-tab lease entry');
+    assert.equal(h.worker.pipeline, pipeline); assert.equal((await h.snapshot()).state, 'playing');
+    assert.equal(h.page(7).__freeTtsPlayback.sessionId, pipeline.sessionId);
+    assert.equal(h.page(7, 'ISOLATED').__freeTtsView.sessionId, pipeline.sessionId);
+    assert.ok(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'));
+    assert.equal(h.audioSpy.constructors.length, restart + 1); assert.equal(h.audioSpy.plays.length, restart + 1);
+    assert.equal(h.page(7).__freeTtsAudio.paused, false);
+    await h.finish();
+  }
 });
 
 test('shared_lease_claim_abandoned_owner_and_closed_tab', async t => {

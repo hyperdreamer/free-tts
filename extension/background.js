@@ -233,14 +233,20 @@ async function stopPlayback(pipeline = sentencePipeline, cancelStarts = true) {
   viewRevision++;
   pipeline.retirementPromise = (async () => {
     const failures = [];
+    let retirementReceipt = null;
     // Each cleanup is independently attempted, using the captured owner even
     // when a successor publishes during an earlier injection.
     for (const cleanup of [cleanupMediaSession, cleanupPageHighlighting, hideControlBar]) {
-      try { await cleanup(owner, retirementRevision); }
-      catch (error) { failures.push(error); logError("retiring playback in page", error); }
+      try {
+        const receipt = await cleanup(owner, retirementRevision);
+        if (cleanup === cleanupMediaSession) {
+          retirementReceipt = receipt;
+          if (receipt.errors.length) throw new Error(receipt.errors.join("; "));
+        }
+      } catch (error) { failures.push(error); logError("retiring playback in page", error); }
     }
     clearOwnedPlayback(pipeline);
-    return commandResponse(true, { disposition: "applied" }, failures.length
+    return commandResponse(true, retirementReceipt, failures.length
       ? { code: "cleanup-failure", message: failures.map(error => error.message).join("; ") } : null);
   })();
   return pipeline.retirementPromise;
@@ -364,7 +370,9 @@ async function establishPageLease(pipeline) {
   const entry = pageLeases.get(pipeline.tabId);
   if (!entry || entry.closed || entry.leaseId !== pipeline.leaseId) return false;
   while (ownsPipeline(pipeline) && !entry.closed) {
-    if (entry.established) return true;
+    // A document navigation discards world records while retaining this tab.
+    // Revalidate the lease for each new session before installing its owner.
+    if (entry.establishedSessionId === pipeline.sessionId) return true;
     if (!entry.promise) {
       const promise = claimPageLease(pipeline, entry);
       entry.promise = promise;
@@ -408,7 +416,7 @@ async function claimPageLease(pipeline, entry) {
       if (!ownsPipeline(pipeline) || entry.closed) return false;
       if (!result?.result?.claimed) { claimed = false; break; }
     }
-    if (claimed) { entry.established = true; return true; }
+    if (claimed) { entry.establishedSessionId = pipeline.sessionId; return true; }
   }
   throw new Error("Page lease claim contention");
 }
@@ -623,9 +631,12 @@ function injectMediaRelay(owner) {
 
 // Media session set up in the MAIN world.
 function injectMediaSession(owner) {
-  if (!("mediaSession" in navigator)) return;
   const record = window.__freeTtsPlayback;
   if (!record || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId || record.lifecycleRevision !== owner.lifecycleRevision) return;
+  if (!("mediaSession" in navigator)) { console.warn("free-tts: Media Session is unavailable"); return; }
+  // Registration and metadata are optional browser capabilities. Isolate each
+  // operation so one unsupported action cannot disable the remaining controls.
+  const optionalSetup = effect => { try { effect(); } catch (error) { console.warn("free-tts: optional Media Session setup", error); } };
   const live = () => record === window.__freeTtsPlayback && !record.retired;
   const send = (action) => {
     if (!live()) return;
@@ -636,29 +647,29 @@ function injectMediaSession(owner) {
   // Play/pause: directly control the Audio element for latency (no service
   // worker round-trip), then notify the worker so it syncs sentencePipeline
   // state and the floating control bar / context menu.
-  navigator.mediaSession.setActionHandler("play", () => {
+  optionalSetup(() => navigator.mediaSession.setActionHandler("play", () => {
     if (!live()) return;
     record.desiredPaused = false;
     record.play();
     send("mediaResume");
-  });
-  navigator.mediaSession.setActionHandler("pause", () => {
+  }));
+  optionalSetup(() => navigator.mediaSession.setActionHandler("pause", () => {
     if (!live()) return;
     record.desiredPaused = true;
     record.pause();
     send("mediaPause");
-  });
+  }));
   // Prev/next/stop: bridge to the service worker via the isolated-world relay.
-  navigator.mediaSession.setActionHandler("previoustrack", () => send("prevSentence"));
-  navigator.mediaSession.setActionHandler("nexttrack", () => send("nextSentence"));
-  navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback"));
+  optionalSetup(() => navigator.mediaSession.setActionHandler("previoustrack", () => send("prevSentence")));
+  optionalSetup(() => navigator.mediaSession.setActionHandler("nexttrack", () => send("nextSentence")));
+  optionalSetup(() => navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback")));
 
-  navigator.mediaSession.metadata = new MediaMetadata({
+  optionalSetup(() => { navigator.mediaSession.metadata = new MediaMetadata({
     title: "free-tts",
     artist: "Text-to-Speech",
     album: document.title || "Web Page",
-  });
-  navigator.mediaSession.playbackState = "paused";
+  }); });
+  optionalSetup(() => { navigator.mediaSession.playbackState = "paused"; });
 
   // Keepalive: ping the worker so prev/next/stop stay responsive while paused.
   if (window.__freeTtsKeepalive) clearInterval(window.__freeTtsKeepalive);
@@ -666,13 +677,14 @@ function injectMediaSession(owner) {
 }
 
 function clearMediaSession(owner, retirementRevision) {
+  const receipt = { ...owner, retirementRevision, disposition: "stale", errors: [] };
   const record = window.__freeTtsPlayback;
   if (!record || record.leaseId !== owner.leaseId || record.lifecycleFloor > retirementRevision ||
       record.lifecycleRevision > owner.lifecycleRevision ||
-      (record.lifecycleRevision === owner.lifecycleRevision && record.sessionId !== owner.sessionId)) return { errors: [] };
+      (record.lifecycleRevision === owner.lifecycleRevision && record.sessionId !== owner.sessionId)) return receipt;
   record.lifecycleFloor = retirementRevision;
   record.retired = true; record.desiredPaused = true; record.startSerial++;
-  const errors = [], attempt = effect => { try { effect(); } catch (error) { errors.push(error.message || String(error)); } };
+  const errors = receipt.errors, attempt = effect => { try { effect(); } catch (error) { errors.push(error.message || String(error)); } };
   // Retain this tombstone even when installation has not yet completed.
   attempt(() => { if (window.__freeTtsKeepalive) clearInterval(window.__freeTtsKeepalive); });
   window.__freeTtsKeepalive = null;
@@ -686,7 +698,8 @@ function clearMediaSession(owner, retirementRevision) {
   attempt(() => { if (audio) audio.src = ""; });
   record.audio = null; record.audioId = null; record.audioStatus = "none"; record.audioError = null; record.audioRevision++;
   window.__freeTtsAudio = null;
-  return { errors };
+  receipt.disposition = "applied";
+  return receipt;
 }
 
 async function setupMediaSession(pipeline) {
@@ -705,7 +718,13 @@ async function setupMediaSession(pipeline) {
 async function cleanupMediaSession(owner, retirementRevision) {
   const [result] = await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN",
     func: clearMediaSession, args: [owner, retirementRevision] });
-  if (result?.result?.errors?.length) throw new Error(result.result.errors.join("; "));
+  const receipt = result?.result;
+  if (!receipt || receipt.tabId !== owner.tabId || receipt.leaseId !== owner.leaseId || receipt.sessionId !== owner.sessionId ||
+      receipt.lifecycleRevision !== owner.lifecycleRevision || receipt.retirementRevision !== retirementRevision ||
+      !["applied", "stale"].includes(receipt.disposition) || !Array.isArray(receipt.errors)) {
+    throw new Error("MAIN retirement returned no valid owned receipt");
+  }
+  return receipt;
 }
 
 // --- Control bar -----------------------------------------------------------
@@ -1193,7 +1212,7 @@ async function startSentenceTTS(tabId, text, ticket = null) {
   if (ticket.cancelled || ticket !== pendingStart) return commandResponse(false);
   if (ownsPipeline(sentencePipeline)) void stopPlayback(sentencePipeline, false);
   pendingStart = null;
-  if (!pageLeases.has(tabId)) pageLeases.set(tabId, { leaseId: crypto.randomUUID(), established: false, promise: null, closed: false });
+  if (!pageLeases.has(tabId)) pageLeases.set(tabId, { leaseId: crypto.randomUUID(), establishedSessionId: null, promise: null, closed: false });
   const pipeline = sentencePipeline = {
     tabId, leaseId: pageLeases.get(tabId).leaseId, sessionId: crypto.randomUUID(), lifecycleRevision: ++lifecycleRevision,
     sentences, currentIdx: 0, cache: new Map(), voice: null, serverUrl: null, speed: 0, isPaused: false,
