@@ -18,11 +18,17 @@ let sentencePipeline = null;
 
 function ownsPipeline(pipeline, attempt = null) {
   return !!pipeline && sentencePipeline === pipeline && !pipeline.cancelled &&
+    activePlayback.tabId === pipeline.tabId && activePlayback.leaseId === pipeline.leaseId &&
     activePlayback.sessionId === pipeline.sessionId && activePlayback.lifecycleRevision === pipeline.lifecycleRevision &&
     (!attempt || (pipeline.attempt === attempt && !attempt.retired && pipeline.currentIdx === attempt.idx));
 }
 
+function ownsAttempt(pipeline, attempt) {
+  return !!attempt && ownsPipeline(pipeline, attempt);
+}
+
 function buildPlaybackSnapshot(pipeline = sentencePipeline) {
+  if (pipeline?.cancelled) pipeline = null;
   const attempt = pipeline?.attempt;
   return {
     workerId, state: pipeline ? (pipeline.isPaused ? "paused" : "playing") : "idle",
@@ -30,6 +36,14 @@ function buildPlaybackSnapshot(pipeline = sentencePipeline) {
     intentRevision: pipeline?.intentRevision ?? null, mediaRevision: pipeline?.mediaRevision ?? null,
     phase: attempt?.phase ?? "idle", audioStatus: attempt?.audioStatus ?? "none", error: lastError,
   };
+}
+
+function failOwnedPlayback(pipeline, code, error, attempt = null) {
+  if (!ownsPipeline(pipeline, attempt)) return;
+  pipeline.failure = { code, message: error.message || String(error) };
+  lastError = pipeline.failure;
+  logError(code, error);
+  void stopPlayback(pipeline, false);
 }
 
 function commandResponse(accepted, receipt = null, commandError = null) {
@@ -116,7 +130,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return sendAsyncResponse(sendResponse, acceptRuntimeCommand(msg, sender));
   }
   if (msg.action === "stopPlayback") {
-    return sendAsyncResponse(sendResponse, stopPlayback().then(() => ({ ok: true })));
+    const pipeline = sentencePipeline;
+    const bound = !!sender.tab || msg.source === "bar" || msg.source === "media";
+    if (bound && (!ownsPipeline(pipeline) || sender.tab?.id !== pipeline.tabId ||
+        !["bar", "media"].includes(msg.source) || msg.sessionId !== pipeline.sessionId ||
+        msg.leaseId !== pipeline.leaseId || msg.lifecycleRevision !== pipeline.lifecycleRevision)) {
+      sendResponse(commandResponse(false)); return false;
+    }
+    return sendAsyncResponse(sendResponse, stopPlayback(pipeline, !bound));
   }
 
   // Media keys already paused/played the Audio element in the page; only sync
@@ -155,27 +176,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const lease = pageLeases.get(tabId);
+  if (lease) lease.closed = true;
+  pageLeases.delete(tabId);
+  if (sentencePipeline?.tabId === tabId) void stopPlayback(sentencePipeline, false);
+});
+
 // --- Keyboard shortcut -----------------------------------------------------
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === "speak-selection") {
     // Toggle: stop playback if active, otherwise speak selection
-    if (sentencePipeline || activePlayback.tabId) {
+    if (ownsPipeline(sentencePipeline) || pendingStart) {
       await stopPlayback();
       return;
     }
     const ticket = startTicket();
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id || ticket.cancelled) return;
     try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id || ticket.cancelled || pendingStart !== ticket) return;
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => window.getSelection()?.toString() || document.body.innerText || "",
       });
       const text = results?.[0]?.result?.trim();
-      if (text && !ticket.cancelled) await startSentenceTTS(tab.id, text, ticket);
+      if (text && !ticket.cancelled && pendingStart === ticket) await startSentenceTTS(tab.id, text, ticket);
     } catch (error) {
       // scripting permission may not be available on all URLs
-      logError("handling keyboard shortcut", error);
+      if (!ticket.cancelled && pendingStart === ticket) logError("handling keyboard shortcut", error);
+    } finally {
+      if (pendingStart === ticket) pendingStart = null;
     }
     return;
   }
@@ -184,36 +214,36 @@ chrome.commands.onCommand.addListener(async (command) => {
 // --- Stop playback ---------------------------------------------------------
 async function stopPlayback(pipeline = sentencePipeline, cancelStarts = true) {
   if (cancelStarts && pendingStart) { pendingStart.cancelled = true; pendingStart = null; }
-  const tabId = pipeline?.tabId ?? activePlayback.tabId;
-  if (pipeline) {
-    pipeline.cancelled = true;
-    pipeline.attempt.retired = true;
-    clearTimeout(pipeline.attempt.pollTimer);
-    clearTimeout(pipeline.attempt.cacheTimer);
-    pipeline.attempt.cacheWake?.();
-    lifecycleRevision++;
-    viewRevision++;
+  if (!pipeline || sentencePipeline !== pipeline) return commandResponse(false);
+  if (pipeline.retirementPromise) return pipeline.retirementPromise;
+  if (!ownsPipeline(pipeline)) return commandResponse(false);
+  // Cancellation and the retirement floor precede every page/cleanup await.
+  // Replacement allocates its successor lifecycle only after this step.
+  const owner = pageOwner(pipeline), retirementRevision = ++lifecycleRevision;
+  pipeline.cancelled = true;
+  const attempt = pipeline.attempt;
+  if (attempt) {
+    attempt.retired = true;
+    clearTimeout(attempt.pollTimer); attempt.pollTimer = null;
+    clearTimeout(attempt.cacheTimer); attempt.cacheTimer = null;
+    attempt.cacheWake?.(); attempt.cacheWake = null;
+    attempt.observationNeeded = false;
+    attempt.pollInFlight = false;
   }
-  if (tabId) {
-    try {
-      await cleanupMediaSession(tabId);
-      await chrome.scripting.executeScript({
-        target: { tabId }, world: "MAIN",
-        func: (owner) => {
-          const record = window.__freeTtsPlayback;
-          if (owner && (record?.sessionId !== owner.sessionId || record.lifecycleRevision !== owner.lifecycleRevision)) return;
-          if (record) { record.desiredPaused = true; record.startSerial++; }
-          const audio = window.__freeTtsAudio;
-          if (audio) { audio.pause(); audio.src = ""; }
-          if (record) { record.audio = null; record.audioId = null; record.audioStatus = "none"; record.audioRevision++; }
-          window.__freeTtsAudio = null;
-        }, args: [pipeline && { sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision }],
-      });
-      await cleanupPageHighlighting(tabId);
-      await hideControlBar(tabId);
-    } catch (error) { logError("stopping playback in page", error); }
-  }
-  clearOwnedPlayback(pipeline);
+  viewRevision++;
+  pipeline.retirementPromise = (async () => {
+    const failures = [];
+    // Each cleanup is independently attempted, using the captured owner even
+    // when a successor publishes during an earlier injection.
+    for (const cleanup of [cleanupMediaSession, cleanupPageHighlighting, hideControlBar]) {
+      try { await cleanup(owner, retirementRevision); }
+      catch (error) { failures.push(error); logError("retiring playback in page", error); }
+    }
+    clearOwnedPlayback(pipeline);
+    return commandResponse(true, { disposition: "applied" }, failures.length
+      ? { code: "cleanup-failure", message: failures.map(error => error.message).join("; ") } : null);
+  })();
+  return pipeline.retirementPromise;
 }
 
 // --- Pause / Resume ---------------------------------------------------------
@@ -222,10 +252,17 @@ async function acceptRuntimeCommand(msg, sender) {
   if (msg.action === "speakSentences") {
     if (typeof msg.text !== "string" || !msg.text.trim()) return commandResponse(false, null, { code: "invalid-argument", message: "No text" });
     const ticket = startTicket();
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (ticket.cancelled) return commandResponse(false);
-    if (!tab?.id) return commandResponse(false, null, { code: "invalid-argument", message: "No active tab" });
-    return startSentenceTTS(tab.id, msg.text, ticket);
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (ticket.cancelled || pendingStart !== ticket) return commandResponse(false);
+      if (!tab?.id) return commandResponse(false, null, { code: "invalid-argument", message: "No active tab" });
+      return await startSentenceTTS(tab.id, msg.text, ticket);
+    } catch (error) {
+      if (ticket.cancelled || (pendingStart && pendingStart !== ticket)) return commandResponse(false);
+      return commandResponse(false, null, { code: "page-operation-failure", message: error.message || String(error) });
+    } finally {
+      if (pendingStart === ticket) pendingStart = null;
+    }
   }
   const pipeline = sentencePipeline;
   if (!pipeline || (sender.tab
@@ -280,7 +317,7 @@ async function changePausedState(pipeline, paused) {
     }
   }
   await Promise.all([acceptedRender, currentRender]);
-  return commandResponse(true, receipt || { disposition: "stale" });
+  return commandResponse(true, receipt || { disposition: "stale" }, pipeline.failure || null);
 }
 
 function applyWorkerIntent(pipeline, capability) {
@@ -301,7 +338,10 @@ function applyWorkerIntent(pipeline, capability) {
       if (pipeline.intentApplication === application) requestActivation(pipeline, attempt);
     }
     return application.receipt;
-  })();
+  })().catch(error => {
+    if (pipeline.intentApplication === application) failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+    return null;
+  });
   return application.promise;
 }
 
@@ -319,25 +359,134 @@ function adoptPageReceipt(pipeline, attempt, receipt) {
   viewRevision++;
 }
 
+// Claims serialize only the short per-tab establishment, never data or play.
+async function establishPageLease(pipeline) {
+  const entry = pageLeases.get(pipeline.tabId);
+  if (!entry || entry.closed || entry.leaseId !== pipeline.leaseId) return false;
+  while (ownsPipeline(pipeline) && !entry.closed) {
+    if (entry.established) return true;
+    if (!entry.promise) {
+      const promise = claimPageLease(pipeline, entry);
+      entry.promise = promise;
+      entry.claimant = pipeline;
+      // Compare the shared promise before releasing its slot. A retired
+      // claimant's inert partial claim can then be completed by the live owner.
+      void promise.finally(() => {
+        if (entry.promise === promise) { entry.promise = null; entry.claimant = null; }
+      }).catch(() => {});
+    }
+    const claimant = entry.claimant;
+    try { await entry.promise; }
+    catch (error) {
+      if (!ownsPipeline(pipeline) || entry.closed) return false;
+      if (claimant === pipeline) throw error;
+      // A live successor sharing a retired claim retries its own bounded
+      // establishment; it never inherits the retired claimant's fatal error.
+    }
+    if (!ownsPipeline(pipeline)) return false;
+  }
+  return false;
+}
+
+async function claimPageLease(pipeline, entry) {
+  const { tabId, leaseId } = pipeline;
+  for (let retry = 0; retry < 3; retry++) {
+    if (!ownsPipeline(pipeline) || entry.closed) return false;
+    const observed = {};
+    for (const world of ["MAIN", "ISOLATED"]) {
+      const [result] = await chrome.scripting.executeScript({ target: { tabId }, world,
+        func: injectPageLease, args: [world, "read"] });
+      if (!ownsPipeline(pipeline) || entry.closed) return false;
+      observed[world] = result?.result;
+      if (!observed[world]) throw new Error("Page lease read returned no receipt");
+    }
+    let claimed = true;
+    for (const world of ["MAIN", "ISOLATED"]) {
+      if (!ownsPipeline(pipeline) || entry.closed) return false;
+      const [result] = await chrome.scripting.executeScript({ target: { tabId }, world,
+        func: injectPageLease, args: [world, "claim", observed[world], leaseId, workerId] });
+      if (!ownsPipeline(pipeline) || entry.closed) return false;
+      if (!result?.result?.claimed) { claimed = false; break; }
+    }
+    if (claimed) { entry.established = true; return true; }
+  }
+  throw new Error("Page lease claim contention");
+}
+
+// One explicit CAS per world. Ordinary install/effect/cleanup functions never
+// adopt a different lease. A same-token claim cannot reset an advanced floor.
+function injectPageLease(world, operation, observed, leaseId, workerToken) {
+  const key = world === "MAIN" ? "__freeTtsPlayback" : "__freeTtsView";
+  const previous = window[key];
+  const current = { leaseId: previous?.leaseId ?? null, lifecycleFloor: previous?.lifecycleFloor ?? 0 };
+  if (operation === "read") return current;
+  if (operation !== "claim" || current.leaseId !== observed.leaseId || current.lifecycleFloor !== observed.lifecycleFloor) return { ...current, claimed: false };
+  if (current.leaseId === leaseId) return { ...current, claimed: true };
+  if (world === "MAIN") {
+    if (window.__freeTtsKeepalive) { clearInterval(window.__freeTtsKeepalive); window.__freeTtsKeepalive = null; }
+    if ("mediaSession" in navigator) {
+      for (const action of ["play", "pause", "previoustrack", "nexttrack", "stop"]) {
+        try { navigator.mediaSession.setActionHandler(action, null); } catch {}
+      }
+      try { navigator.mediaSession.metadata = null; } catch {}
+      try { navigator.mediaSession.playbackState = "none"; } catch {}
+    }
+    if (previous) { previous.retired = true; previous.desiredPaused = true; previous.startSerial++; }
+    const audio = previous?.audio || window.__freeTtsAudio;
+    try { audio?.pause(); } catch {}
+    try { if (audio) audio.src = ""; } catch {}
+    window.__freeTtsAudio = null;
+  } else {
+    if (previous) previous.retired = true;
+    document.querySelectorAll(".free-tts-highlight-overlay").forEach(element => element.remove());
+    delete window.__freeTtsSentences; delete window.__freeTtsColor;
+    window.__freeTtsCleanupControlBar?.();
+  }
+  window[key] = { leaseId, workerId: workerToken, lifecycleFloor: 0, sessionId: null, lifecycleRevision: null, retired: true };
+  return { leaseId, lifecycleFloor: 0, claimed: true };
+}
+
 // The short install barrier contains no storage, fetch, highlight, or play wait.
 async function installPlayback(pipeline) {
   const owner = pageOwner(pipeline);
-  await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN", func: injectPlaybackSession, args: [owner, workerId] });
+  if (!await establishPageLease(pipeline) || !ownsPipeline(pipeline)) return;
+  const [main] = await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN", func: injectPlaybackSession, args: [owner, workerId] });
   if (!ownsPipeline(pipeline)) return;
-  await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, func: (binding) => {
-    const previous = window.__freeTtsView;
-    if (previous?.leaseId === binding.leaseId && previous.lifecycleRevision >= binding.lifecycleRevision) return;
-    window.__freeTtsView = { ...binding, viewRevision: 0, barCreated: false, pendingRender: null };
-  }, args: [owner] });
+  if (!main?.result?.installed) throw new Error("MAIN session installation rejected");
+  const [view] = await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, func: injectViewSession, args: [owner] });
   if (!ownsPipeline(pipeline)) return;
-  await selectAttempt(pipeline, pipeline.attempt);
+  if (!view?.result?.installed) throw new Error("Isolated session installation rejected");
+  await selectAttempt(pipeline, pipeline.attempt, true);
+}
+
+function injectViewSession(owner) {
+  const previous = window.__freeTtsView;
+  if (!previous || previous.leaseId !== owner.leaseId || owner.lifecycleRevision < previous.lifecycleFloor) return { installed: false };
+  if (owner.lifecycleRevision === previous.lifecycleFloor) return { installed: !previous.retired && previous.sessionId === owner.sessionId };
+  previous.retired = true;
+  document.querySelectorAll(".free-tts-highlight-overlay").forEach(element => element.remove());
+  delete window.__freeTtsSentences; delete window.__freeTtsColor;
+  window.__freeTtsCleanupControlBar?.();
+  window.__freeTtsView = { ...owner, lifecycleFloor: owner.lifecycleRevision, retired: false, viewRevision: 0, barCreated: false, pendingRender: null };
+  return { installed: true };
 }
 
 function injectPlaybackSession(owner, workerToken) {
   const previous = window.__freeTtsPlayback;
-  if (previous?.leaseId === owner.leaseId && previous.lifecycleFloor >= owner.lifecycleRevision) return;
-  if (previous?.audio) { previous.audio.pause(); previous.audio.src = ""; }
-  const record = window.__freeTtsPlayback = { ...owner, workerId: workerToken, lifecycleFloor: owner.lifecycleRevision,
+  if (!previous || previous.leaseId !== owner.leaseId || owner.lifecycleRevision < previous.lifecycleFloor) return { installed: false };
+  if (owner.lifecycleRevision === previous.lifecycleFloor) return { installed: !previous.retired && previous.sessionId === owner.sessionId };
+  previous.retired = true;
+  if (window.__freeTtsKeepalive) { clearInterval(window.__freeTtsKeepalive); window.__freeTtsKeepalive = null; }
+  if ("mediaSession" in navigator) {
+    for (const action of ["play", "pause", "previoustrack", "nexttrack", "stop"]) {
+      try { navigator.mediaSession.setActionHandler(action, null); } catch {}
+    }
+    try { navigator.mediaSession.metadata = null; } catch {}
+    try { navigator.mediaSession.playbackState = "none"; } catch {}
+  }
+  try { previous.audio?.pause(); } catch {}
+  try { if (previous.audio) previous.audio.src = ""; } catch {}
+  const record = window.__freeTtsPlayback = { ...owner, workerId: workerToken, lifecycleFloor: owner.lifecycleRevision, retired: false,
     workerIntentRevision: 0, mediaRevision: 0, mediaSequence: 0, desiredPaused: true, attemptFloor: 0, attemptId: null,
     audio: null, audioId: null, audioStatus: "none", startSerial: 0, audioRevision: 0, audioError: null };
   window.__freeTtsAudio = null;
@@ -350,14 +499,14 @@ function injectPlaybackSession(owner, workerToken) {
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
   };
   record.play = () => {
-    if (record !== window.__freeTtsPlayback || record.desiredPaused || !record.audio || record.audio.ended || ["starting", "playing"].includes(record.audioStatus)) return;
+    if (record !== window.__freeTtsPlayback || record.retired || record.desiredPaused || !record.audio || record.audio.ended || ["starting", "playing"].includes(record.audioStatus)) return;
     const audio = record.audio, serial = ++record.startSerial, attemptId = record.attemptId;
     const audioId = record.audioId;
     record.audioStatus = "starting"; record.audioError = null; record.audioRevision++;
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
     // Newer running intents may retain this invocation. Reconcile its outcome
     // with the current running snapshot; an applied pause invalidates its serial.
-    const live = () => record === window.__freeTtsPlayback && record.audio === audio && record.audioId === audioId &&
+    const live = () => record === window.__freeTtsPlayback && !record.retired && record.audio === audio && record.audioId === audioId &&
       record.attemptId === attemptId && record.startSerial === serial && !record.desiredPaused;
     const settled = (error) => {
       if (!live()) return;
@@ -369,29 +518,31 @@ function injectPlaybackSession(owner, workerToken) {
     };
     try { Promise.resolve(audio.play()).then(() => settled(null), settled); } catch (error) { settled(error); }
   };
+  return { installed: true };
 }
 
-function selectAttempt(pipeline, attempt) {
+function selectAttempt(pipeline, attempt, installed = false) {
   if (!ownsPipeline(pipeline, attempt)) return Promise.resolve(null);
   if (!attempt.selectionPromise) {
     const capability = workerIntent(pipeline);
-    attempt.selectionPromise = chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
-      func: injectSelectAttempt, args: [capability] }).then(([result]) => {
+    attempt.selectionPromise = (async () => {
+      if (!installed) await pipeline.installPromise;
+      if (!ownsPipeline(pipeline, attempt)) return null;
+      const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
+        func: injectSelectAttempt, args: [capability] });
       if (!ownsPipeline(pipeline, attempt)) return null;
       attempt.selectionReceipt = result?.result;
-      // Selection, loading, and running intent may finish in any order. Each
-      // boundary continues the same attempt once the other two are confirmed.
       requestActivation(pipeline, attempt);
       return attempt.selectionReceipt;
-    });
+    })();
   }
   return attempt.selectionPromise;
 }
 
 function injectSelectAttempt(capability) {
   const record = window.__freeTtsPlayback;
-  if (!record) return null;
-  if (record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.attemptId < record.attemptFloor) return record.receipt("stale");
+  if (!record?.receipt) return null;
+  if (record.retired || record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.attemptId < record.attemptFloor) return record.receipt("stale");
   if (capability.attemptId === record.attemptId) return record.receipt("idempotent");
   record.startSerial++;
   if (record.audio) { record.audio.pause(); record.audio.src = ""; record.audioRevision++; }
@@ -403,8 +554,8 @@ function injectSelectAttempt(capability) {
 
 function injectWorkerIntent(capability) {
   const record = window.__freeTtsPlayback;
-  if (!record) return null;
-  if (record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.intentRevision < record.workerIntentRevision) return record.receipt("stale");
+  if (!record?.receipt) return null;
+  if (record.retired || record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision || capability.intentRevision < record.workerIntentRevision) return record.receipt("stale");
   if (capability.intentRevision === record.workerIntentRevision) return record.receipt("idempotent");
   record.workerIntentRevision = capability.intentRevision;
   if (capability.mediaBase !== record.mediaRevision) return record.receipt("superseded-by-media");
@@ -416,8 +567,8 @@ function injectWorkerIntent(capability) {
 
 function injectActivation(capability) {
   const record = window.__freeTtsPlayback;
-  if (!record) return null;
-  if (record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision ||
+  if (!record?.receipt) return null;
+  if (record.retired || record.leaseId !== capability.leaseId || record.sessionId !== capability.sessionId || record.lifecycleRevision !== capability.lifecycleRevision ||
       record.attemptId !== capability.attemptId || record.workerIntentRevision !== capability.intentRevision || record.mediaRevision !== capability.mediaRevision || record.desiredPaused || record.audioStatus === "ended") return record.receipt("no-effect");
   if (!record.audio) {
     const audio = new Audio(capability.dataUrl);
@@ -457,36 +608,42 @@ async function syncPausedState(paused) {
 
 // Relay installed in the ISOLATED world: forwards MAIN-world postMessages to
 // the service worker. Idempotent so repeated setup calls don't stack listeners.
-function injectMediaRelay() {
+function injectMediaRelay(owner) {
+  const view = window.__freeTtsView;
+  if (!view || view.retired || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision) return;
   if (window.__freeTtsRelayInstalled) return;
   window.__freeTtsRelayInstalled = true;
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const data = event.data;
     if (!data || data.__freeTtsMedia !== true || typeof data.action !== "string") return;
-    try { chrome.runtime.sendMessage({ action: data.action }).catch(() => {}); } catch {}
+    try { chrome.runtime.sendMessage({ ...data, source: "media" }).catch(() => {}); } catch {}
   });
 }
 
 // Media session set up in the MAIN world.
-function injectMediaSession() {
+function injectMediaSession(owner) {
   if (!("mediaSession" in navigator)) return;
   const record = window.__freeTtsPlayback;
+  if (!record || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId || record.lifecycleRevision !== owner.lifecycleRevision) return;
+  const live = () => record === window.__freeTtsPlayback && !record.retired;
   const send = (action) => {
-    try { window.postMessage({ __freeTtsMedia: true, action }, "*"); } catch {}
+    if (!live()) return;
+    try { window.postMessage({ __freeTtsMedia: true, action, leaseId: owner.leaseId, sessionId: owner.sessionId,
+      lifecycleRevision: owner.lifecycleRevision }, "*"); } catch {}
   };
 
   // Play/pause: directly control the Audio element for latency (no service
   // worker round-trip), then notify the worker so it syncs sentencePipeline
   // state and the floating control bar / context menu.
   navigator.mediaSession.setActionHandler("play", () => {
-    if (!record || record !== window.__freeTtsPlayback) return;
+    if (!live()) return;
     record.desiredPaused = false;
     record.play();
     send("mediaResume");
   });
   navigator.mediaSession.setActionHandler("pause", () => {
-    if (!record || record !== window.__freeTtsPlayback) return;
+    if (!live()) return;
     record.desiredPaused = true;
     record.pause();
     send("mediaPause");
@@ -508,35 +665,47 @@ function injectMediaSession() {
   window.__freeTtsKeepalive = setInterval(() => send("ping"), 25000);
 }
 
-function clearMediaSession() {
-  if (window.__freeTtsKeepalive) {
-    clearInterval(window.__freeTtsKeepalive);
-    window.__freeTtsKeepalive = null;
+function clearMediaSession(owner, retirementRevision) {
+  const record = window.__freeTtsPlayback;
+  if (!record || record.leaseId !== owner.leaseId || record.lifecycleFloor > retirementRevision ||
+      record.lifecycleRevision > owner.lifecycleRevision ||
+      (record.lifecycleRevision === owner.lifecycleRevision && record.sessionId !== owner.sessionId)) return { errors: [] };
+  record.lifecycleFloor = retirementRevision;
+  record.retired = true; record.desiredPaused = true; record.startSerial++;
+  const errors = [], attempt = effect => { try { effect(); } catch (error) { errors.push(error.message || String(error)); } };
+  // Retain this tombstone even when installation has not yet completed.
+  attempt(() => { if (window.__freeTtsKeepalive) clearInterval(window.__freeTtsKeepalive); });
+  window.__freeTtsKeepalive = null;
+  if ("mediaSession" in navigator) {
+    for (const action of ["play", "pause", "previoustrack", "nexttrack", "stop"]) attempt(() => navigator.mediaSession.setActionHandler(action, null));
+    attempt(() => { navigator.mediaSession.metadata = null; });
+    attempt(() => { navigator.mediaSession.playbackState = "none"; });
   }
-  if (!("mediaSession" in navigator)) return;
-  for (const action of ["play", "pause", "previoustrack", "nexttrack", "stop"]) {
-    try { navigator.mediaSession.setActionHandler(action, null); } catch {}
-  }
-  navigator.mediaSession.metadata = null;
-  try { navigator.mediaSession.playbackState = "none"; } catch {}
+  const audio = record.audio;
+  attempt(() => audio?.pause());
+  attempt(() => { if (audio) audio.src = ""; });
+  record.audio = null; record.audioId = null; record.audioStatus = "none"; record.audioError = null; record.audioRevision++;
+  window.__freeTtsAudio = null;
+  return { errors };
 }
 
-async function setupMediaSession(tabId) {
+async function setupMediaSession(pipeline) {
+  const owner = pageOwner(pipeline);
+  await pipeline.installPromise;
+  if (!ownsPipeline(pipeline)) return;
   try {
-    // Relay first (isolated world), then handlers (main world).
-    await chrome.scripting.executeScript({ target: { tabId }, func: injectMediaRelay });
-    await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: injectMediaSession });
+    await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, func: injectMediaRelay, args: [owner] });
+    if (!ownsPipeline(pipeline)) return;
+    await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN", func: injectMediaSession, args: [owner] });
   } catch (error) {
-    logError("setting up media session", error);
+    failOwnedPlayback(pipeline, "page-operation-failure", error);
   }
 }
 
-async function cleanupMediaSession(tabId) {
-  try {
-    await chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", func: clearMediaSession });
-  } catch (error) {
-    logError("cleaning up media session", error);
-  }
+async function cleanupMediaSession(owner, retirementRevision) {
+  const [result] = await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, world: "MAIN",
+    func: clearMediaSession, args: [owner, retirementRevision] });
+  if (result?.result?.errors?.length) throw new Error(result.result.errors.join("; "));
 }
 
 // --- Control bar -----------------------------------------------------------
@@ -567,16 +736,21 @@ async function getRepeatCurrentState(tabId) {
 }
 
 async function showControlBar(owner, snapshot, modes) {
+  await owner.installPromise;
+  if (!ownsPipeline(owner)) return "deferred";
   try {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: owner.tabId },
       func: (binding, supplied, suppliedModes) => {
         const view = window.__freeTtsView;
-        if (!view || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
+        if (!view || view.retired || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
         if (view.barCreated) return "rendered";
         const pending = view.pendingRender;
         const latest = pending && pending.snapshot.viewRevision > supplied.viewRevision ? pending : { snapshot: supplied, modes: suppliedModes };
-        const sendBarMessage = message => chrome.runtime.sendMessage({ ...message, source: "bar", leaseId: binding.leaseId,
+        let alive = true;
+        const selectionTimers = new Set();
+        const live = () => alive && view === window.__freeTtsView && !view.retired;
+        const sendBarMessage = message => live() && chrome.runtime.sendMessage({ ...message, source: "bar", leaseId: binding.leaseId,
           sessionId: binding.sessionId, lifecycleRevision: binding.lifecycleRevision });
         const paused = latest.snapshot.state === "paused";
         const initialLoopEnabled = latest.modes.loopEnabled, initialRepeatCurrent = latest.modes.repeatCurrentEnabled;
@@ -612,12 +786,13 @@ async function showControlBar(owner, snapshot, modes) {
         loopCheck.checked = initialLoopEnabled !== false;
         loopCheck.style.cssText = "margin:0;cursor:pointer;";
         loopCheck.addEventListener("change", () => {
+          if (!live()) return;
           if (loopCheck.checked) {
             const repeatCurrent = document.getElementById("free-tts-repeat-current");
             if (repeatCurrent) repeatCurrent.checked = false;
           }
           window.__freeTtsLoop = loopCheck.checked;
-          chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked });
+          sendBarMessage({ action: "setLoopState", enabled: loopCheck.checked });
         });
         loopLabel.appendChild(loopCheck);
         loopLabel.appendChild(document.createTextNode("↻"));
@@ -634,11 +809,12 @@ async function showControlBar(owner, snapshot, modes) {
         repeatCurrentCheck.checked = initialRepeatCurrent === true;
         repeatCurrentCheck.style.cssText = "margin:0;cursor:pointer;";
         repeatCurrentCheck.addEventListener("change", () => {
+          if (!live()) return;
           if (repeatCurrentCheck.checked) {
             const loop = document.getElementById("free-tts-loop");
             if (loop) loop.checked = false;
           }
-          chrome.runtime.sendMessage({ action: "setRepeatCurrentState", enabled: repeatCurrentCheck.checked });
+          sendBarMessage({ action: "setRepeatCurrentState", enabled: repeatCurrentCheck.checked });
         });
         repeatCurrentLabel.appendChild(repeatCurrentCheck);
         repeatCurrentLabel.appendChild(document.createTextNode("↻1"));
@@ -655,7 +831,7 @@ async function showControlBar(owner, snapshot, modes) {
         // --- Drag to move ---
         let drag = false, startX, startY, startLeft, startTop;
         bar.addEventListener("mousedown", (e) => {
-          if (e.target.tagName === "BUTTON") return;  // don't drag when clicking buttons
+          if (!live() || e.target.tagName === "BUTTON") return;  // don't drag when clicking buttons
           drag = true;
           startX = e.clientX; startY = e.clientY;
           const rect = bar.getBoundingClientRect();
@@ -663,7 +839,7 @@ async function showControlBar(owner, snapshot, modes) {
           e.preventDefault();
         });
         const onMouseMove = (e) => {
-          if (!drag) return;
+          if (!live() || !drag) return;
           bar.style.transform = "none";
           bar.style.left = (startLeft + e.clientX - startX) + "px";
           bar.style.top = (startTop + e.clientY - startY) + "px";
@@ -673,23 +849,24 @@ async function showControlBar(owner, snapshot, modes) {
         document.addEventListener("mouseup", onDragMouseUp);
 
         // --- Button handlers ---
-        bar.querySelector("#free-tts-prev").addEventListener("click", () => chrome.runtime.sendMessage({ action: "prevSentence" }));
-        bar.querySelector("#free-tts-next").addEventListener("click", () => chrome.runtime.sendMessage({ action: "nextSentence" }));
+        bar.querySelector("#free-tts-prev").addEventListener("click", () => sendBarMessage({ action: "prevSentence" }));
+        bar.querySelector("#free-tts-next").addEventListener("click", () => sendBarMessage({ action: "nextSentence" }));
         bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
           sendBarMessage({ action: "togglePlayback" });
         });
-        bar.querySelector("#free-tts-close").addEventListener("click", () => chrome.runtime.sendMessage({ action: "stopPlayback" }));
+        bar.querySelector("#free-tts-close").addEventListener("click", () => sendBarMessage({ action: "stopPlayback" }));
 
         // --- ESC key stops playback ---
         const onKeyDown = (e) => {
           if (e.key === "Escape") {
-            chrome.runtime.sendMessage({ action: "stopPlayback" });
+            sendBarMessage({ action: "stopPlayback" });
           }
         };
         document.addEventListener("keydown", onKeyDown);
 
         // --- Double-click to jump to sentence ---
         const onDoubleClick = () => {
+          if (!live()) return;
           const sel = window.getSelection();
           if (!sel || !sel.toString().trim()) return;
           const word = sel.toString().trim();
@@ -697,7 +874,7 @@ async function showControlBar(owner, snapshot, modes) {
           if (!sents) return;
           for (let i = 0; i < sents.length; i++) {
             if (sents[i].includes(word)) {
-              chrome.runtime.sendMessage({ action: "jumpToSentence", idx: i });
+              sendBarMessage({ action: "jumpToSentence", idx: i });
               return;
             }
           }
@@ -706,7 +883,10 @@ async function showControlBar(owner, snapshot, modes) {
 
         // --- Drag-select to jump to sentence ---
         const onSelectionMouseUp = () => {
-          setTimeout(() => {
+          if (!live()) return;
+          const timer = setTimeout(() => {
+            selectionTimers.delete(timer);
+            if (!live()) return;
             const sel = window.getSelection();
             if (!sel || sel.isCollapsed) return;
             const text = sel.toString().trim();
@@ -715,23 +895,29 @@ async function showControlBar(owner, snapshot, modes) {
             if (!sents) return;
             for (let i = 0; i < sents.length; i++) {
               if (sents[i].includes(text)) {
-                chrome.runtime.sendMessage({ action: "jumpToSentence", idx: i });
+                sendBarMessage({ action: "jumpToSentence", idx: i });
                 return;
               }
             }
           }, 100);
+          selectionTimers.add(timer);
         };
         document.addEventListener("mouseup", onSelectionMouseUp);
 
-        window.__freeTtsCleanupControlBar = () => {
+        const cleanup = () => {
+          if (!alive) return;
+          alive = false; drag = false;
+          for (const timer of selectionTimers) clearTimeout(timer);
+          selectionTimers.clear();
           document.removeEventListener("mousemove", onMouseMove);
           document.removeEventListener("mouseup", onDragMouseUp);
           document.removeEventListener("dblclick", onDoubleClick);
           document.removeEventListener("mouseup", onSelectionMouseUp);
           document.removeEventListener("keydown", onKeyDown);
-          document.getElementById("free-tts-bar")?.remove();
-          delete window.__freeTtsCleanupControlBar;
+          bar.remove();
+          if (window.__freeTtsCleanupControlBar === cleanup) delete window.__freeTtsCleanupControlBar;
         };
+        window.__freeTtsCleanupControlBar = cleanup;
         return "rendered";
       },
       args: [pageOwner(owner), snapshot, modes],
@@ -753,7 +939,7 @@ async function updateControlBar(owner, snapshot, modes) {
       target: { tabId: owner.tabId },
       func: (binding, current, currentModes) => {
         const view = window.__freeTtsView;
-        if (!view || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
+        if (!view || view.retired || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
         if (current.viewRevision < view.viewRevision) return "rendered";
         if (!view.barCreated) {
           if (!view.pendingRender || current.viewRevision >= view.pendingRender.snapshot.viewRevision) view.pendingRender = { snapshot: current, modes: currentModes };
@@ -779,78 +965,81 @@ async function updateControlBar(owner, snapshot, modes) {
   }
 }
 
-async function hideControlBar(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        if (typeof window.__freeTtsCleanupControlBar === "function") {
-          window.__freeTtsCleanupControlBar();
-        } else {
-          document.getElementById("free-tts-bar")?.remove();
-        }
-      },
-    });
-  } catch (error) {
-    logError("hiding control bar", error);
-  }
+async function hideControlBar(owner, retirementRevision) {
+  await chrome.scripting.executeScript({
+    target: { tabId: owner.tabId },
+    func: (binding, floor) => {
+      const view = window.__freeTtsView;
+      if (!view || view.leaseId !== binding.leaseId || view.lifecycleFloor > floor ||
+          view.lifecycleRevision > binding.lifecycleRevision ||
+          (view.lifecycleRevision === binding.lifecycleRevision && view.sessionId !== binding.sessionId)) return;
+      view.lifecycleFloor = floor; view.retired = true;
+      view.pendingRender = null; view.barCreated = false;
+      if (typeof window.__freeTtsCleanupControlBar === "function") window.__freeTtsCleanupControlBar();
+      else document.getElementById("free-tts-bar")?.remove();
+    }, args: [owner, retirementRevision],
+  });
 }
 
 // --- Prev/next sentence ----------------------------------------------------
+function injectNavigationStop(owner, attemptId) {
+  const record = window.__freeTtsPlayback;
+  if (!record || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
+      record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId) return;
+  record.pause();
+  if (record.audio) record.audio.src = "";
+}
+
 async function prevSentence() {
-  if (!sentencePipeline || sentencePipeline.currentIdx <= 0) return;
+  const pipeline = sentencePipeline, attempt = pipeline?.attempt;
+  if (!ownsPipeline(pipeline) || pipeline.currentIdx <= 0) return;
   // currentIdx is the sentence currently playing (increment happens only after
   // playback ends), so go back one to reach the previous sentence.
-  sentencePipeline.currentIdx -= 1;
-  if (sentencePipeline.currentIdx < 0) sentencePipeline.currentIdx = 0;
-  sentencePipeline.isPaused = false;
-  // Stop current audio
+  pipeline.currentIdx -= 1;
+  if (pipeline.currentIdx < 0) pipeline.currentIdx = 0;
+  pipeline.isPaused = false;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: sentencePipeline.tabId },
-      world: "MAIN",
-      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
-    });
+    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
+      func: injectNavigationStop, args: [pageOwner(pipeline), attempt.attemptId] });
   } catch (error) {
-    logError("stopping current audio before previous sentence", error);
+    if (ownsPipeline(pipeline)) logError("stopping current audio before previous sentence", error);
   }
-  updateControlBar(sentencePipeline.tabId, false);
+  if (!ownsPipeline(pipeline) || pipeline.attempt !== attempt) return;
+  void updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
   await playNextSentence();
 }
 
 async function nextSentence() {
-  if (!sentencePipeline) return;
-  sentencePipeline.isPaused = false;
-  sentencePipeline.currentIdx++;  // skip to next
+  const pipeline = sentencePipeline, attempt = pipeline?.attempt;
+  if (!ownsPipeline(pipeline)) return;
+  pipeline.isPaused = false;
+  pipeline.currentIdx++;  // skip to next
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: sentencePipeline.tabId },
-      world: "MAIN",
-      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
-    });
+    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
+      func: injectNavigationStop, args: [pageOwner(pipeline), attempt.attemptId] });
   } catch (error) {
-    logError("stopping current audio before next sentence", error);
+    if (ownsPipeline(pipeline)) logError("stopping current audio before next sentence", error);
   }
-  updateControlBar(sentencePipeline.tabId, false);
+  if (!ownsPipeline(pipeline) || pipeline.attempt !== attempt) return;
+  void updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
   await playNextSentence();
 }
 
 // --- Jump to sentence -------------------------------------------------------
 async function jumpToSentence(idx) {
-  if (!sentencePipeline) return;
-  if (idx < 0 || idx >= sentencePipeline.sentences.length) return;
-  sentencePipeline.currentIdx = idx;
-  sentencePipeline.isPaused = false;
+  const pipeline = sentencePipeline, attempt = pipeline?.attempt;
+  if (!ownsPipeline(pipeline)) return;
+  if (idx < 0 || idx >= pipeline.sentences.length) return;
+  pipeline.currentIdx = idx;
+  pipeline.isPaused = false;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: sentencePipeline.tabId },
-      world: "MAIN",
-      func: () => { const s = window.__freeTtsAudio; if (s) { s.pause(); s.src = ""; } },
-    });
+    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
+      func: injectNavigationStop, args: [pageOwner(pipeline), attempt.attemptId] });
   } catch (error) {
-    logError("stopping current audio before sentence jump", error);
+    if (ownsPipeline(pipeline)) logError("stopping current audio before sentence jump", error);
   }
-  updateControlBar(sentencePipeline.tabId, false);
+  if (!ownsPipeline(pipeline) || pipeline.attempt !== attempt) return;
+  void updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
   await playNextSentence();
 }
 
@@ -865,22 +1054,25 @@ function splitSentences(text) {
 
 // --- In-page sentence wrapping + highlight + scroll -----------------------
 async function initPageHighlighting(tabId, sentences, pipeline = sentencePipeline) {
-  const { highlightColor } = await chrome.storage.sync.get({ highlightColor: "#fff3cd" });
-  if (!ownsPipeline(pipeline)) return;
-  const safeHighlightColor = normalizeColor(highlightColor);
   try {
+    if (!ownsPipeline(pipeline)) return;
+    const { highlightColor } = await chrome.storage.sync.get({ highlightColor: "#fff3cd" });
+    if (!ownsPipeline(pipeline)) return;
+    await pipeline.installPromise;
+    if (!ownsPipeline(pipeline)) return;
+    const safeHighlightColor = normalizeColor(highlightColor);
     await chrome.scripting.executeScript({
       target: { tabId },
       func: (sents, color, owner) => {
         const view = window.__freeTtsView;
-        if (!view || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision) return;
+        if (!view || view.retired || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision) return;
         window.__freeTtsSentences = sents;
         window.__freeTtsColor = color;
       },
       args: [sentences, safeHighlightColor, pageOwner(pipeline)],
     });
   } catch (error) {
-    logError("initializing page highlighting", error);
+    if (ownsPipeline(pipeline)) logError("initializing page highlighting", error);
   }
 }
 
@@ -891,7 +1083,7 @@ async function highlightCurrentSentence(tabId, idx, pipeline = sentencePipeline,
       target: { tabId },
       func: (idx, owner, attemptId) => {
         const view = window.__freeTtsView;
-        if (!view || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision || attemptId < (view.attemptFloor || 0)) return;
+        if (!view || view.retired || view.leaseId !== owner.leaseId || view.sessionId !== owner.sessionId || view.lifecycleRevision !== owner.lifecycleRevision || attemptId < (view.attemptFloor || 0)) return;
         view.attemptFloor = attemptId;
         const color = window.__freeTtsColor || "#fff3cd";
         const sentence = window.__freeTtsSentences[idx];
@@ -938,23 +1130,24 @@ async function highlightCurrentSentence(tabId, idx, pipeline = sentencePipeline,
       args: [idx, pageOwner(pipeline), attempt.attemptId],
     });
   } catch (error) {
-    logError("highlighting current sentence", error);
+    if (ownsPipeline(pipeline, attempt)) logError("highlighting current sentence", error);
   }
 }
 
-async function cleanupPageHighlighting(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        document.querySelectorAll(".free-tts-highlight-overlay").forEach(el => el.remove());
-        delete window.__freeTtsSentences;
-        delete window.__freeTtsColor;
-      },
-    });
-  } catch (error) {
-    logError("cleaning page highlighting", error);
-  }
+async function cleanupPageHighlighting(owner, retirementRevision) {
+  await chrome.scripting.executeScript({
+    target: { tabId: owner.tabId },
+    func: (binding, floor) => {
+      const view = window.__freeTtsView;
+      if (!view || view.leaseId !== binding.leaseId || view.lifecycleFloor > floor ||
+          view.lifecycleRevision > binding.lifecycleRevision ||
+          (view.lifecycleRevision === binding.lifecycleRevision && view.sessionId !== binding.sessionId)) return;
+      view.lifecycleFloor = floor; view.retired = true; view.pendingRender = null;
+      document.querySelectorAll(".free-tts-highlight-overlay").forEach(el => el.remove());
+      delete window.__freeTtsSentences;
+      delete window.__freeTtsColor;
+    }, args: [owner, retirementRevision],
+  });
 }
 
 // --- Fetch audio for one sentence ------------------------------------------
@@ -998,10 +1191,11 @@ async function startSentenceTTS(tabId, text, ticket = null) {
   if (!sentences.length) return commandResponse(false);
   ticket ||= startTicket();
   if (ticket.cancelled || ticket !== pendingStart) return commandResponse(false);
-  if (sentencePipeline) void stopPlayback(sentencePipeline, false);
-  if (!pageLeases.has(tabId)) pageLeases.set(tabId, crypto.randomUUID());
+  if (ownsPipeline(sentencePipeline)) void stopPlayback(sentencePipeline, false);
+  pendingStart = null;
+  if (!pageLeases.has(tabId)) pageLeases.set(tabId, { leaseId: crypto.randomUUID(), established: false, promise: null, closed: false });
   const pipeline = sentencePipeline = {
-    tabId, leaseId: pageLeases.get(tabId), sessionId: crypto.randomUUID(), lifecycleRevision: ++lifecycleRevision,
+    tabId, leaseId: pageLeases.get(tabId).leaseId, sessionId: crypto.randomUUID(), lifecycleRevision: ++lifecycleRevision,
     sentences, currentIdx: 0, cache: new Map(), voice: null, serverUrl: null, speed: 0, isPaused: false,
     loopEnabled: true, repeatCurrentEnabled: false, intentRevision: 1, localIntentFloor: 1,
     mediaRevision: 0, lastMediaSequence: 0, nextAttemptId: 0, attempt: null, cancelled: false, initialized: false,
@@ -1011,16 +1205,19 @@ async function startSentenceTTS(tabId, text, ticket = null) {
   viewRevision++;
   createAttempt(pipeline, "initializing");
   const capability = workerIntent(pipeline);
-  pipeline.installPromise = installPlayback(pipeline);
-  pipeline.initializationPromise = initializePlayback(pipeline).catch(error => {
-    if (ownsPipeline(pipeline)) { logError("initializing playback", error); lastError = { code: "settings-failure", message: error.message }; void stopPlayback(pipeline, false); }
+  pipeline.installPromise = installPlayback(pipeline).catch(error => {
+    failOwnedPlayback(pipeline, "page-operation-failure", error);
+    return null;
   });
-  pipeline.installPromise.then(() => {
-    if (ownsPipeline(pipeline)) void showControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
-  }).catch(error => logError("installing playback", error));
+  pipeline.initializationPromise = initializePlayback(pipeline).catch(error => {
+    failOwnedPlayback(pipeline, "settings-failure", error);
+  });
+  void pipeline.installPromise.then(() => {
+    if (ownsPipeline(pipeline)) return showControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+  }).catch(error => { if (ownsPipeline(pipeline)) logError("installing playback", error); });
   const receipt = await applyWorkerIntent(pipeline, capability);
   if (ownsPipeline(pipeline)) await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
-  return commandResponse(true, receipt);
+  return commandResponse(true, receipt, pipeline.failure || null);
 }
 
 function createAttempt(pipeline, phase = "loading") {
@@ -1047,7 +1244,7 @@ async function initializePlayback(pipeline) {
   pipeline.serverUrl = normalizeServerUrl(settings.serverUrl); pipeline.voice = settings.voice; pipeline.speed = normalizeSpeed(settings.speed);
   await pipeline.installPromise;
   if (!ownsPipeline(pipeline)) return;
-  await setupMediaSession(pipeline.tabId);
+  await setupMediaSession(pipeline);
   if (!ownsPipeline(pipeline)) return;
   await initPageHighlighting(pipeline.tabId, pipeline.sentences, pipeline);
   if (!ownsPipeline(pipeline)) return;
@@ -1060,7 +1257,7 @@ async function initializePlayback(pipeline) {
 function preloadSentence(pipeline, idx) {
   fetchSentenceAudio(pipeline.serverUrl, pipeline.voice, pipeline.speed, pipeline.sentences[idx])
     .then(url => { if (ownsPipeline(pipeline)) pipeline.cache.set(idx, url); })
-    .catch(error => logError(`preloading sentence ${idx}`, error));
+    .catch(error => { if (ownsPipeline(pipeline)) logError(`preloading sentence ${idx}`, error); });
 }
 
 async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
@@ -1069,12 +1266,7 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
   const startIdx = currentIdx;
   if (currentIdx >= sentences.length) {
     if (pipeline.repeatCurrentEnabled || pipeline.loopEnabled) { pipeline.currentIdx = 0; return playNextSentence(pipeline); }
-    // Keep finalization bound to this owner across the existing cleanup awaits.
-    const clearPlayback = () => clearOwnedPlayback(pipeline);
-    await cleanupMediaSession(tabId);
-    await cleanupPageHighlighting(tabId);
-    await hideControlBar(tabId);
-    clearPlayback();
+    await stopPlayback(pipeline, false);
     return;
   }
   if (!attempt) {
@@ -1087,7 +1279,7 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
       await applyWorkerIntent(pipeline, workerIntent(pipeline));
     }
   }
-  if (!ownsPipeline(pipeline, attempt)) return;
+  if (!ownsAttempt(pipeline, attempt)) return;
   if (!attempt.loadPromise) attempt.loadPromise = (async () => {
     let dataUrl = cache.get(startIdx);
     const start = Date.now();
@@ -1114,7 +1306,7 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
     await attempt.loadPromise;
     if (ownsPipeline(pipeline, attempt) && !pipeline.isPaused) requestActivation(pipeline, attempt);
   } catch (error) {
-    if (ownsPipeline(pipeline, attempt)) { logError(`fetching sentence ${startIdx}`, error); lastError = { code: "load-failure", message: error.message }; void stopPlayback(pipeline, false); }
+    failOwnedPlayback(pipeline, "load-failure", error, attempt);
   }
 }
 
@@ -1143,7 +1335,7 @@ function requestActivation(pipeline, attempt) {
       adoptPageReceipt(pipeline, attempt, result?.result);
       if (attempt.audioId) scheduleCompletionPoll(pipeline, attempt);
     }).catch(error => {
-      if (ownsPipeline(pipeline, attempt) && pipeline.intentRevision === capability.intentRevision) { logError("activating audio", error); lastError = { code: "page-operation-failure", message: error.message }; void stopPlayback(pipeline, false); }
+      if (pipeline.intentRevision === capability.intentRevision) failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
     }).finally(() => { if (ownsPipeline(pipeline, attempt) && attempt.activationRequest === request) attempt.activationRequest = null; });
 }
 
@@ -1158,7 +1350,7 @@ async function pollCompletion(pipeline, attempt) {
   try {
     const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: (owner, attemptId, audioId) => {
       const record = window.__freeTtsPlayback;
-      if (!record || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
+      if (!record || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
           record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId ||
           record.audioId !== audioId || !record.audio) return { owned: false, status: "missing-or-stale" };
       const ended = !!record.audio.ended;
@@ -1195,8 +1387,10 @@ async function pollCompletion(pipeline, attempt) {
   } catch (error) {
     if (ownsPipeline(pipeline, attempt)) logError("polling playback", error);
   } finally {
-    attempt.pollInFlight = false;
-    if (ownsPipeline(pipeline, attempt)) scheduleCompletionPoll(pipeline, attempt);
+    if (ownsPipeline(pipeline, attempt)) {
+      attempt.pollInFlight = false;
+      scheduleCompletionPoll(pipeline, attempt);
+    }
   }
 }
 

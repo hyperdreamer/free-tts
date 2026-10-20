@@ -45,12 +45,12 @@ class ScriptGate {
 
 // Only the DOM operations used by setup/render/highlight are needed here. Gesture
 // behavior is exercised by the separately assigned real Chromium suite.
-function fixtureDocument() {
+function fixtureDocument(onRemove = () => {}) {
   const nodes = [];
   const element = (tagName) => {
     const node = { tagName: tagName.toUpperCase(), children: [], style: {}, attributes: {}, listeners: new Map(), textContent: '',
       appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
-      remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(n => n !== this); },
+      remove() { onRemove(this); if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(n => n !== this); },
       addEventListener(type, callback) { this.listeners.set(type, [...(this.listeners.get(type) || []), callback]); },
       removeEventListener(type, callback) { this.listeners.set(type, (this.listeners.get(type) || []).filter(fn => fn !== callback)); },
       setAttribute(name, value) { this.attributes[name] = String(value); },
@@ -73,19 +73,21 @@ function fixtureDocument() {
 }
 
 function harness() {
-  const clock = new VirtualClock(), scripts = new ScriptGate(), storage = [], fetches = [], messages = [], logs = [];
-  const audioSpy = { constructors: [], plays: [], pauses: [], writes: [], media: [] };
+  const clock = new VirtualClock(), scripts = new ScriptGate(), storage = [], fetches = [], queries = [], messages = [], logs = [];
+  let holdTabQueries = false, tabRemoved;
+  const audioSpy = { constructors: [], plays: [], pauses: [], writes: [], media: [], effects: [] };
   const pages = new Map(); let listener, commandListener;
   const timers = Object.fromEntries(['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'].map(key => [key, clock[key].bind(clock)]));
   const chrome = {
     runtime: { onMessage: { addListener(fn) { listener = fn; } } }, commands: { onCommand: { addListener(fn) { commandListener = fn; } } },
-    tabs: { query: async () => [{ id: 7 }] }, scripting: { executeScript: details => scripts.dispatch(details) },
+    tabs: { query() { if (!holdTabQueries) return Promise.resolve([{ id: 7 }]); const gate = new Deferred(); queries.push(gate); return gate.promise; },
+      onRemoved: { addListener(fn) { tabRemoved = fn; } } }, scripting: { executeScript: details => scripts.dispatch(details) },
     storage: { sync: { get(defaults) { const gate = new Deferred(); storage.push({ defaults, gate }); return gate.promise; } } },
   };
   const quietConsole = { error: (...args) => logs.push(args), warn: (...args) => logs.push(args), log() {} };
   function page(tabId, world = 'MAIN') {
     if (!pages.has(tabId)) {
-      const document = fixtureDocument(), contexts = {};
+      const document = fixtureDocument(node => audioSpy.effects.push({ kind: 'remove', id: node.id, className: node.className, tabId })), contexts = {};
       for (const name of ['MAIN', 'ISOLATED']) {
         const events = new Map(), context = { ...timers, console: quietConsole, document, NodeFilter: { SHOW_TEXT: 4 }, navigator: {}, scrollX: 0, scrollY: 0, innerHeight: 900, scrollTo() {},
           getSelection: () => ({ toString: () => 'First sentence. Second sentence.', isCollapsed: false }),
@@ -98,7 +100,8 @@ function harness() {
           context.chrome = { runtime: { sendMessage(message) { messages.push({ tabId, world: name, data: message }); return Promise.resolve(); } } };
           context.Audio = function () { assert.fail('Audio constructed outside MAIN'); };
         } else {
-          const media = { handlers: new Map(), setActionHandler(action, fn) { this.handlers.set(action, fn); } };
+          const media = { handlers: new Map(), setActionHandler(action, fn) { this.handlers.set(action, fn); audioSpy.effects.push({ kind: 'handler', action, cleared: fn === null, tabId }); } };
+          Object.defineProperty(media, 'metadata', { get() { return this.data; }, set(value) { this.data = value; audioSpy.effects.push({ kind: 'metadata', cleared: value === null, tabId }); } });
           Object.defineProperty(media, 'playbackState', { get() { return this.state; }, set(value) { this.state = value; audioSpy.media.push({ value, time: clock.now }); } });
           context.navigator.mediaSession = media; context.MediaMetadata = function (value) { Object.assign(this, value); };
           context.Audio = function (url) {
@@ -106,10 +109,10 @@ function harness() {
             let currentTime = 3, src = url;
             Object.defineProperties(this, {
               currentTime: { get: () => currentTime, set: value => { currentTime = value; audioSpy.writes.push({ audio: this, field: 'currentTime', value }); } },
-              src: { get: () => src, set: value => { src = value; audioSpy.writes.push({ audio: this, field: 'src', value }); } },
+              src: { get: () => src, set: value => { src = value; audioSpy.writes.push({ audio: this, field: 'src', value }); audioSpy.effects.push({ kind: 'src', value, tabId }); } },
             });
             this.play = () => { this.paused = false; const outcome = new Deferred(); audioSpy.plays.push({ audio: this, time: clock.now, intentRevision: context.__freeTtsPlayback?.workerIntentRevision, mediaRevision: context.__freeTtsPlayback?.mediaRevision, outcome }); return outcome.promise; };
-            this.pause = () => { this.paused = true; audioSpy.pauses.push({ audio: this, time: clock.now }); };
+            this.pause = () => { this.paused = true; audioSpy.pauses.push({ audio: this, time: clock.now }); audioSpy.effects.push({ kind: 'pause', audio: this, tabId, keepaliveActive: clock.timers.has(context.__freeTtsKeepalive) }); };
             audioSpy.constructors.push({ audio: this, url, tabId });
           };
         }
@@ -129,9 +132,12 @@ function harness() {
       return response.promise;
     },
   });
-  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, start: startSentenceTTS, poll: pollCompletion };`, worker);
+  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, get pendingStart() { return pendingStart; }, get leases() { return pageLeases; }, start: startSentenceTTS, stop: stopPlayback, poll: pollCompletion };`, worker);
   assert.equal(typeof commandListener, 'function');
-  const api = { clock, scripts, storage, fetches, audioSpy, messages, logs, worker: worker.__worker, page,
+  const api = { clock, scripts, storage, fetches, queries, audioSpy, messages, logs, worker: worker.__worker, page,
+    holdTabQueries(value = true) { holdTabQueries = value; },
+    shortcut: () => commandListener('speak-selection'),
+    closeTab: tabId => tabRemoved?.(tabId),
     start(text = 'First sentence. Second sentence.', tabId = 7) {
       const result = worker.__worker.start(tabId, text);
       const owner = worker.__worker.pipeline;
@@ -915,4 +921,392 @@ test('W11 pause_at_completion_decision', async t => {
     assert.equal(h.audioSpy.plays.length, originalPlayCount + 1);
     await h.finish();
   });
+});
+
+const selectionRead = entry => entry.source.includes('window.getSelection()?.toString()');
+const highlightInit = entry => entry.source.includes('window.__freeTtsSentences = sents');
+const sessionInstall = entry => entry.func.name === 'injectPlaybackSession';
+const leaseClaim = entry => entry.func.name === 'injectPageLease' && entry.args[1] === 'claim';
+const mediaSetup = entry => entry.func.name === 'injectMediaSession';
+
+function assertIdlePage(h, tabId = 7) {
+  assert.equal(h.page(tabId).__freeTtsAudio ?? null, null);
+  assert.equal(h.page(tabId).navigator.mediaSession.playbackState ?? 'none', 'none');
+  assert.equal(h.page(tabId, 'ISOLATED').document.getElementById('free-tts-bar'), null);
+  assert.equal(h.page(tabId, 'ISOLATED').__freeTtsSentences, undefined);
+}
+
+// Removing initializer ownership or the in-page retirement fence permits old
+// setup to recreate resources even though its worker has already stopped.
+test('W12 stop_initializer', async t => {
+  for (const boundary of ['target', 'selection', 'settings', 'session-install', 'lease-claim', 'media-setup', 'highlight-init']) await t.test(boundary, async () => {
+    const h = harness(); let started, held, settings;
+    if (boundary === 'target') {
+      h.holdTabQueries();
+      started = h.send({ action: 'speakSentences', text: 'First sentence.', source: 'popup' }, {});
+      assert.equal(h.queries.length, 1);
+    } else if (boundary === 'selection') {
+      started = h.shortcut(); await h.drain(); held = h.scripts.pending(selectionRead);
+    } else {
+      started = h.start();
+      settings = h.storage.find(entry => 'serverUrl' in entry.defaults);
+      const predicate = { 'session-install': sessionInstall, 'lease-claim': leaseClaim, 'media-setup': mediaSetup, 'highlight-init': highlightInit }[boundary];
+      await h.flush({ holdScript: predicate || (() => false), holdStorage: entry => boundary === 'settings' && entry === settings });
+      if (predicate) held = h.scripts.entries.find(entry => !entry.executed && predicate(entry));
+      if (boundary !== 'lease-claim' && predicate) assert.ok(held);
+    }
+    const stopped = h.send({ action: 'stopPlayback', source: 'popup' }, {});
+    assert.equal((await h.snapshot()).state, 'idle', 'retirement is public before cleanup completes');
+    await h.flush({ holdScript: entry => entry === held, holdStorage: entry => entry === settings });
+    await stopped;
+    const afterFence = h.scripts.entries.length;
+    if (boundary === 'target') h.queries[0].resolve([{ id: 7 }]);
+    if (held) { if (!held.executed) h.execute(held); await h.complete(held); }
+    await h.flush(); await started;
+    assert.equal(h.scripts.entries.length, afterFence, 'obsolete initialization dispatches no continuation after stop');
+    assert.equal((await h.snapshot()).state, 'idle'); assert.equal(h.worker.pipeline, null);
+    assert.equal(h.audioSpy.constructors.length, 0); assert.equal(h.audioSpy.plays.length, 0);
+    assertIdlePage(h); await h.finish();
+  });
+});
+
+// Publication by completion order, or retired cleanup rediscovering tab state,
+// would replace or erase the explicitly newer session in these schedules.
+test('W13 replace_initializer_latest_wins', async t => {
+  for (const boundary of ['target', 'settings']) for (const tabId of [7, 8]) await t.test(`${boundary}-successor-tab-${tabId}`, async () => {
+    const h = harness(); let first, oldSettings, oldPipeline;
+    if (boundary === 'target') {
+      h.holdTabQueries();
+      first = h.send({ action: 'speakSentences', text: 'First sentence.', source: 'popup' }, {});
+      assert.equal(h.worker.pipeline, null);
+    } else {
+      first = h.start(); oldPipeline = h.worker.pipeline;
+      oldSettings = h.storage.find(entry => 'serverUrl' in entry.defaults);
+      await h.flush({ holdStorage: entry => entry === oldSettings });
+      assert.equal(oldPipeline.attempt.phase, 'initializing');
+    }
+    const second = h.start('First sentence. Second sentence.', tabId), successor = h.worker.pipeline;
+    assert.ok(successor); assert.notEqual(successor, oldPipeline);
+    const retirement = h.scripts.entries.find(entry => !entry.executed && entry.func.name === 'clearMediaSession');
+    const holds = { holdStorage: entry => entry === oldSettings, holdScript: entry => entry === retirement };
+    await h.flush(holds); await h.clock.advance(200);
+    await h.flush(holds); await second;
+    assert.equal(h.worker.pipeline, successor);
+    assert.equal(h.page(tabId).__freeTtsPlayback.sessionId, successor.sessionId);
+    const audio = h.page(tabId).__freeTtsAudio, cache = [...successor.cache], scripts = h.scripts.entries.length;
+    assert.ok(audio, 'successor has activated');
+    if (boundary === 'target') h.queries[0].resolve([{ id: 7 }]);
+    else oldSettings.gate.resolve({ serverUrl: 'http://localhost:9999/old/', voice: 'old-voice', speed: 99 });
+    if (retirement) { h.execute(retirement); await h.complete(retirement); }
+    await h.flush(); await first;
+    assert.equal(h.scripts.entries.slice(scripts).some(entry => sessionInstall(entry) || mediaSetup(entry) || highlightInit(entry) || activation(entry)), false,
+      'losing start dispatches no further setup');
+    assert.equal(h.worker.pipeline, successor); assert.equal(h.worker.active.sessionId, successor.sessionId);
+    assert.equal(h.page(tabId).__freeTtsAudio, audio); assert.equal(audio.paused, false);
+    assert.equal(successor.serverUrl, 'http://localhost:5000');
+    assert.equal(successor.voice, 'en-US-AvaMultilingualNeural'); assert.equal(successor.speed, 0);
+    assert.deepEqual([...successor.cache], cache); assert.equal(successor.attempt.completionObservedWhilePaused, false);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+    assert.ok(h.page(tabId, 'ISOLATED').document.getElementById('free-tts-bar'));
+    if (tabId !== 7) assertIdlePage(h, 7);
+    await h.finish();
+  });
+});
+
+// A missing captured pipeline/attempt check would start obsolete audio, write
+// a retired cache, or replace successor highlights at one of these boundaries.
+test('W14 replace_pending_attempt_boundaries', async t => {
+  for (const boundary of ['cache', 'fetch', 'body', 'highlight', 'activation']) for (const tabId of [7, 8]) await t.test(`${boundary}-successor-tab-${tabId}`, async () => {
+    const h = harness(); const first = h.start(); let held;
+    if (boundary === 'fetch' || boundary === 'body') {
+      await h.flush({ holdResponse: () => true }); await h.clock.advance(10000); await h.drain();
+      assert.equal(h.fetches.length, 3);
+      if (boundary === 'body') { h.releaseResponse(h.fetches[2]); await h.drain(); }
+    } else if (boundary === 'cache') await h.flush();
+    else { await h.ready(boundary === 'highlight' ? highlight : activation); held = h.scripts.pending(boundary === 'highlight' ? highlight : activation); }
+    await first;
+    const predecessor = h.worker.pipeline, oldAttempt = predecessor.attempt, oldFetches = [...h.fetches], oldCache = [...predecessor.cache];
+    const second = h.start('First sentence. Second sentence.', tabId), successor = h.worker.pipeline;
+    assert.notEqual(successor, predecessor); assert.equal(predecessor.cancelled, true); assert.equal(oldAttempt.retired, true);
+    const retirement = h.scripts.entries.find(entry => !entry.executed && entry.func.name === 'clearMediaSession');
+    const holds = { holdScript: entry => entry === held || entry === retirement, holdResponse: entry => oldFetches.includes(entry), holdBody: entry => oldFetches.includes(entry) };
+    await h.flush(holds); await h.clock.advance(200); await h.flush(holds); await second;
+    const audio = h.page(tabId).__freeTtsAudio, cache = [...successor.cache], idx = successor.currentIdx;
+    assert.ok(audio); const scripts = h.scripts.entries.length;
+    if (retirement) { h.execute(retirement); await h.complete(retirement); }
+    await h.flush({ ...holds, holdScript: entry => entry === held });
+    if (held) { h.execute(held); await h.complete(held); }
+    await h.flush(); await h.clock.advance(200); await h.flush();
+    assert.equal(h.worker.pipeline, successor); assert.equal(successor.currentIdx, idx);
+    assert.equal(h.scripts.entries.slice(scripts).some(entry => activation(entry) || mediaSetup(entry) || highlight(entry)), false,
+      'obsolete work cannot dispatch activation or more loading');
+    assert.deepEqual([...predecessor.cache], oldCache, 'retired preloads and fallback cannot write cache');
+    assert.deepEqual([...successor.cache], cache); assert.equal(successor.attempt.completionObservedWhilePaused, false);
+    assert.equal(h.page(tabId).__freeTtsPlayback.sessionId, successor.sessionId);
+    assert.equal(h.page(tabId).__freeTtsAudio, audio); assert.equal(audio.paused, false);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+    assert.ok(h.page(tabId, 'ISOLATED').document.getElementById('free-tts-bar'));
+    if (tabId !== 7) assertIdlePage(h, 7);
+    await h.finish();
+  });
+});
+
+// A navigation stop dispatched by a retired owner cannot target the active Audio.
+test('navigation_dispatched_before_replacement_is_owner_bound', async () => {
+  const h = harness(); const first = h.start(); await h.ready(); await first;
+  const navigationStop = entry => entry.world === 'MAIN' && (entry.func.name === 'injectNavigationStop' || entry.source.includes('const s = window.__freeTtsAudio'));
+  const next = h.send({ action: 'nextSentence', source: 'popup' }, {});
+  const held = h.scripts.pending(navigationStop);
+  const second = h.start(), successor = h.worker.pipeline;
+  await h.ready(entry => entry === held); await second;
+  const audio = h.page(7).__freeTtsAudio, plays = h.audioSpy.plays.length;
+  h.execute(held); await h.complete(held); await h.flush(); await next;
+  assert.equal(h.worker.pipeline, successor); assert.equal(successor.currentIdx, 0);
+  assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(audio.paused, false); assert.notEqual(audio.src, '');
+  assert.equal(h.audioSpy.plays.length, plays);
+  await h.finish();
+});
+
+test('current_setup_failure_retires_only_captured_owner', async () => {
+  const h = harness(); const first = h.start();
+  await h.flush({ holdScript: mediaSetup });
+  const held = h.scripts.pending(mediaSetup), predecessor = h.worker.pipeline;
+  await h.fail(held, new Error('media setup unavailable')); await h.flush(); await first;
+  assert.equal((await h.snapshot()).state, 'idle');
+  assert.equal(predecessor.cancelled, true); assert.equal(h.audioSpy.constructors.length, 0);
+  assert.equal(h.scripts.entries.some(highlightInit), false);
+  await h.finish();
+});
+
+test('highlight_color_failure_is_nonfatal', async () => {
+  const h = harness(); const first = h.start();
+  await h.flush({ holdStorage: entry => 'highlightColor' in entry.defaults });
+  const color = h.storage.find(entry => 'highlightColor' in entry.defaults);
+  color.gate.reject(new Error('highlight color unavailable')); await h.ready(); await first;
+  assert.equal((await h.snapshot()).state, 'playing');
+  assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+  await h.finish();
+});
+
+// A session-bound stop preserves an unrelated unpublished start ticket;
+// unbound popup/shortcut stop intentionally cancels both kinds of ownership.
+test('bound_stop_preserves_pending_start', async t => {
+  for (const origin of ['bar', 'popup', 'shortcut']) await t.test(origin, async () => {
+    const h = harness(); const first = h.start(); await h.ready(); await first;
+    const predecessor = h.worker.pipeline;
+    h.holdTabQueries();
+    const second = h.send({ source: 'popup', action: 'speakSentences', text: 'Second sentence.' }, {});
+    const ticket = h.worker.pendingStart;
+    assert.ok(ticket);
+    const stopped = origin === 'shortcut' ? h.shortcut() : h.send(origin === 'bar'
+      ? { action: 'stopPlayback', source: 'bar', ...{ leaseId: predecessor.leaseId, sessionId: predecessor.sessionId, lifecycleRevision: predecessor.lifecycleRevision } }
+      : { action: 'stopPlayback', source: 'popup' }, origin === 'bar' ? { tab: { id: 7 } } : {});
+    assert.equal(ticket.cancelled, origin !== 'bar');
+    await h.flush(); await stopped;
+    h.queries[0].resolve([{ id: 8 }]);
+    await h.ready(); await second;
+    if (origin === 'bar') {
+      assert.ok(h.worker.pipeline); assert.notEqual(h.worker.pipeline.sessionId, predecessor.sessionId);
+      assert.equal(h.worker.pipeline.tabId, 8); assert.equal(h.audioSpy.constructors.length, 2);
+    } else {
+      assert.equal(h.worker.pipeline, null); assert.equal(h.audioSpy.constructors.length, 1);
+    }
+    await h.finish();
+  });
+});
+
+// A rejected old initializer still has no authority. Its response must describe
+// the successor instead of leaking rejection or initiating successor cleanup.
+test('retired_initializer_failure_is_inert', async () => {
+  const h = harness();
+  const first = h.send({ action: 'speakSentences', text: 'First sentence.', source: 'popup' }, {});
+  await h.flush({ holdScript: sessionInstall });
+  const held = h.scripts.pending(sessionInstall), predecessor = h.worker.pipeline;
+  const second = h.start(); const successor = h.worker.pipeline;
+  await h.ready(entry => entry === held); await second;
+  const audio = h.page(7).__freeTtsAudio;
+  await h.fail(held, new Error('obsolete installation failure')); await h.flush();
+  const response = await first;
+  assert.equal(response.sessionId, successor.sessionId);
+  assert.equal(response.state, 'playing'); assert.equal(h.worker.pipeline, successor);
+  assert.equal(predecessor.cancelled, true); assert.equal(h.page(7).__freeTtsAudio, audio);
+  assert.equal(audio.paused, false); assert.ok(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'));
+  await h.finish();
+});
+
+const retiredHighlights = entry => entry.world === 'ISOLATED' && entry.source.includes('delete window.__freeTtsSentences') && entry.func.name !== 'injectViewSession' && entry.func.name !== 'injectPageLease';
+const retiredBar = entry => entry.world === 'ISOLATED' && entry.source.includes('view.barCreated = false');
+
+// Completion, error and explicit stop must use the same captured retirement.
+// Holding each cleanup at dispatch and completion exposes rediscovered globals.
+test('terminal_cleanup_cannot_clear_successor', async t => {
+  for (const terminal of ['stop', 'completion', 'error']) for (const part of ['media', 'highlights', 'bar']) for (const boundary of ['dispatch', 'completion']) {
+    await t.test(`${terminal}-${part}-${boundary}`, async () => {
+      const h = harness(); const first = h.start('First sentence.');
+      let settings, terminalResult;
+      if (terminal === 'error') {
+        settings = h.storage.find(entry => 'serverUrl' in entry.defaults);
+        await h.flush({ holdStorage: entry => entry === settings });
+        settings.gate.reject(new Error('current settings failure')); await h.drain();
+      } else {
+        await h.ready(); await first;
+        if (terminal === 'stop') terminalResult = h.send({ action: 'stopPlayback', source: 'popup' }, {});
+        else {
+          const poll = await startOwnedEndPoll(h, h.worker.pipeline.attempt);
+          await finishOwnedEndPoll(h, poll);
+        }
+      }
+      const predicate = { media: entry => entry.func.name === 'clearMediaSession', highlights: retiredHighlights, bar: retiredBar }[part];
+      await h.flush({ holdScript: predicate });
+      const held = h.scripts.pending(predicate);
+      if (boundary === 'completion') h.execute(held);
+      assert.equal((await h.snapshot()).state, 'idle');
+      const second = h.start(), successor = h.worker.pipeline;
+      await h.ready(entry => entry === held); await second;
+      const audio = h.page(7).__freeTtsAudio, bar = h.page(7, 'ISOLATED').document.getElementById('free-tts-bar');
+      assert.ok(audio); assert.ok(bar);
+      const media = h.page(7).navigator.mediaSession, handler = media.handlers.get('play'), metadata = media.metadata;
+      if (!held.executed) h.execute(held);
+      await h.complete(held); await h.flush(); await first; if (terminalResult) await terminalResult;
+      assert.equal(h.worker.pipeline, successor); assert.equal(h.worker.active.sessionId, successor.sessionId);
+      assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(audio.paused, false);
+      assert.equal(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'), bar);
+      assert.equal(h.page(7, 'ISOLATED').__freeTtsSentences[0], 'First sentence.');
+      assert.equal(media.handlers.get('play'), handler); assert.equal(media.metadata, metadata);
+      assert.equal(h.clock.timers.has(h.page(7).__freeTtsKeepalive), true);
+      await h.finish();
+    });
+  }
+});
+
+test('retirement_cleanup_order_and_failure_continuation', async t => {
+  for (const failure of ['none', 'injection', 'media-api']) await t.test(failure, async () => {
+    const h = harness(); const first = h.start(); await h.ready(); await first;
+    const view = h.page(7, 'ISOLATED'), media = h.page(7).navigator.mediaSession;
+    const overlay = view.document.createElement('div'); overlay.className = 'free-tts-highlight-overlay'; view.document.body.appendChild(overlay);
+    const oldControl = view.document.getElementById('free-tts-toggle');
+    // Queue an actual old bar selection timeout so teardown must cancel it.
+    for (const callback of view.document.body.listeners.get('mouseup')) callback();
+    const effectsAt = h.audioSpy.effects.length;
+    if (failure === 'media-api') {
+      const register = media.setActionHandler;
+      media.setActionHandler = function (action, fn) { if (action === 'play' && fn === null) throw new Error('unsupported clear'); return register.call(this, action, fn); };
+    }
+    const stopped = h.send({ action: 'stopPlayback', source: 'popup' }, {});
+    if (failure === 'injection') {
+      const cleanup = h.scripts.pending(entry => entry.func.name === 'clearMediaSession');
+      await h.fail(cleanup, new Error('retirement injection unavailable'));
+    }
+    await h.flush(); const response = await stopped;
+    assert.equal(response.ok, failure === 'none');
+    if (failure !== 'none') assert.equal(response.commandError.code, 'cleanup-failure');
+    assert.equal((await h.snapshot()).state, 'idle');
+    assert.equal(view.document.getElementById('free-tts-bar'), null);
+    assert.equal(view.document.querySelectorAll('.free-tts-highlight-overlay').length, 0);
+    const messages = h.messages.length; oldControl.listeners.get('click')[0]();
+    await h.clock.advance(150); await h.drain();
+    assert.equal(h.messages.length, messages, 'removed control and its selection timer cannot send');
+    if (failure !== 'injection') {
+      const effects = h.audioSpy.effects.slice(effectsAt);
+      const pauseAt = effects.findIndex(effect => effect.kind === 'pause');
+      const highlightAt = effects.findIndex(effect => effect.kind === 'remove' && effect.className === 'free-tts-highlight-overlay');
+      const barAt = effects.findIndex(effect => effect.kind === 'remove' && effect.id === 'free-tts-bar');
+      assert.ok(pauseAt > 0); assert.equal(effects[pauseAt].keepaliveActive, false);
+      assert.ok(effects.findIndex(effect => effect.kind === 'metadata' && effect.cleared) < pauseAt);
+      for (const action of ['pause', 'previoustrack', 'nexttrack', 'stop']) assert.ok(effects.findIndex(effect => effect.kind === 'handler' && effect.action === action && effect.cleared) < pauseAt);
+      assert.ok(pauseAt < highlightAt && highlightAt < barAt);
+      assert.equal(media.playbackState, 'none'); assert.equal(h.page(7).__freeTtsAudio, null);
+    } else {
+      // Retrying the captured production cleanup is allowed after a transport
+      // failure, and ensures fixture disposal never leaves timers/audio behind.
+      const failed = h.scripts.entries.find(entry => entry.func.name === 'clearMediaSession' && entry.completion.settled && !entry.executed);
+      h.execute(failed);
+    }
+    for (const play of h.audioSpy.plays) play.outcome.resolve();
+    await h.flush(); h.assertNoUnintendedTimers();
+  });
+});
+
+async function runPageFunction(h, template, args, world = template.world) {
+  const completion = h.scripts.dispatch({ target: template.target, world, func: template.func, args });
+  const entry = h.scripts.entries.at(-1); h.execute(entry); await h.complete(entry);
+  return (await completion)[0].result;
+}
+
+// CAS against a token alone would win after stop advances that token's floor;
+// implicit cross-lease installation or equal retired installation recreates UI.
+test('lease_and_retirement_fences_survive_idle', async t => {
+  for (const world of ['MAIN', 'ISOLATED']) await t.test(world, async () => {
+    const h = harness(); const first = h.start(); await h.ready(); await first;
+    const pipeline = h.worker.pipeline;
+    const claim = h.scripts.entries.find(entry => leaseClaim(entry) && entry.world === world);
+    assert.ok(claim, 'lease established in both worlds');
+    const install = h.scripts.entries.find(entry => entry.func.name === (world === 'MAIN' ? 'injectPlaybackSession' : 'injectViewSession'));
+    const context = h.page(7, world), key = world === 'MAIN' ? '__freeTtsPlayback' : '__freeTtsView';
+    const live = context[key], audio = h.page(7).__freeTtsAudio;
+    const effects = h.audioSpy.effects.length;
+    const badInstall = await runPageFunction(h, install, [{ ...install.args[0], leaseId: 'unclaimed-lease', lifecycleRevision: pipeline.lifecycleRevision + 100 }, ...install.args.slice(1)]);
+    assert.equal(badInstall.installed, false); assert.equal(context[key], live);
+    assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(h.audioSpy.effects.length, effects);
+    const observed = { leaseId: live.leaseId, lifecycleFloor: live.lifecycleFloor };
+    const stopped = h.send({ action: 'stopPlayback', source: 'popup' }, {}); await h.flush(); await stopped;
+    const retired = context[key], floor = retired.lifecycleFloor;
+    assert.ok(floor > observed.lifecycleFloor);
+    const losing = await runPageFunction(h, claim, [world, 'claim', observed, 'losing-lease', 'other-worker']);
+    assert.equal(losing.claimed, false); assert.equal(context[key], retired); assert.equal(retired.lifecycleFloor, floor);
+    const staleInstall = await runPageFunction(h, install, install.args);
+    assert.equal(staleInstall.installed, false);
+    const oldEffects = h.scripts.entries.filter(entry => world === 'MAIN' ? activation(entry) || mediaSetup(entry)
+      : highlightInit(entry) || highlight(entry) || entry.source.includes('const initialLoopEnabled'));
+    const played = h.audioSpy.plays.length, constructed = h.audioSpy.constructors.length;
+    for (const effect of oldEffects) await runPageFunction(h, effect, effect.args);
+    assert.equal(h.audioSpy.plays.length, played); assert.equal(h.audioSpy.constructors.length, constructed);
+    assert.equal(context[key].lifecycleFloor, floor); assertIdlePage(h);
+    await h.finish();
+  });
+});
+
+test('shared_lease_claim_abandoned_owner_and_closed_tab', async t => {
+  for (const outcome of ['fulfilled', 'rejected-after-execution']) await t.test(outcome, async () => {
+    const h = harness(); const first = h.start();
+    await h.flush({ holdScript: leaseClaim });
+    const held = h.scripts.pending(leaseClaim);
+    const predecessor = h.worker.pipeline, establishing = h.worker.leases.get(7).promise;
+    const second = h.start(), successor = h.worker.pipeline;
+    await h.flush({ holdScript: entry => entry === held });
+    assert.equal(h.worker.leases.get(7).promise, establishing, 'one per-tab establishment in flight');
+    assert.equal(h.scripts.entries.filter(leaseClaim).length, 1, 'successor shares the held claim');
+    h.execute(held);
+    if (outcome === 'fulfilled') await h.complete(held);
+    else await h.fail(held, new Error('retired claimant transport failure'));
+    await h.ready(); await Promise.all([first, second]);
+    assert.equal(predecessor.cancelled, true); assert.equal(h.worker.pipeline, successor);
+    assert.equal(h.page(7).__freeTtsPlayback.sessionId, successor.sessionId);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+    h.closeTab(7); await h.flush();
+    assert.equal(h.worker.leases.size, 0); assert.equal((await h.snapshot()).state, 'idle');
+    await h.finish();
+  });
+});
+
+// Another explicit claimant wins after each read. The current owner must stop
+// after three failed claims rather than spin or implicitly overwrite that lease.
+test('lease_claim_contention_is_bounded', async () => {
+  const h = harness(); const first = h.send({ action: 'speakSentences', text: 'First sentence.', source: 'popup' }, {});
+  await h.drain(); const pipeline = h.worker.pipeline;
+  for (let conflict = 0; conflict < 3; conflict++) {
+    await h.flush({ holdScript: leaseClaim });
+    const held = h.scripts.pending(leaseClaim);
+    const record = h.page(7).__freeTtsPlayback;
+    const competing = await runPageFunction(h, held, ['MAIN', 'claim', { leaseId: record?.leaseId ?? null, lifecycleFloor: record?.lifecycleFloor ?? 0 }, `contender-${conflict}`, 'other-worker']);
+    assert.equal(competing.claimed, true);
+    const receipt = h.execute(held); assert.equal(receipt.claimed, false);
+    await h.complete(held);
+  }
+  await h.flush(); const response = await first;
+  assert.equal(h.scripts.entries.filter(entry => leaseClaim(entry) && entry.args[3] === pipeline.leaseId).length, 3);
+  assert.equal(response.ok, false); assert.equal(response.commandError.code, 'page-operation-failure');
+  assert.equal((await h.snapshot()).state, 'idle'); assert.equal(h.worker.pipeline, null);
+  assert.equal(h.audioSpy.constructors.length, 0); assert.equal(h.audioSpy.plays.length, 0);
+  await h.finish();
 });

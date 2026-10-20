@@ -58,7 +58,7 @@ def test_prev_next_stop_bridged_via_postmessage():
     assert 'send("stopPlayback")' in src
     # ...and the isolated-world relay forwards it to the worker.
     assert "injectMediaRelay" in src, "isolated-world relay missing"
-    assert "chrome.runtime.sendMessage({ action: data.action })" in src
+    assert 'chrome.runtime.sendMessage({ ...data, source: "media" })' in src
 
 
 def test_old_port_mechanism_removed():
@@ -113,7 +113,7 @@ def test_loop_checkbox_syncs_to_worker_pipeline():
     assert 'msg.action === "setLoopState"' in src, "loop state message not routed"
     assert "sentencePipeline.loopEnabled = msg.enabled !== false" in src
     assert (
-        'chrome.runtime.sendMessage({ action: "setLoopState", enabled: loopCheck.checked })'
+        'sendBarMessage({ action: "setLoopState", enabled: loopCheck.checked })'
         in src
     )
 
@@ -129,24 +129,25 @@ def test_loop_decision_uses_worker_owned_state_before_injected_fallback():
 
 
 def test_cleanup_ordering_on_natural_completion():
-    """The non-loop completion path in playNextSentence must call
-    cleanupMediaSession *before* clearPlayback so the media-session
-    integration is torn down cleanly rather than left dangling."""
+    """Natural completion delegates to captured-owner retirement, which attempts
+    media cleanup, highlights and the bar before owner-compared worker clearing.
+    The executable schedules live in extension_playback.test.cjs.
+    """
     src = _source()
     match = re.search(r"async function playNextSentence\(.*?\n}\n", src, re.DOTALL)
     assert match, "playNextSentence body not found"
-    body = match.group(0)
+    assert "await stopPlayback(pipeline, false);" in match.group(0)
 
-    # The natural-completion cleanup sequence is uniquely identifiable:
-    # cleanupMediaSession → cleanupPageHighlighting → hideControlBar → clearPlayback → return
+    retirement = re.search(r"async function stopPlayback\(.*?\n}\n", src, re.DOTALL)
+    assert retirement, "captured-owner retirement body not found"
+    body = retirement.group(0)
     sequence = re.search(
-        r"await cleanupMediaSession\(tabId\);\s*"
-        r"await cleanupPageHighlighting\(tabId\);\s*"
-        r"await hideControlBar\(tabId\);\s*"
-        r"clearPlayback\(\);",
+        r"for \(const cleanup of \[cleanupMediaSession, cleanupPageHighlighting, hideControlBar\]\)"
+        r".*?await cleanup\(owner, retirementRevision\).*?clearOwnedPlayback\(pipeline\);",
         body,
+        re.DOTALL,
     )
-    assert sequence, (
-        "cleanupMediaSession(tabId) must be called before clearPlayback() "
-        "in the natural non-loop completion path of playNextSentence"
-    )
+    assert sequence, "media cleanup must precede highlights, bar and owned worker clear"
+    clearing = re.search(r"function clearOwnedPlayback\(.*?\n}\n", src, re.DOTALL)
+    assert clearing, "owner-compared clearing helper missing"
+    assert "sentencePipeline === pipeline" in clearing.group(0)
