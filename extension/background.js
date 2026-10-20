@@ -393,6 +393,10 @@ function adoptPageReceipt(pipeline, attempt, receipt) {
     }
   }
   if (learnedMedia || learnedInvocation) requestPageObservation(pipeline, attempt);
+  if (receipt.owned && receipt.ended && receipt.audioId === attempt.audioId &&
+      receipt.audioRevision >= attempt.audioRevision && receipt.startSerial === attempt.startSerial) {
+    observeAttemptCompletion(pipeline, attempt);
+  }
 }
 
 // One no-effect read and one follow-up bit per live attempt. Reads never admit
@@ -442,7 +446,9 @@ function injectPlaybackObservation(owner, attemptId) {
   const record = window.__freeTtsPlayback;
   if (!record?.receipt || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
       record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId) return null;
-  return { ...record.receipt("applied"), owned: !record.audioId || !!record.audio, ended: !!record.audio?.ended };
+  const ended = !!record.audio?.ended;
+  if (ended && record.audioStatus !== "ended") { record.audioStatus = "ended"; record.audioRevision++; }
+  return { ...record.receipt("applied"), owned: !record.audioId || !!record.audio, ended };
 }
 
 function continueObservedPlayback(pipeline, attempt) {
@@ -1479,6 +1485,30 @@ function scheduleCompletionPoll(pipeline, attempt) {
   attempt.pollTimer = setTimeout(() => { attempt.pollTimer = null; void pollCompletion(pipeline, attempt); }, 500);
 }
 
+function observeAttemptCompletion(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt) || attempt.completionObserved) return;
+  attempt.audioStatus = "ended";
+  attempt.completionObserved = true;
+  setAttemptPhase(pipeline, attempt, "ended");
+  if (pipeline.isPaused) {
+    attempt.completionObservedWhilePaused = true;
+    return;
+  }
+
+  attempt.completionConsumed = true;
+  let nextIdx = pipeline.repeatCurrentEnabled ? attempt.idx : attempt.idx + 1;
+  if (nextIdx >= pipeline.sentences.length) {
+    if (pipeline.loopEnabled) nextIdx = 0;
+    else { void playNextSentence(pipeline, attempt); return; }
+  }
+  pipeline.currentIdx = nextIdx;
+  const nextAttempt = createAttempt(pipeline);
+  pipeline.intentRevision++; viewRevision++;
+  void selectAttempt(pipeline, nextAttempt);
+  void applyWorkerIntent(pipeline, workerIntent(pipeline));
+  void playNextSentence(pipeline, nextAttempt);
+}
+
 async function pollCompletion(pipeline, attempt) {
   if (!ownsPipeline(pipeline, attempt) || attempt.pollInFlight || attempt.completionObserved || !attempt.audioId) return;
   attempt.pollInFlight = true;
@@ -1505,38 +1535,16 @@ async function pollCompletion(pipeline, attempt) {
       }
       return;
     }
-    if (sample.audioStatus === "error" && sample.intentRevision === pipeline.intentRevision && sample.mediaRevision === pipeline.mediaRevision) {
+    if (sample.intentRevision === pipeline.intentRevision && sample.mediaRevision === pipeline.mediaRevision) {
       adoptPageReceipt(pipeline, attempt, sample);
-      return;
+    } else if (sample.mediaRevision >= pipeline.mediaRevision && sample.audioRevision > attempt.audioRevision &&
+        (attempt.startSerial === null || sample.startSerial >= attempt.startSerial)) {
+      // An unreconciled media invocation is provisional. Consuming its audio
+      // revision here would hide a live rejection from the fresh owned read.
+      requestPageObservation(pipeline, attempt);
     }
-    if (sample.audioRevision > attempt.audioRevision) {
-      attempt.audioRevision = sample.audioRevision;
-      attempt.audioStatus = sample.audioStatus;
-      attempt.startSerial = sample.startSerial;
-      if (["starting", "playing", "paused"].includes(sample.audioStatus)) setAttemptPhase(pipeline, attempt, sample.audioStatus);
-    }
-    if (!sample.ended || attempt.completionObserved) return;
-
-    attempt.audioStatus = "ended";
-    attempt.completionObserved = true;
-    setAttemptPhase(pipeline, attempt, "ended");
-    if (pipeline.isPaused) {
-      attempt.completionObservedWhilePaused = true;
-      return;
-    }
-
-    attempt.completionConsumed = true;
-    let nextIdx = pipeline.repeatCurrentEnabled ? attempt.idx : attempt.idx + 1;
-    if (nextIdx >= pipeline.sentences.length) {
-      if (pipeline.loopEnabled) nextIdx = 0;
-      else { void playNextSentence(pipeline, attempt); return; }
-    }
-    pipeline.currentIdx = nextIdx;
-    const nextAttempt = createAttempt(pipeline);
-    pipeline.intentRevision++; viewRevision++;
-    void selectAttempt(pipeline, nextAttempt);
-    void applyWorkerIntent(pipeline, workerIntent(pipeline));
-    void playNextSentence(pipeline, nextAttempt);
+    if (!ownsPipeline(pipeline, attempt) || !sample.ended) return;
+    observeAttemptCompletion(pipeline, attempt);
   } catch (error) {
     if (ownsPipeline(pipeline, attempt) && pipeline.intentRevision === intentRevision) failOwnedPlayback(pipeline, "poll-failure", error, attempt);
   } finally {

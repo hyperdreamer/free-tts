@@ -813,6 +813,38 @@ test('W09 end_observed_paused_replay', async () => {
   await h.finish();
 });
 
+// F-10: a fresh paused observation must retain completion before a later
+// resume, even when the periodic completion poll has not run yet.
+test('W09 F-10 paused_observation_before_poll', async () => {
+  const h = harness(); const started = h.start(); await h.ready(); await started;
+  const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt, endedAudio = h.page(7).__freeTtsAudio;
+  await h.pause();
+  endedAudio.ended = true;
+  const pollCount = h.scripts.entries.filter(completionPoll).length;
+  const pause = h.mediaAction(7, 'pause');
+  await h.command(h.deliverRelay(7, pause), { tab: { id: 7 } });
+
+  assert.equal(h.scripts.entries.filter(completionPoll).length, pollCount, 'fresh read observes the end before any 500 ms poll');
+  assert.equal(pipeline.attempt, endedAttempt); assert.equal(pipeline.currentIdx, 0);
+  assert.equal(endedAttempt.completionObserved, true, 'owned ended read must accept completion');
+  assert.equal(endedAttempt.completionObservedWhilePaused, true, 'completion uses accepted paused intent at read acceptance');
+  assert.equal(endedAttempt.completionConsumed, false); assert.equal(endedAttempt.phase, 'ended');
+  assert.equal(h.audioSpy.plays.length, 1);
+
+  await h.command({ action: 'resumePlayback', source: 'popup' });
+  const replay = pipeline.attempt;
+  assert.notEqual(replay, endedAttempt); assert.notEqual(replay.attemptId, endedAttempt.attemptId);
+  assert.equal(replay.idx, 0); assert.equal(pipeline.currentIdx, 0);
+  assert.equal(endedAttempt.retired, true); assert.equal(endedAttempt.completionConsumed, true);
+  assert.equal(h.audioSpy.constructors.length, 2); assert.equal(h.audioSpy.plays.length, 2);
+  assert.notEqual(h.page(7).__freeTtsAudio, endedAudio, 'resume creates a fresh same-index Audio');
+  await h.clock.advance(1000); await h.flush();
+  await h.worker.poll(pipeline, endedAttempt); await h.flush();
+  assert.equal(pipeline.attempt, replay); assert.equal(pipeline.currentIdx, 0, 'later polls cannot advance the replay from the old end');
+  assert.equal(h.audioSpy.constructors.length, 2); assert.equal(h.audioSpy.plays.length, 2);
+  await h.finish();
+});
+
 // F-4: MAIN play cannot replay an ended element itself; media resume must
 // consume the same attempt-owned paused completion as an explicit resume.
 test('W09 F-4 media_resume_after_paused_completion', async () => {
@@ -2173,6 +2205,46 @@ test('W24 current_errors', async t => {
     assert.equal(response.state, 'playing'); assert.equal(response.phase, 'starting');
     assert.equal(response.audioStatus, 'starting', 'accepted intent is not reported as audible success');
     assert.equal(response.pageApplied, true);
+    await h.finish();
+  });
+});
+
+// F-9: polling an error from a media revision not yet known to the worker
+// cannot consume its audioRevision and hide the rejection from reconciliation.
+test('W24 F-9 poll_before_unreconciled_play_rejection', async t => {
+  for (const delivery of ['withheld', 'action-before-outcome']) await t.test(delivery, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    h.audioSpy.plays[0].outcome.resolve(); await h.drain();
+    const initialOutcome = h.messages.findLast(message => message.world === 'MAIN' && message.data.action === 'audioPlaybackEvent').data;
+    await h.command(h.deliverRelay(7, initialOutcome), { tab: { id: 7 } });
+    await h.pause();
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, audio = h.page(7).__freeTtsAudio;
+    const resume = h.mediaAction(7, 'play');
+    assert.equal(h.audioSpy.plays.length, 2); assert.equal(h.audioSpy.plays[1].audio, audio);
+    h.audioSpy.plays[1].outcome.reject(new Error('direct media play rejected before poll'));
+    await h.drain();
+    const failure = h.messages.findLast(message => message.world === 'MAIN' && message.data.action === 'audioPlaybackEvent').data;
+    assert.equal(failure.audioStatus, 'error'); assert.ok(failure.mediaRevision > pipeline.mediaRevision);
+    await h.clock.advance(500); await h.drain();
+    const poll = h.scripts.pending(completionPoll), sample = h.execute(poll);
+    assert.equal(sample.audioStatus, 'error'); assert.equal(sample.audioRevision, failure.audioRevision);
+    await h.complete(poll); await h.drain();
+    assert.ok(attempt.audioRevision < failure.audioRevision, 'unreconciled poll cannot consume the rejected observation revision');
+    assert.ok(h.scripts.entries.some(entry => !entry.executed && entry.func.name === 'injectPlaybackObservation'),
+      'poll requests a fresh owned sample before any activation continuation');
+
+    if (delivery === 'action-before-outcome') {
+      await h.command(h.deliverRelay(7, resume), { tab: { id: 7 } });
+      await h.command(h.deliverRelay(7, failure), { tab: { id: 7 } });
+    }
+    await h.flush();
+    assert.equal(h.audioSpy.plays.length, 2, 'poll and delayed relay delivery cannot retry the rejected play');
+    const snapshot = await h.snapshot();
+    assert.equal(snapshot.state, 'idle', 'poll must reconcile the current rejection even without relay delivery');
+    assert.equal(snapshot.error?.code, 'play-rejection');
+    assert.equal(snapshot.error?.message, 'direct media play rejected before poll');
+    assert.equal(h.worker.pipeline, null); assert.equal(pipeline.currentIdx, 0);
+    assert.equal(attempt.completionObserved, false); assertIdlePage(h);
     await h.finish();
   });
 });
