@@ -335,11 +335,13 @@ function injectPlaybackSession(owner, workerToken) {
   record.play = () => {
     if (record !== window.__freeTtsPlayback || record.desiredPaused || !record.audio || record.audio.ended || ["starting", "playing"].includes(record.audioStatus)) return;
     const audio = record.audio, serial = ++record.startSerial, attemptId = record.attemptId;
-    const intentRevision = record.workerIntentRevision, audioId = record.audioId;
+    const audioId = record.audioId;
     record.audioStatus = "starting"; record.audioError = null; record.audioRevision++;
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    // Newer running intents may retain this invocation. Reconcile its outcome
+    // with the current running snapshot; an applied pause invalidates its serial.
     const live = () => record === window.__freeTtsPlayback && record.audio === audio && record.audioId === audioId &&
-      record.attemptId === attemptId && record.workerIntentRevision === intentRevision && record.startSerial === serial && !record.desiredPaused;
+      record.attemptId === attemptId && record.startSerial === serial && !record.desiredPaused;
     const settled = (error) => {
       if (!live()) return;
       record.audioStatus = error ? "error" : "playing";

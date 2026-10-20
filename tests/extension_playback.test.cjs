@@ -401,10 +401,14 @@ test('W04 stale_resume_both_execution_orders', async t => {
   });
 });
 
+// A newer running intent must retain the sole pending play's outcome, while a
+// newer applied pause must invalidate it even when older intents execute last.
 test('W05 rapid_toggle_parity', async t => {
-  for (const count of [2, 3]) await t.test(`${count}-toggles`, async () => {
+  for (const count of [2, 3]) for (const outcome of ['fulfill', 'reject']) await t.test(`${count}-toggles-${outcome}`, async () => {
     const h = harness(); const started = h.start(); await h.ready(); await started;
     const pipeline = h.worker.pipeline, owner = { leaseId: pipeline.leaseId, sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision };
+    const originalPlay = h.audioSpy.plays[0], originalAudio = originalPlay.audio;
+    const audioId = h.page(7).__freeTtsPlayback.audioId, startSerial = h.page(7).__freeTtsPlayback.startSerial;
     const button = h.page(7, 'ISOLATED').document.getElementById('free-tts-toggle');
     const beforeRevision = pipeline.intentRevision, beforeState = pipeline.isPaused;
     button.textContent = '▶'; button.title = 'Resume'; button.setAttribute('aria-label', 'Resume');
@@ -456,6 +460,50 @@ test('W05 rapid_toggle_parity', async t => {
     const action = paused ? 'Resume' : 'Pause';
     assert.equal(rendered.textContent, paused ? '▶' : '⏸');
     assert.equal(rendered.title, action); assert.equal(rendered.getAttribute('aria-label'), action);
+
+    const record = h.page(7).__freeTtsPlayback, media = h.page(7).navigator.mediaSession;
+    const audioRevision = record.audioRevision;
+    assert.equal(record.audio, originalAudio); assert.equal(record.audioId, audioId);
+    assert.equal(record.startSerial, paused ? startSerial + 1 : startSerial);
+    assert.equal(h.audioSpy.plays.length, 1, 'reordered running intent must retain the pending play without replaying');
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(originalAudio.currentTime, 3);
+    assert.equal(h.audioSpy.writes.filter(write => write.field === 'currentTime').length, 0);
+    assert.equal(media.playbackState, 'paused', 'pending play has not established audible success');
+    assert.equal(h.messages.filter(message => message.data.action === 'audioPlaybackEvent').length, 0);
+    if (outcome === 'fulfill') originalPlay.outcome.resolve();
+    else originalPlay.outcome.reject(new Error('pending original play failed'));
+    await h.drain(); await h.flush();
+
+    const events = h.messages.filter(message => message.data.action === 'audioPlaybackEvent');
+    if (paused) {
+      assert.equal(record.audioStatus, 'paused'); assert.equal(record.audioError, null);
+      assert.equal(record.audioRevision, audioRevision, 'pause invalidates either old play outcome');
+      assert.equal(events.length, 0); assert.equal(media.playbackState, 'paused');
+      assert.equal(originalAudio.paused, true);
+    } else {
+      const status = outcome === 'fulfill' ? 'playing' : 'error';
+      assert.equal(record.audioStatus, status, 'the still-live original play must settle under the latest running intent');
+      if (outcome === 'fulfill') assert.equal(record.audioError, null);
+      else {
+        assert.equal(record.audioError.code, 'play-rejection');
+        assert.equal(record.audioError.message, 'pending original play failed');
+      }
+      assert.equal(record.audioRevision, audioRevision + 1);
+      assert.equal(media.playbackState, outcome === 'fulfill' ? 'playing' : 'paused');
+      assert.equal(events.length, 1, 'publish the retained invocation outcome once');
+      const event = events[0];
+      assert.equal(event.world, 'MAIN'); assert.equal(event.tabId, 7);
+      assert.equal(event.data.leaseId, owner.leaseId); assert.equal(event.data.sessionId, owner.sessionId);
+      assert.equal(event.data.lifecycleRevision, owner.lifecycleRevision);
+      assert.equal(event.data.intentRevision, beforeRevision + count); assert.equal(event.data.mediaRevision, 0);
+      assert.equal(event.data.attemptId, pipeline.attempt.attemptId); assert.equal(event.data.audioId, audioId);
+      assert.equal(event.data.startSerial, startSerial); assert.equal(event.data.audioRevision, audioRevision + 1);
+      assert.equal(event.data.paused, false); assert.equal(event.data.audioStatus, status);
+      assert.equal(event.data.audioError, record.audioError);
+    }
+    assert.equal(h.audioSpy.plays.length, 1, 'settlement cannot retry play');
+    assert.equal(record.audio, originalAudio); assert.equal(record.audioId, audioId);
+    assert.equal(h.worker.pipeline, pipeline);
     await h.finish();
   });
 });
