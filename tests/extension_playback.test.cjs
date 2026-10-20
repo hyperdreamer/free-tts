@@ -443,7 +443,7 @@ test('W04 stale_resume_both_execution_orders', async t => {
     const pipeline = h.worker.pipeline, audio = h.audioSpy.constructors[0].audio;
     const initialPlayCount = h.audioSpy.plays.length;
     const isIntent = entry => entry.func.name === 'injectWorkerIntent';
-    const isToggleRender = entry => entry.world === 'ISOLATED' && entry.source.includes('const paused = current.state');
+    const isToggleRender = renderUpdate;
     const resume = h.send({ action: 'resumePlayback', source: 'popup' }, {}); await h.drain();
     const resumeIntent = h.scripts.pending(entry => isIntent(entry) && entry.args[0].paused === false);
     const delayedResumeRender = h.scripts.pending(isToggleRender);
@@ -524,7 +524,7 @@ test('W05 rapid_toggle_parity', async t => {
     assert.equal(pipeline.isPaused, count % 2 === 0 ? beforeState : !beforeState);
     await h.drain();
     const intents = h.scripts.entries.filter(entry => entry.func.name === 'injectWorkerIntent' && entry.args[0].intentRevision > beforeRevision);
-    const isToggleRender = entry => entry.world === 'ISOLATED' && entry.source.includes('const paused = current.state');
+    const isToggleRender = renderUpdate;
     assert.equal(intents.length, count);
     const descending = [...intents].sort((a, b) => b.args[0].intentRevision - a.args[0].intentRevision);
     const renders = h.scripts.entries.filter(entry => !entry.executed && isToggleRender(entry));
@@ -1345,6 +1345,7 @@ test('retirement_cleanup_order_and_failure_continuation', async t => {
     const view = h.page(7, 'ISOLATED'), media = h.page(7).navigator.mediaSession;
     const overlay = view.document.createElement('div'); overlay.className = 'free-tts-highlight-overlay'; view.document.body.appendChild(overlay);
     const oldControl = view.document.getElementById('free-tts-toggle');
+    const oldClick = oldControl.listeners.get('click')[0];
     // Queue an actual old bar selection timeout so teardown must cancel it.
     for (const callback of view.document.body.listeners.get('mouseup')) callback();
     const effectsAt = h.audioSpy.effects.length;
@@ -1365,7 +1366,7 @@ test('retirement_cleanup_order_and_failure_continuation', async t => {
     assert.equal((await h.snapshot()).state, 'idle');
     assert.equal(view.document.getElementById('free-tts-bar'), null);
     assert.equal(view.document.querySelectorAll('.free-tts-highlight-overlay').length, 0);
-    const messages = h.messages.length; oldControl.listeners.get('click')[0]();
+    const messages = h.messages.length; oldClick();
     await h.clock.advance(150); await h.drain();
     assert.equal(h.messages.length, messages, 'removed control and its selection timer cannot send');
     if (failure !== 'injection') {

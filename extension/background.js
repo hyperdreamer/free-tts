@@ -894,191 +894,242 @@ async function getRepeatCurrentState(tabId) {
 }
 
 async function showControlBar(owner, snapshot, modes) {
-  await owner.installPromise;
-  if (!ownsPipeline(owner)) return "deferred";
+  const pipeline = navigationPipeline(owner);
+  if (!pipeline) return "deferred";
+  await pipeline.installPromise;
+  if (!ownsPipeline(pipeline)) return "deferred";
   try {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: owner.tabId },
       func: (binding, supplied, suppliedModes) => {
-        const view = window.__freeTtsView;
-        if (!view || view.retired || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
-        if (view.barCreated) {
-          if (!document.getElementById("free-tts-bar")) throw new Error("Owned control bar is missing");
+        const isolated = window.__freeTtsView;
+        if (!isolated || isolated.retired || isolated.leaseId !== binding.leaseId || isolated.sessionId !== binding.sessionId ||
+            isolated.lifecycleRevision !== binding.lifecycleRevision || supplied.sessionId !== binding.sessionId) return "deferred";
+        isolated.owner ||= binding;
+        isolated.highestRenderedViewRevision ??= isolated.viewRevision ?? 0;
+        if (isolated.barCreated) {
+          const bar = document.getElementById("free-tts-bar");
+          if (!bar || bar !== isolated.bar || !isolated.renderControlBarSnapshot) throw new Error("Owned control bar is missing");
+          isolated.renderControlBarSnapshot(bar, supplied, suppliedModes);
           return "rendered";
         }
-        const pending = view.pendingRender;
+        const pending = isolated.pendingRender;
         const latest = pending && pending.snapshot.viewRevision > supplied.viewRevision ? pending : { snapshot: supplied, modes: suppliedModes };
-        let alive = true;
-        const selectionTimers = new Set();
-        const live = () => alive && view === window.__freeTtsView && !view.retired;
-        const sendBarMessage = message => live() && chrome.runtime.sendMessage({ ...message, source: "bar", leaseId: binding.leaseId,
-          sessionId: binding.sessionId, lifecycleRevision: binding.lifecycleRevision });
-        const paused = latest.snapshot.state === "paused";
-        const initialLoopEnabled = latest.modes.loopEnabled, initialRepeatCurrent = latest.modes.repeatCurrentEnabled;
-        view.viewRevision = latest.snapshot.viewRevision;
-        view.pendingRender = null;
-        // Remove existing bar
-        if (typeof window.__freeTtsCleanupControlBar === "function") {
-          window.__freeTtsCleanupControlBar();
-        }
-        document.getElementById("free-tts-bar")?.remove();
         const bar = document.createElement("div");
         bar.id = "free-tts-bar";
+        const gesture = {
+          instanceId: `${binding.sessionId}:bar:${Math.random().toString(36).slice(2)}`,
+          leaseId: binding.leaseId, sessionId: binding.sessionId, lifecycleRevision: binding.lifecycleRevision,
+          alive: true, gestureRevision: 0, origin: null, lastCompletedOrigin: null, selectionChanged: false,
+          selectionTimer: null, selectionSnapshot: null, drag: null,
+        };
+        const barOwner = { ...binding, instanceId: gesture.instanceId };
+        const live = () => gesture.alive && isolated === window.__freeTtsView && !isolated.retired &&
+          isolated.bar === bar && document.getElementById("free-tts-bar") === bar && window.__freeTtsControlBarOwner === barOwner;
+        function sendBarAction(action, payload = {}) {
+          if (!live()) return;
+          chrome.runtime.sendMessage({ source: "bar", leaseId: gesture.leaseId, sessionId: gesture.sessionId,
+            lifecycleRevision: gesture.lifecycleRevision, action, ...payload }).catch(() => {});
+        }
+        function renderControlBarSnapshot(bar, snapshot, modes) {
+          if (!gesture.alive || isolated !== window.__freeTtsView || isolated.retired || !bar || bar !== isolated.bar ||
+              snapshot.sessionId !== isolated.owner.sessionId || snapshot.viewRevision < isolated.highestRenderedViewRevision) return false;
+          if (isolated.barCreated && snapshot.viewRevision === isolated.highestRenderedViewRevision) return true;
+          const paused = snapshot.state === "paused", toggle = bar.querySelector("#free-tts-toggle");
+          if (!toggle) return false;
+          toggle.textContent = paused ? "▶" : "⏸";
+          toggle.title = paused ? "Resume" : "Pause";
+          toggle.setAttribute("aria-label", paused ? "Resume" : "Pause");
+          for (const [id, name] of [["prev", "Previous"], ["next", "Next"], ["close", "Stop"], ["loop", "Repeat All"], ["repeat-current", "Repeat Current Sentence"]]) {
+            bar.querySelector(`#free-tts-${id}`).setAttribute("aria-label", name);
+          }
+          bar.querySelector("#free-tts-loop").checked = modes.loopEnabled;
+          bar.querySelector("#free-tts-repeat-current").checked = modes.repeatCurrentEnabled;
+          window.__freeTtsLoop = modes.loopEnabled;
+          isolated.highestRenderedViewRevision = isolated.viewRevision = snapshot.viewRevision;
+          return true;
+        }
+        const handles = [];
+        const listen = (target, type, callback, capture = false) => {
+          target.addEventListener(type, callback, capture);
+          handles.push({ target, type, callback, capture });
+        };
         [
           ["free-tts-prev", "Previous", "⏮"],
-          ["free-tts-toggle", paused ? "Resume" : "Pause", paused ? "▶" : "⏸"],
+          ["free-tts-toggle", "Pause", "⏸"],
           ["free-tts-next", "Next", "⏭"],
           ["free-tts-close", "Stop", "✕"],
         ].forEach(([id, title, text]) => {
           const button = document.createElement("button");
-          button.id = id;
-          button.title = title;
-          button.setAttribute("aria-label", title);
-          button.textContent = text;
+          button.id = id; button.title = title; button.textContent = text;
           bar.appendChild(button);
         });
-        // Repeat All (loop) checkbox — checked by default
         const loopLabel = document.createElement("label");
         loopLabel.title = "Repeat All";
         loopLabel.style.cssText = "display:flex;align-items:center;gap:2px;font-size:12px;color:#555;padding:2px 4px;cursor:pointer;border-left:1px solid #ddd;margin-left:2px;";
         const loopCheck = document.createElement("input");
-        loopCheck.type = "checkbox";
-        loopCheck.id = "free-tts-loop";
-        loopCheck.checked = initialLoopEnabled !== false;
+        loopCheck.type = "checkbox"; loopCheck.id = "free-tts-loop";
         loopCheck.style.cssText = "margin:0;cursor:pointer;";
-        loopCheck.addEventListener("change", () => {
-          if (!live()) return;
-          if (loopCheck.checked) {
-            const repeatCurrent = document.getElementById("free-tts-repeat-current");
-            if (repeatCurrent) repeatCurrent.checked = false;
-          }
-          window.__freeTtsLoop = loopCheck.checked;
-          sendBarMessage({ action: "setLoopState", enabled: loopCheck.checked });
-        });
         loopLabel.appendChild(loopCheck);
         loopLabel.appendChild(document.createTextNode("↻"));
         bar.appendChild(loopLabel);
-        window.__freeTtsLoop = initialLoopEnabled !== false;
-
-        // Repeat Current Sentence checkbox — unchecked by default
         const repeatCurrentLabel = document.createElement("label");
         repeatCurrentLabel.title = "Repeat Current Sentence";
         repeatCurrentLabel.style.cssText = "display:flex;align-items:center;gap:2px;font-size:12px;color:#555;padding:2px 4px;cursor:pointer;";
         const repeatCurrentCheck = document.createElement("input");
-        repeatCurrentCheck.type = "checkbox";
-        repeatCurrentCheck.id = "free-tts-repeat-current";
-        repeatCurrentCheck.checked = initialRepeatCurrent === true;
+        repeatCurrentCheck.type = "checkbox"; repeatCurrentCheck.id = "free-tts-repeat-current";
         repeatCurrentCheck.style.cssText = "margin:0;cursor:pointer;";
-        repeatCurrentCheck.addEventListener("change", () => {
-          if (!live()) return;
-          if (repeatCurrentCheck.checked) {
-            const loop = document.getElementById("free-tts-loop");
-            if (loop) loop.checked = false;
-          }
-          sendBarMessage({ action: "setRepeatCurrentState", enabled: repeatCurrentCheck.checked });
-        });
         repeatCurrentLabel.appendChild(repeatCurrentCheck);
         repeatCurrentLabel.appendChild(document.createTextNode("↻1"));
         bar.appendChild(repeatCurrentLabel);
         bar.style.cssText = "position:fixed;top:56px;right:16px;background:rgba(255,255,255,0.85);backdrop-filter:blur(8px);border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.06);padding:2px 4px;z-index:999999;display:flex;gap:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;cursor:move;user-select:none;";
-        bar.querySelectorAll("button").forEach(b => {
-          b.style.cssText = "border:none;background:none;font-size:14px;cursor:pointer;padding:2px 4px;border-radius:4px;color:#555;transition:background 0.15s;line-height:1;";
-          b.addEventListener("mouseenter", () => b.style.background = "#f0f0f0");
-          b.addEventListener("mouseleave", () => b.style.background = "none");
+        bar.querySelectorAll("button").forEach(button => {
+          button.style.cssText = "border:none;background:none;font-size:14px;cursor:pointer;padding:2px 4px;border-radius:4px;color:#555;transition:background 0.15s;line-height:1;";
         });
         document.body.appendChild(bar);
-        view.barCreated = true;
+        isolated.bar = bar;
+        isolated.renderControlBarSnapshot = renderControlBarSnapshot;
+        if (!renderControlBarSnapshot(bar, latest.snapshot, latest.modes)) throw new Error("Control bar render was rejected");
+        isolated.pendingRender = null;
+        isolated.barCreated = true;
+        window.__freeTtsControlBarOwner = barOwner;
 
-        // --- Drag to move ---
-        let drag = false, startX, startY, startLeft, startTop;
-        bar.addEventListener("mousedown", (e) => {
-          if (!live() || e.target.tagName === "BUTTON") return;  // don't drag when clicking buttons
-          drag = true;
-          startX = e.clientX; startY = e.clientY;
-          const rect = bar.getBoundingClientRect();
-          startLeft = rect.left; startTop = rect.top;
-          e.preventDefault();
+        const normalized = target => target?.nodeType === 3 ? target.parentNode : target;
+        const eventPath = event => event.composedPath?.() || [event.target];
+        const insideBar = event => eventPath(event).some(target => {
+          const node = normalized(target);
+          return node === bar || (node?.nodeType && bar.contains(node));
         });
-        const onMouseMove = (e) => {
-          if (!live() || !drag) return;
-          bar.style.transform = "none";
-          bar.style.left = (startLeft + e.clientX - startX) + "px";
-          bar.style.top = (startTop + e.clientY - startY) + "px";
+        const interactive = event => eventPath(event).some(target => {
+          for (let node = normalized(target); node && node !== bar; node = node.parentNode) {
+            if (["BUTTON", "INPUT", "LABEL"].includes(node.tagName)) return true;
+          }
+          return false;
+        });
+        const readSelection = () => {
+          const selection = window.getSelection();
+          return selection ? { anchorNode: selection.anchorNode, anchorOffset: selection.anchorOffset,
+            focusNode: selection.focusNode, focusOffset: selection.focusOffset, text: selection.toString(), collapsed: selection.isCollapsed } : null;
         };
-        const onDragMouseUp = () => { drag = false; };
-        document.addEventListener("mousemove", onMouseMove);
-        document.addEventListener("mouseup", onDragMouseUp);
-
-        // --- Button handlers ---
-        bar.querySelector("#free-tts-prev").addEventListener("click", () => sendBarMessage({ action: "prevSentence" }));
-        bar.querySelector("#free-tts-next").addEventListener("click", () => sendBarMessage({ action: "nextSentence" }));
-        bar.querySelector("#free-tts-toggle").addEventListener("click", () => {
-          sendBarMessage({ action: "togglePlayback" });
-        });
-        bar.querySelector("#free-tts-close").addEventListener("click", () => sendBarMessage({ action: "stopPlayback" }));
-
-        // --- ESC key stops playback ---
-        const onKeyDown = (e) => {
-          if (e.key === "Escape") {
-            sendBarMessage({ action: "stopPlayback" });
+        const sameSelection = (a, b) => a === b || (!!a && !!b && a.anchorNode === b.anchorNode && a.anchorOffset === b.anchorOffset &&
+          a.focusNode === b.focusNode && a.focusOffset === b.focusOffset && a.text === b.text && a.collapsed === b.collapsed);
+        const invalidateSelection = () => {
+          gesture.gestureRevision++;
+          if (gesture.selectionTimer !== null) clearTimeout(gesture.selectionTimer);
+          gesture.selectionTimer = null; gesture.selectionSnapshot = null;
+        };
+        const cancelGesture = () => {
+          if (!live()) return;
+          invalidateSelection();
+          gesture.drag = null; gesture.origin = null; gesture.lastCompletedOrigin = null; gesture.selectionChanged = false;
+        };
+        const jumpToSelection = text => {
+          if (!live()) return;
+          const trimmed = text.trim(), sentences = window.__freeTtsSentences;
+          if (!trimmed || !sentences) return;
+          for (let idx = 0; idx < sentences.length; idx++) {
+            if (sentences[idx].includes(trimmed)) { sendBarAction("jumpToSentence", { idx }); return; }
           }
         };
-        document.addEventListener("keydown", onKeyDown);
-
-        // --- Double-click to jump to sentence ---
-        const onDoubleClick = () => {
+        const onMouseDown = event => {
           if (!live()) return;
-          const sel = window.getSelection();
-          if (!sel || !sel.toString().trim()) return;
-          const word = sel.toString().trim();
-          const sents = window.__freeTtsSentences;
-          if (!sents) return;
-          for (let i = 0; i < sents.length; i++) {
-            if (sents[i].includes(word)) {
-              sendBarMessage({ action: "jumpToSentence", idx: i });
-              return;
-            }
+          invalidateSelection();
+          gesture.origin = insideBar(event) ? "bar" : "page";
+          gesture.lastCompletedOrigin = null; gesture.selectionChanged = false; gesture.drag = null;
+          if (gesture.origin === "page") gesture.selectionSnapshot = readSelection();
+          else if (!interactive(event)) {
+            const rect = bar.getBoundingClientRect();
+            gesture.drag = { startX: event.clientX, startY: event.clientY, startLeft: rect.left, startTop: rect.top };
           }
         };
-        document.addEventListener("dblclick", onDoubleClick);
-
-        // --- Drag-select to jump to sentence ---
-        const onSelectionMouseUp = () => {
-          if (!live()) return;
+        const onMouseMove = event => {
+          if (!live() || !gesture.drag) return;
+          const drag = gesture.drag;
+          bar.style.transform = "none"; bar.style.right = "auto";
+          bar.style.left = (drag.startLeft + event.clientX - drag.startX) + "px";
+          bar.style.top = (drag.startTop + event.clientY - drag.startY) + "px";
+        };
+        const onSelectionChange = () => {
+          if (live() && gesture.origin === "page" && !sameSelection(gesture.selectionSnapshot, readSelection())) gesture.selectionChanged = true;
+        };
+        const onMouseUp = event => {
+          if (!live() || !event || !gesture.origin) return;
+          const origin = gesture.origin;
+          gesture.lastCompletedOrigin = origin; gesture.origin = null; gesture.drag = null;
+          if (origin !== "page" || insideBar(event)) return;
+          const selected = readSelection();
+          if (!selected || selected.collapsed || !selected.text.trim() ||
+              (!gesture.selectionChanged && sameSelection(gesture.selectionSnapshot, selected))) return;
+          gesture.selectionSnapshot = selected;
+          const ticket = gesture.gestureRevision;
           const timer = setTimeout(() => {
-            selectionTimers.delete(timer);
-            if (!live()) return;
-            const sel = window.getSelection();
-            if (!sel || sel.isCollapsed) return;
-            const text = sel.toString().trim();
-            if (!text) return;
-            const sents = window.__freeTtsSentences;
-            if (!sents) return;
-            for (let i = 0; i < sents.length; i++) {
-              if (sents[i].includes(text)) {
-                sendBarMessage({ action: "jumpToSentence", idx: i });
-                return;
-              }
-            }
+            if (gesture.selectionTimer === timer) gesture.selectionTimer = null;
+            if (!live() || ticket !== gesture.gestureRevision || gesture.selectionSnapshot !== selected || !sameSelection(selected, readSelection())) return;
+            jumpToSelection(selected.text);
           }, 100);
-          selectionTimers.add(timer);
+          gesture.selectionTimer = timer;
         };
-        document.addEventListener("mouseup", onSelectionMouseUp);
-
+        const onBarInteraction = () => {
+          if (!live()) return;
+          invalidateSelection();
+          gesture.lastCompletedOrigin = "bar";
+          if (gesture.origin !== "bar") gesture.origin = null;
+          gesture.drag = null;
+        };
+        const onDoubleClick = event => {
+          if (!live()) return;
+          const fromBar = insideBar(event) || gesture.origin === "bar" || gesture.lastCompletedOrigin === "bar";
+          invalidateSelection();
+          if (!fromBar) jumpToSelection(readSelection()?.text || "");
+        };
+        const onKeyDown = event => {
+          if (!live() || event.key !== "Escape") return;
+          cancelGesture();
+          sendBarAction("stopPlayback");
+        };
+        listen(document, "mousedown", onMouseDown, true);
+        listen(document, "mousemove", onMouseMove);
+        listen(document, "mouseup", onMouseUp);
+        listen(document, "selectionchange", onSelectionChange);
+        listen(document, "dblclick", onDoubleClick);
+        listen(document, "keydown", onKeyDown);
+        listen(document, "pointercancel", cancelGesture);
+        listen(document, "visibilitychange", () => { if (document.hidden) cancelGesture(); });
+        listen(window, "blur", cancelGesture);
+        for (const type of ["click", "change", "keydown", "focusin"]) listen(bar, type, onBarInteraction, true);
+        for (const [id, action] of [["prev", "prevSentence"], ["next", "nextSentence"], ["toggle", "togglePlayback"], ["close", "stopPlayback"]]) {
+          listen(bar.querySelector(`#free-tts-${id}`), "click", () => sendBarAction(action));
+        }
+        listen(loopCheck, "change", () => {
+          if (!live()) return;
+          if (loopCheck.checked) repeatCurrentCheck.checked = false;
+          window.__freeTtsLoop = loopCheck.checked;
+          sendBarAction("setLoopState", { enabled: loopCheck.checked });
+        });
+        listen(repeatCurrentCheck, "change", () => {
+          if (!live()) return;
+          if (repeatCurrentCheck.checked) { loopCheck.checked = false; window.__freeTtsLoop = false; }
+          sendBarAction("setRepeatCurrentState", { enabled: repeatCurrentCheck.checked });
+        });
+        bar.querySelectorAll("button").forEach(button => {
+          listen(button, "mouseenter", () => { if (live()) button.style.background = "#f0f0f0"; });
+          listen(button, "mouseleave", () => { if (live()) button.style.background = "none"; });
+        });
         const cleanup = () => {
-          if (!alive) return;
-          alive = false; drag = false;
-          for (const timer of selectionTimers) clearTimeout(timer);
-          selectionTimers.clear();
-          document.removeEventListener("mousemove", onMouseMove);
-          document.removeEventListener("mouseup", onDragMouseUp);
-          document.removeEventListener("dblclick", onDoubleClick);
-          document.removeEventListener("mouseup", onSelectionMouseUp);
-          document.removeEventListener("keydown", onKeyDown);
+          if (!gesture.alive) return;
+          gesture.alive = false;
+          invalidateSelection();
+          gesture.drag = null; gesture.origin = null; gesture.lastCompletedOrigin = null;
+          for (const { target, type, callback, capture } of handles) target.removeEventListener(type, callback, capture);
+          handles.length = 0;
           bar.remove();
+          if (isolated.cleanup === cleanup) {
+            isolated.retired = true; isolated.barCreated = false; isolated.pendingRender = null;
+            isolated.bar = null; isolated.renderControlBarSnapshot = null; isolated.cleanup = null;
+          }
           if (window.__freeTtsCleanupControlBar === cleanup) delete window.__freeTtsCleanupControlBar;
         };
-        window.__freeTtsCleanupControlBar = cleanup;
+        isolated.cleanup = window.__freeTtsCleanupControlBar = cleanup;
         return "rendered";
       },
       args: [pageOwner(owner), snapshot, modes],
@@ -1086,7 +1137,7 @@ async function showControlBar(owner, snapshot, modes) {
     if (!["rendered", "deferred"].includes(result?.result)) throw new Error("Control bar creation returned no receipt");
     return result.result;
   } catch (error) {
-    if (snapshot.viewRevision === viewRevision) failOwnedPlayback(owner, "render-failure", error);
+    if (snapshot.viewRevision === viewRevision) failOwnedPlayback(pipeline, "render-failure", error);
     return "deferred";
   }
 }
@@ -1094,28 +1145,25 @@ async function showControlBar(owner, snapshot, modes) {
 async function updateControlBar(owner, snapshot, modes) {
   // Existing navigation callers still supply a tab ID; render canonical state.
   if (typeof owner === "number") { owner = sentencePipeline; snapshot = buildPlaybackSnapshot(owner); modes = owner && playbackModes(owner); }
-  const pipeline = sentencePipeline;
-  if (!ownsPipeline(pipeline) || !owner || owner.leaseId !== pipeline.leaseId || owner.sessionId !== pipeline.sessionId || owner.lifecycleRevision !== pipeline.lifecycleRevision) return "deferred";
+  const pipeline = navigationPipeline(owner);
+  if (!pipeline) return "deferred";
   try {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: owner.tabId },
       func: (binding, current, currentModes) => {
         const view = window.__freeTtsView;
-        if (!view || view.retired || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
-        if (current.viewRevision < view.viewRevision) return "rendered";
+        if (!view || view.retired || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId ||
+            view.lifecycleRevision !== binding.lifecycleRevision || current.sessionId !== binding.sessionId) return "deferred";
+        view.highestRenderedViewRevision ??= view.viewRevision ?? 0;
+        if (current.viewRevision < view.highestRenderedViewRevision) return "rendered";
         if (!view.barCreated) {
-          if (!view.pendingRender || current.viewRevision >= view.pendingRender.snapshot.viewRevision) view.pendingRender = { snapshot: current, modes: currentModes };
+          if (!view.pendingRender || current.viewRevision > view.pendingRender.snapshot.viewRevision) view.pendingRender = { snapshot: current, modes: currentModes };
           return "deferred";
         }
         const btn = document.getElementById("free-tts-toggle");
-        if (!btn) throw new Error("Control bar is missing");
-        const paused = current.state === "paused", title = paused ? "Resume" : "Pause";
-        btn.textContent = paused ? "▶" : "⏸";
-        btn.title = title;
-        btn.setAttribute("aria-label", title);
-        document.getElementById("free-tts-loop").checked = currentModes.loopEnabled;
-        document.getElementById("free-tts-repeat-current").checked = currentModes.repeatCurrentEnabled;
-        view.viewRevision = current.viewRevision;
+        const bar = document.getElementById("free-tts-bar");
+        if (!bar || bar !== view.bar || !btn || bar.querySelector("#free-tts-toggle") !== btn || !view.renderControlBarSnapshot) throw new Error("Owned control bar is missing");
+        if (!view.renderControlBarSnapshot(bar, current, currentModes)) throw new Error("Control bar render was rejected");
         return "rendered";
       },
       args: [pageOwner(owner), snapshot, modes],
@@ -1138,8 +1186,8 @@ async function hideControlBar(owner, retirementRevision) {
           (view.lifecycleRevision === binding.lifecycleRevision && view.sessionId !== binding.sessionId)) return;
       view.lifecycleFloor = floor; view.retired = true;
       view.pendingRender = null; view.barCreated = false;
-      if (typeof window.__freeTtsCleanupControlBar === "function") window.__freeTtsCleanupControlBar();
-      else document.getElementById("free-tts-bar")?.remove();
+      if (view.cleanup) view.cleanup();
+      else view.bar?.remove();
     }, args: [owner, retirementRevision],
   });
 }
