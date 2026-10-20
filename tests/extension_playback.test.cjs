@@ -587,7 +587,7 @@ test('F-2 direct_media_pause_then_popup_resume', async t => {
   });
 });
 
-const completionPoll = entry => entry.world === 'MAIN' && entry.source.includes('record.audio.ended');
+const completionPoll = entry => entry.world === 'MAIN' && entry.source.includes('const ended = !!record.audio.ended');
 
 function boundModeMessage(h, action, enabled) {
   const pipeline = h.worker.pipeline;
@@ -1052,12 +1052,12 @@ test('W14 replace_pending_attempt_boundaries', async t => {
   });
 });
 
-// A navigation stop dispatched by a retired owner cannot target the active Audio.
+// A selection dispatched by a retired owner cannot target the active Audio.
 test('navigation_dispatched_before_replacement_is_owner_bound', async () => {
   const h = harness(); const first = h.start(); await h.ready(); await first;
-  const navigationStop = entry => entry.world === 'MAIN' && (entry.func.name === 'injectNavigationStop' || entry.source.includes('const s = window.__freeTtsAudio'));
-  const next = h.send({ action: 'nextSentence', source: 'popup' }, {});
-  const held = h.scripts.pending(navigationStop);
+  const selectingAttempt = entry => entry.func.name === 'injectSelectAttempt';
+  const next = h.send({ action: 'nextSentence', source: 'popup' }, {}); await h.drain();
+  const held = h.scripts.pending(selectingAttempt);
   const second = h.start(), successor = h.worker.pipeline;
   await h.ready(entry => entry === held); await second;
   const audio = h.page(7).__freeTtsAudio, plays = h.audioSpy.plays.length;
@@ -1411,4 +1411,309 @@ test('lease_claim_contention_is_bounded', async () => {
   assert.equal((await h.snapshot()).state, 'idle'); assert.equal(h.worker.pipeline, null);
   assert.equal(h.audioSpy.constructors.length, 0); assert.equal(h.audioSpy.plays.length, 0);
   await h.finish();
+});
+
+function boundNavigation(h, action, idx) {
+  const pipeline = h.worker.pipeline;
+  return h.send({ action, idx, source: 'bar', leaseId: pipeline.leaseId,
+    sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision }, { tab: { id: pipeline.tabId } });
+}
+
+// Reusing an index as ownership, or retiring only after the navigation injection
+// completes, revives the old loader/activation when navigation returns to idx 0.
+test('W15 same_index_and_return_navigation', async t => {
+  for (const route of ['same-index', 'away-and-back']) for (const boundary of ['cache', 'fallback', 'highlight', 'activation']) {
+    await t.test(`${route}-${boundary}`, async () => {
+      const h = harness(); const started = h.start(); let held, fallback;
+      if (boundary === 'fallback') {
+        await h.flush({ holdResponse: () => true }); await h.clock.advance(10000); await h.drain();
+        fallback = h.fetches[2]; assert.ok(fallback, 'old current-sentence fallback is pending');
+        await h.flush({ holdResponse: entry => entry === fallback });
+      } else if (boundary === 'cache') await h.flush();
+      else { await h.ready(boundary === 'highlight' ? highlight : activation); held = h.scripts.pending(boundary === 'highlight' ? highlight : activation); }
+      await started;
+      const pipeline = h.worker.pipeline, original = pipeline.attempt, originalLoader = original.loadPromise;
+      const commands = [boundNavigation(h, 'jumpToSentence', route === 'same-index' ? 0 : 1)];
+      const second = pipeline.attempt;
+      assert.notEqual(second.attemptId, original.attemptId, 'navigation allocates a new attempt before any await');
+      assert.equal(original.retired, true, 'the displaced attempt loses observer/load authority synchronously');
+      if (route === 'away-and-back') {
+        commands.push(boundNavigation(h, 'jumpToSentence', 0));
+        assert.ok(pipeline.attempt.attemptId > second.attemptId, 'returning to idx 0 is another distinct attempt');
+        assert.equal(second.retired, true);
+      }
+      const latest = pipeline.attempt;
+      const holds = { holdScript: entry => entry === held, holdResponse: entry => entry === fallback };
+      await h.flush(holds); await Promise.all(commands);
+      const record = h.page(7).__freeTtsPlayback, audio = record.audio;
+      assert.ok(audio, 'the selected successor activates without releasing obsolete work');
+      assert.equal(record.attemptId, latest.attemptId); assert.equal(record.attemptFloor, latest.attemptId);
+      assert.equal(latest.audioId, record.audioId); assert.notEqual(latest.loadPromise, originalLoader);
+      assert.equal(pipeline.currentIdx, 0); assert.equal(latest.idx, 0);
+      assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+      assert.equal(h.audioSpy.plays[0].audio, audio);
+      assert.equal(h.audioSpy.constructors[0].url, 'data:audio/mpeg;base64,AQ==');
+      const scripts = h.scripts.entries.length, cache = [...pipeline.cache];
+      if (held) { h.execute(held); await h.complete(held); }
+      if (fallback) { h.releaseResponse(fallback); fallback.body.resolve(Uint8Array.of(9).buffer); }
+      await h.flush(); await h.clock.advance(200); await h.flush();
+      assert.deepEqual([...pipeline.cache], cache, 'obsolete fallback bytes cannot overwrite the selected attempt cache');
+      assert.equal(h.worker.pipeline, pipeline); assert.equal(pipeline.attempt, latest);
+      assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(record.audioId, latest.audioId);
+      assert.equal(h.audioSpy.constructors.length, 1, 'old work cannot create another Audio at the same index');
+      assert.equal(h.audioSpy.plays.length, 1, 'old work cannot play after returning to its index');
+      assert.equal(latest.completionObserved, false); assert.equal(latest.completionConsumed, false);
+      assert.equal(h.scripts.entries.slice(scripts).some(entry => activation(entry) || highlight(entry)), false);
+      assert.ok(latest.pollTimer, 'only the latest attempt owns a scheduled completion observer');
+      assert.equal([...h.clock.timers.values()].filter(timer => !timer.repeat).length, 1);
+      await h.finish();
+    });
+  }
+
+  await t.test('stale-selection-cannot-dispose-newer-same-index-audio', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, original = pipeline.attempt, originalAudio = h.page(7).__freeTtsAudio;
+    const first = boundNavigation(h, 'jumpToSentence', 0), displaced = pipeline.attempt;
+    assert.ok(displaced.attemptId > original.attemptId);
+    const selectingDisplaced = entry => entry.func.name === 'injectSelectAttempt' && entry.args[0].attemptId === displaced.attemptId;
+    await h.flush({ holdScript: entry => selectingDisplaced(entry) || activation(entry) });
+    const selection = h.scripts.pending(selectingDisplaced);
+    const second = boundNavigation(h, 'jumpToSentence', 1);
+    const third = boundNavigation(h, 'jumpToSentence', 0), latest = pipeline.attempt;
+    await h.flush({ holdScript: entry => entry === selection }); await Promise.all([second, third]);
+    const record = h.page(7).__freeTtsPlayback, audio = record.audio;
+    assert.notEqual(audio, originalAudio); assert.equal(record.attemptFloor, latest.attemptId);
+    const pauses = h.audioSpy.pauses.length, plays = h.audioSpy.plays.length;
+    const receipt = h.execute(selection);
+    await h.complete(selection); await h.flush(); await first;
+    assert.equal(record.audio, audio, 'stale selection cannot replace or clear successor Audio');
+    assert.equal(record.attemptId, latest.attemptId); assert.equal(receipt.disposition, 'stale');
+    assert.equal(record.audioId, latest.audioId); assert.equal(audio.paused, false); assert.notEqual(audio.src, '');
+    assert.equal(h.audioSpy.pauses.length, pauses, 'stale selection cannot pause/dispose successor Audio');
+    assert.equal(h.audioSpy.plays.length, plays); assert.equal(pipeline.attempt, latest);
+    await h.finish();
+  });
+
+  await t.test('navigation-during-session-installation', async () => {
+    const h = harness(); const started = h.start();
+    await h.flush({ holdScript: sessionInstall });
+    const held = h.scripts.pending(sessionInstall), pipeline = h.worker.pipeline, original = pipeline.attempt;
+    const jump = boundNavigation(h, 'jumpToSentence', 0), latest = pipeline.attempt;
+    assert.ok(latest.attemptId > original.attemptId); assert.equal(original.retired, true);
+    h.execute(held); await h.complete(held); await h.ready();
+    assert.ok(h.page(7).__freeTtsAudio, 'new selection cannot deadlock the shared session-install barrier');
+    assert.equal(h.page(7).__freeTtsPlayback.attemptId, latest.attemptId);
+    assert.equal(latest.audioId, h.page(7).__freeTtsPlayback.audioId);
+    assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1);
+    await Promise.all([started, jump]); await h.finish();
+  });
+
+  await t.test('invalid-navigation-and-previous-at-zero-have-no-effects', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started; await h.pause();
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, audio = h.page(7).__freeTtsAudio;
+    const snapshot = await h.snapshot(), scripts = h.scripts.entries.length, pauses = h.audioSpy.pauses.length;
+    for (const idx of [-1, 2, 0.5, '0', null, undefined]) {
+      const response = await boundNavigation(h, 'jumpToSentence', idx);
+      assert.equal(response.ok, false); assert.equal(response.accepted, false);
+      assert.equal(response.commandError.code, 'invalid-argument');
+      assert.equal(response.sessionId, pipeline.sessionId); assert.equal(response.state, 'paused');
+      assert.equal(pipeline.attempt, attempt); assert.equal(attempt.retired, false);
+      assert.equal(h.scripts.entries.length, scripts, 'invalid jumps dispatch nothing');
+      assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(h.audioSpy.pauses.length, pauses);
+    }
+    const previous = await boundNavigation(h, 'prevSentence');
+    assert.equal(previous.accepted, false); assert.equal(previous.disposition, 'ignored');
+    assert.equal(pipeline.attempt, attempt); assert.equal(pipeline.isPaused, true);
+    assert.equal(h.scripts.entries.length, scripts); assert.deepEqual(await h.snapshot(), snapshot);
+    await h.finish();
+  });
+
+  await t.test('previous-and-next-select-fresh-attempts-and-running-intent', async () => {
+    const h = harness(); const started = h.worker.start(7, 'First sentence. Second sentence.'); await h.ready(); await started;
+    const pipeline = h.worker.pipeline;
+    assert.equal(pipeline.loopEnabled, true); assert.equal(pipeline.repeatCurrentEnabled, false);
+    for (const [action, idx] of [['nextSentence', 1], ['prevSentence', 0]]) {
+      await h.pause();
+      const previous = pipeline.attempt, revision = pipeline.intentRevision;
+      const navigation = boundNavigation(h, action), latest = pipeline.attempt;
+      assert.ok(latest.attemptId > previous.attemptId); assert.equal(previous.retired, true);
+      assert.equal(latest.idx, idx); assert.equal(pipeline.currentIdx, idx);
+      assert.equal(pipeline.isPaused, false); assert.equal(pipeline.intentRevision, revision + 1);
+      assert.equal(pipeline.localIntentFloor, pipeline.intentRevision);
+      await h.flush(); const response = await navigation;
+      assert.equal(response.accepted, true); assert.equal(response.sessionId, pipeline.sessionId);
+      assert.equal(h.page(7).__freeTtsPlayback.attemptId, latest.attemptId);
+      assert.equal(h.page(7).__freeTtsPlayback.audioId, latest.audioId);
+      assert.equal(h.page(7).__freeTtsAudio.paused, false);
+    }
+    assert.equal(h.audioSpy.constructors.length, 3); await h.finish();
+  });
+
+  await t.test('stale-navigation-origins-cannot-bind-to-successor', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const predecessor = h.worker.pipeline;
+    const owner = { leaseId: predecessor.leaseId, sessionId: predecessor.sessionId, lifecycleRevision: predecessor.lifecycleRevision };
+    const replacement = h.start(); await h.ready(); await replacement;
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, audio = h.page(7).__freeTtsAudio;
+    const snapshot = await h.snapshot(), scripts = h.scripts.entries.length;
+    for (const action of ['prevSentence', 'nextSentence', 'jumpToSentence']) {
+      const response = await h.send({ action, idx: 0, source: 'bar', ...owner }, { tab: { id: pipeline.tabId } });
+      assert.equal(response.accepted, false); assert.equal(response.sessionId, pipeline.sessionId);
+      assert.equal(pipeline.attempt, attempt); assert.equal(h.page(7).__freeTtsAudio, audio);
+      assert.equal(h.scripts.entries.length, scripts); assert.deepEqual(await h.snapshot(), snapshot);
+    }
+    await h.finish();
+  });
+
+  await t.test('navigation-selects-without-overwriting-newer-pause', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, original = pipeline.attempt;
+    const jump = boundNavigation(h, 'jumpToSentence', 0), latest = pipeline.attempt;
+    assert.notEqual(latest.attemptId, original.attemptId);
+    const selectingLatest = entry => entry.func.name === 'injectSelectAttempt' && entry.args[0].attemptId === latest.attemptId;
+    await h.flush({ holdScript: entry => selectingLatest(entry) || activation(entry) });
+    const selection = h.scripts.pending(selectingLatest);
+    await h.pause(entry => entry === selection || activation(entry));
+    const plays = h.audioSpy.plays.length;
+    h.execute(selection); await h.complete(selection); await h.flush(); await jump;
+    assert.equal(pipeline.isPaused, true); assert.equal(pipeline.attempt, latest);
+    assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, true, 'selection itself never writes desired running state');
+    assert.equal(h.page(7).__freeTtsPlayback.attemptId, latest.attemptId);
+    assert.equal(h.page(7).__freeTtsAudio, null); assert.equal(h.audioSpy.plays.length, plays);
+    h.assertPausedBar(); await h.finish();
+  });
+});
+
+// Reading the global Audio alias or checking only idx 0 lets an old poll inspect
+// or advance its same-index successor; overlapping timer polls are also a bug.
+test('W16 poll_identity_and_no_overlap', async t => {
+  for (const execution of ['before-navigation', 'after-navigation']) await t.test(execution, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, original = pipeline.attempt, originalAudio = h.page(7).__freeTtsAudio;
+    originalAudio.ended = true;
+    await h.clock.advance(500); await h.drain();
+    const poll = h.scripts.pending(completionPoll);
+    assert.equal(original.pollInFlight, true);
+    await h.clock.advance(2000); await h.drain();
+    assert.equal(h.scripts.entries.filter(completionPoll).length, 1, 'only one old poll may remain in flight');
+    if (execution === 'before-navigation') {
+      const sample = h.execute(poll); assert.equal(sample.owned, true); assert.equal(sample.ended, true);
+    }
+    const jumped = boundNavigation(h, 'jumpToSentence', 0), latest = pipeline.attempt;
+    assert.equal(original.retired, true, 'navigation retires the old observer before page effects');
+    assert.ok(latest.attemptId > original.attemptId);
+    await h.flush({ holdScript: entry => entry === poll }); await jumped;
+    const record = h.page(7).__freeTtsPlayback, audio = record.audio;
+    assert.notEqual(audio, originalAudio); assert.equal(record.audioId, latest.audioId);
+    assert.equal(record.attemptId, latest.attemptId); assert.equal(pipeline.currentIdx, 0);
+    let successorReads = 0;
+    Object.defineProperty(audio, 'ended', { configurable: true, get() { successorReads++; return true; } });
+    const revision = record.audioRevision;
+    const sample = poll.executed ? poll.result : h.execute(poll);
+    await h.complete(poll); await h.flush();
+    assert.equal(successorReads, 0, 'old poll must not inspect successor Audio even transiently');
+    if (execution === 'after-navigation') assert.equal(sample.owned, false, 'an old attempt cannot observe the replacement Audio');
+    assert.equal(record.audioRevision, revision, 'old poll cannot write successor end/status observations');
+    assert.equal(pipeline.attempt, latest, 'obsolete completion cannot advance or retire the successor attempt'); assert.equal(pipeline.currentIdx, 0);
+    assert.equal(latest.completionObserved, false); assert.equal(latest.completionObservedWhilePaused, false);
+    assert.equal(latest.completionConsumed, false); assert.equal(h.page(7).__freeTtsAudio, audio);
+    assert.equal(h.audioSpy.constructors.length, 2); assert.equal(h.audioSpy.plays.length, 2);
+    assert.equal(original.pollTimer, null, 'old poll completion cannot schedule another old observer');
+    assert.ok(latest.pollTimer); assert.equal(latest.pollInFlight, false);
+    Object.defineProperty(audio, 'ended', { configurable: true, writable: true, value: false });
+    await h.finish();
+  });
+
+  await t.test('missing-audio-is-not-completion', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, record = h.page(7).__freeTtsPlayback, audio = record.audio;
+    record.audio = null; // The legacy global alias still points at the old Audio.
+    await h.clock.advance(500); await h.drain(); const poll = h.scripts.pending(completionPoll);
+    const sample = h.execute(poll); assert.equal(sample.owned, false);
+    await h.complete(poll); await h.flush();
+    assert.equal(attempt.completionObserved, false); assert.equal(attempt.completionConsumed, false);
+    assert.equal(pipeline.currentIdx, 0); assert.equal(h.audioSpy.constructors.length, 1);
+    record.audio = audio; await h.finish();
+  });
+});
+
+// Removing captured-owner checks from settings/load/script failures, or live
+// Audio/serial checks from play outcomes, would retire or damage same-index S2.
+test('W17 late_failure', async t => {
+  for (const failure of ['settings', 'fallback', 'intent-script', 'activation-script', 'selection-script', 'play']) await t.test(`${failure}-after-replacement`, async () => {
+    const h = harness(); const first = h.start(); let held, settings, fallback, navigation;
+    if (failure === 'settings') {
+      settings = h.storage.find(entry => 'serverUrl' in entry.defaults);
+      await h.flush({ holdStorage: entry => entry === settings });
+    } else if (failure === 'fallback') {
+      await h.flush({ holdResponse: () => true }); await h.clock.advance(10000); await h.drain();
+      fallback = h.fetches[2]; assert.ok(fallback);
+    } else if (failure.endsWith('script')) {
+      if (failure === 'selection-script') {
+        await h.ready(); await first;
+        navigation = boundNavigation(h, 'jumpToSentence', 0);
+        const predicate = entry => entry.func.name === 'injectSelectAttempt';
+        await h.flush({ holdScript: predicate }); held = h.scripts.pending(predicate);
+      } else {
+        const predicate = failure === 'intent-script' ? entry => entry.func.name === 'injectWorkerIntent' : activation;
+        await h.ready(predicate); held = h.scripts.pending(predicate);
+      }
+    } else { await h.ready(); await first; }
+    const predecessor = h.worker.pipeline;
+    const oldPlay = failure === 'play' ? h.audioSpy.plays[0] : null;
+    const second = h.start(), successor = h.worker.pipeline;
+    const holds = { holdScript: entry => entry === held, holdStorage: entry => entry === settings, holdResponse: entry => entry === fallback };
+    await h.flush(holds); await h.clock.advance(200); await h.flush(holds); await second;
+    const audio = h.page(7).__freeTtsAudio, record = h.page(7).__freeTtsPlayback;
+    const bar = h.page(7, 'ISOLATED').document.getElementById('free-tts-bar');
+    const media = h.page(7).navigator.mediaSession, metadata = media.metadata, playHandler = media.handlers.get('play');
+    const snapshot = await h.snapshot(), cache = [...successor.cache], scripts = h.scripts.entries.length;
+    assert.ok(audio); assert.ok(bar); assert.equal(record.sessionId, successor.sessionId);
+    if (settings) settings.gate.reject(new Error('obsolete settings rejection'));
+    else if (fallback) fallback.response.reject(new Error('obsolete fallback rejection'));
+    else if (held) await h.fail(held, new Error('obsolete script rejection'));
+    else oldPlay.outcome.reject(new Error('obsolete play rejection'));
+    await h.flush(); await first;
+    if (navigation) {
+      const response = await navigation;
+      assert.equal(response.sessionId, successor.sessionId, 'obsolete selection rejection responds with the current owner snapshot');
+      assert.equal(response.ok, true, 'an obsolete failure cannot fail the current owner');
+    }
+    assert.equal(predecessor.cancelled, true); assert.equal(h.worker.pipeline, successor);
+    assert.equal(h.worker.active.sessionId, successor.sessionId); assert.equal(successor.attempt.audioId, record.audioId);
+    assert.deepEqual(await h.snapshot(), snapshot); assert.deepEqual([...successor.cache], cache);
+    assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(audio.paused, false); assert.notEqual(audio.src, '');
+    assert.equal(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'), bar);
+    assert.equal(media.metadata, metadata); assert.equal(media.handlers.get('play'), playHandler);
+    assert.equal(h.scripts.entries.slice(scripts).some(entry => entry.func.name === 'clearMediaSession'), false);
+    assert.equal(record.audioError, null); assert.equal(successor.attempt.completionObservedWhilePaused, false);
+    await h.finish();
+  });
+
+  await t.test('play-rejection-invalidated-by-pause-is-nonfatal', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, play = h.audioSpy.plays[0];
+    await h.pause(); const snapshot = await h.snapshot(), messages = h.messages.length;
+    play.outcome.reject(new Error('expected invalidated play rejection')); await h.flush();
+    assert.equal(h.worker.pipeline, pipeline); assert.equal(pipeline.attempt, attempt);
+    assert.deepEqual(await h.snapshot(), snapshot); assert.equal(play.audio.paused, true);
+    assert.equal(h.page(7).__freeTtsPlayback.audioError, null); assert.equal(h.messages.length, messages);
+    h.assertPausedBar(); await h.finish();
+  });
+
+  await t.test('future-preload-rejection-is-nonfatal', async () => {
+    const h = harness(); const started = h.start();
+    await h.flush({ holdResponse: entry => entry.sentence === 2 }); await h.clock.advance(200);
+    await h.flush({ holdResponse: entry => entry.sentence === 2 }); await started;
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, audio = h.page(7).__freeTtsAudio;
+    const snapshot = await h.snapshot(), pending = h.fetches.filter(entry => entry.sentence === 2 && !entry.response.settled);
+    assert.ok(pending.length > 0);
+    for (const entry of pending) entry.response.reject(new Error('future sentence unavailable'));
+    await h.flush();
+    assert.equal(h.worker.pipeline, pipeline); assert.equal(pipeline.attempt, attempt);
+    assert.deepEqual(await h.snapshot(), snapshot); assert.equal(h.page(7).__freeTtsAudio, audio);
+    assert.equal(audio.paused, false); assert.equal(pipeline.cache.has(1), false);
+    assert.ok(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'));
+    await h.finish();
+  });
 });

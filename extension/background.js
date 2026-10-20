@@ -149,14 +149,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "mediaResume") {
     return sendAsyncResponse(sendResponse, syncPausedState(false).then(() => ({ ok: true })));
   }
-  if (msg.action === "prevSentence") {
-    return sendAsyncResponse(sendResponse, prevSentence().then(() => ({ ok: true })));
-  }
-  if (msg.action === "nextSentence") {
-    return sendAsyncResponse(sendResponse, nextSentence().then(() => ({ ok: true })));
-  }
-  if (msg.action === "jumpToSentence") {
-    return sendAsyncResponse(sendResponse, jumpToSentence(msg.idx).then(() => ({ ok: true })));
+  if (["prevSentence", "nextSentence", "jumpToSentence"].includes(msg.action)) {
+    const pipeline = sentencePipeline;
+    const bound = !!sender.tab || msg.source === "bar" || msg.source === "media";
+    if (!ownsPipeline(pipeline) || (bound && (sender.tab?.id !== pipeline.tabId ||
+        !["bar", "media"].includes(msg.source) || msg.leaseId !== pipeline.leaseId ||
+        msg.sessionId !== pipeline.sessionId || msg.lifecycleRevision !== pipeline.lifecycleRevision))) {
+      sendResponse(commandResponse(false)); return false;
+    }
+    const owner = pageOwner(pipeline);
+    return sendAsyncResponse(sendResponse, msg.action === "prevSentence" ? prevSentence(owner)
+      : msg.action === "nextSentence" ? nextSentence(owner) : jumpToSentence(owner, msg.idx));
   }
   if (msg.action === "setLoopState") {
     if (sentencePipeline && sender.tab?.id === sentencePipeline.tabId) {
@@ -464,7 +467,6 @@ async function installPlayback(pipeline) {
   const [view] = await chrome.scripting.executeScript({ target: { tabId: owner.tabId }, func: injectViewSession, args: [owner] });
   if (!ownsPipeline(pipeline)) return;
   if (!view?.result?.installed) throw new Error("Isolated session installation rejected");
-  await selectAttempt(pipeline, pipeline.attempt, true);
 }
 
 function injectViewSession(owner) {
@@ -529,12 +531,12 @@ function injectPlaybackSession(owner, workerToken) {
   return { installed: true };
 }
 
-function selectAttempt(pipeline, attempt, installed = false) {
+function selectAttempt(pipeline, attempt) {
   if (!ownsPipeline(pipeline, attempt)) return Promise.resolve(null);
   if (!attempt.selectionPromise) {
     const capability = workerIntent(pipeline);
     attempt.selectionPromise = (async () => {
-      if (!installed) await pipeline.installPromise;
+      await pipeline.installPromise;
       if (!ownsPipeline(pipeline, attempt)) return null;
       const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
         func: injectSelectAttempt, args: [capability] });
@@ -542,7 +544,10 @@ function selectAttempt(pipeline, attempt, installed = false) {
       attempt.selectionReceipt = result?.result;
       requestActivation(pipeline, attempt);
       return attempt.selectionReceipt;
-    })();
+    })().catch(error => {
+      failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+      return null;
+    });
   }
   return attempt.selectionPromise;
 }
@@ -556,7 +561,7 @@ function injectSelectAttempt(capability) {
   if (record.audio) { record.audio.pause(); record.audio.src = ""; record.audioRevision++; }
   record.attemptId = record.attemptFloor = capability.attemptId;
   record.audio = window.__freeTtsAudio = null;
-  record.audioId = null; record.audioStatus = "none";
+  record.audioId = null; record.audioStatus = "none"; record.audioError = null;
   return record.receipt("applied");
 }
 
@@ -1000,66 +1005,54 @@ async function hideControlBar(owner, retirementRevision) {
   });
 }
 
-// --- Prev/next sentence ----------------------------------------------------
-function injectNavigationStop(owner, attemptId) {
-  const record = window.__freeTtsPlayback;
-  if (!record || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
-      record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId) return;
-  record.pause();
-  if (record.audio) record.audio.src = "";
+// --- Prev/next/jump sentence -----------------------------------------------
+function navigationPipeline(owner) {
+  const pipeline = sentencePipeline;
+  return ownsPipeline(pipeline) && owner && owner.tabId === pipeline.tabId && owner.leaseId === pipeline.leaseId &&
+    owner.sessionId === pipeline.sessionId && owner.lifecycleRevision === pipeline.lifecycleRevision ? pipeline : null;
 }
 
-async function prevSentence() {
-  const pipeline = sentencePipeline, attempt = pipeline?.attempt;
-  if (!ownsPipeline(pipeline) || pipeline.currentIdx <= 0) return;
-  // currentIdx is the sentence currently playing (increment happens only after
-  // playback ends), so go back one to reach the previous sentence.
-  pipeline.currentIdx -= 1;
-  if (pipeline.currentIdx < 0) pipeline.currentIdx = 0;
-  pipeline.isPaused = false;
-  try {
-    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
-      func: injectNavigationStop, args: [pageOwner(pipeline), attempt.attemptId] });
-  } catch (error) {
-    if (ownsPipeline(pipeline)) logError("stopping current audio before previous sentence", error);
-  }
-  if (!ownsPipeline(pipeline) || pipeline.attempt !== attempt) return;
-  void updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
-  await playNextSentence();
-}
-
-async function nextSentence() {
-  const pipeline = sentencePipeline, attempt = pipeline?.attempt;
-  if (!ownsPipeline(pipeline)) return;
-  pipeline.isPaused = false;
-  pipeline.currentIdx++;  // skip to next
-  try {
-    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
-      func: injectNavigationStop, args: [pageOwner(pipeline), attempt.attemptId] });
-  } catch (error) {
-    if (ownsPipeline(pipeline)) logError("stopping current audio before next sentence", error);
-  }
-  if (!ownsPipeline(pipeline) || pipeline.attempt !== attempt) return;
-  void updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
-  await playNextSentence();
-}
-
-// --- Jump to sentence -------------------------------------------------------
-async function jumpToSentence(idx) {
-  const pipeline = sentencePipeline, attempt = pipeline?.attempt;
-  if (!ownsPipeline(pipeline)) return;
-  if (idx < 0 || idx >= pipeline.sentences.length) return;
+async function navigateToSentence(pipeline, idx) {
+  // Selection and accepted running intent are synchronous worker decisions.
+  // MAIN selection only displaces the old Audio; it cannot undo a newer pause.
   pipeline.currentIdx = idx;
+  const attempt = createAttempt(pipeline, pipeline.initialized ? "loading" : "initializing");
   pipeline.isPaused = false;
-  try {
-    await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
-      func: injectNavigationStop, args: [pageOwner(pipeline), attempt.attemptId] });
-  } catch (error) {
-    if (ownsPipeline(pipeline)) logError("stopping current audio before sentence jump", error);
+  pipeline.localIntentFloor = ++pipeline.intentRevision;
+  viewRevision++;
+  const capability = workerIntent(pipeline);
+  const render = updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+  const selection = selectAttempt(pipeline, attempt);
+  const application = applyWorkerIntent(pipeline, capability);
+  void playNextSentence(pipeline, attempt);
+  const [, receipt] = await Promise.all([selection, application, render]);
+  return commandResponse(true, receipt || { disposition: "stale" }, pipeline.failure || null);
+}
+
+async function prevSentence(owner) {
+  const pipeline = navigationPipeline(owner);
+  if (!pipeline || pipeline.currentIdx === 0) return commandResponse(false);
+  return navigateToSentence(pipeline, pipeline.currentIdx - 1);
+}
+
+async function nextSentence(owner) {
+  const pipeline = navigationPipeline(owner);
+  if (!pipeline) return commandResponse(false);
+  let idx = pipeline.currentIdx + 1;
+  if (idx >= pipeline.sentences.length) {
+    if (pipeline.repeatCurrentEnabled || pipeline.loopEnabled) idx = 0;
+    else return stopPlayback(pipeline, false);
   }
-  if (!ownsPipeline(pipeline) || pipeline.attempt !== attempt) return;
-  void updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
-  await playNextSentence();
+  return navigateToSentence(pipeline, idx);
+}
+
+async function jumpToSentence(owner, idx) {
+  const pipeline = navigationPipeline(owner);
+  if (!pipeline) return commandResponse(false);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= pipeline.sentences.length) {
+    return commandResponse(false, null, { code: "invalid-argument", message: "Invalid sentence index" });
+  }
+  return navigateToSentence(pipeline, idx);
 }
 
 // --- Sentence splitting ----------------------------------------------------
@@ -1228,6 +1221,9 @@ async function startSentenceTTS(tabId, text, ticket = null) {
     failOwnedPlayback(pipeline, "page-operation-failure", error);
     return null;
   });
+  // Selection follows the session barrier rather than participating in it;
+  // navigation during installation must never make that barrier await itself.
+  void selectAttempt(pipeline, pipeline.attempt);
   pipeline.initializationPromise = initializePlayback(pipeline).catch(error => {
     failOwnedPlayback(pipeline, "settings-failure", error);
   });
@@ -1279,44 +1275,33 @@ function preloadSentence(pipeline, idx) {
     .catch(error => { if (ownsPipeline(pipeline)) logError(`preloading sentence ${idx}`, error); });
 }
 
-async function playNextSentence(pipeline = sentencePipeline, attempt = null) {
-  if (!ownsPipeline(pipeline) || !pipeline.initialized) return;
-  const { sentences, currentIdx, cache, tabId, voice, serverUrl, speed } = pipeline;
-  const startIdx = currentIdx;
-  if (currentIdx >= sentences.length) {
-    if (pipeline.repeatCurrentEnabled || pipeline.loopEnabled) { pipeline.currentIdx = 0; return playNextSentence(pipeline); }
+async function playNextSentence(pipeline = sentencePipeline, attempt = pipeline?.attempt) {
+  if (!ownsAttempt(pipeline, attempt) || !pipeline.initialized) return;
+  if (attempt.completionConsumed) {
+    // Terminal completion delegates to the same captured-owner retirement.
     await stopPlayback(pipeline, false);
     return;
   }
-  if (!attempt) {
-    attempt = pipeline.attempt;
-    if (arguments.length === 0 || attempt.retired || attempt.idx !== currentIdx) {
-      attempt = createAttempt(pipeline);
-      pipeline.intentRevision++; pipeline.localIntentFloor = pipeline.intentRevision; viewRevision++;
-      await selectAttempt(pipeline, attempt);
-      if (!ownsPipeline(pipeline, attempt)) return;
-      await applyWorkerIntent(pipeline, workerIntent(pipeline));
-    }
-  }
-  if (!ownsAttempt(pipeline, attempt)) return;
+  const { sentences, cache, tabId, voice, serverUrl, speed } = pipeline;
+  const idx = attempt.idx;
   if (!attempt.loadPromise) attempt.loadPromise = (async () => {
-    let dataUrl = cache.get(startIdx);
+    let dataUrl = cache.get(idx);
     const start = Date.now();
     while (!dataUrl && Date.now() - start < 10000) {
       await new Promise(resolve => { attempt.cacheWake = resolve; attempt.cacheTimer = setTimeout(resolve, 200); });
       if (!ownsPipeline(pipeline, attempt)) return;
-      dataUrl = cache.get(startIdx);
+      dataUrl = cache.get(idx);
     }
     if (!dataUrl) {
-      dataUrl = await fetchSentenceAudio(serverUrl, voice, speed, sentences[startIdx]);
+      dataUrl = await fetchSentenceAudio(serverUrl, voice, speed, sentences[idx]);
       if (!ownsPipeline(pipeline, attempt)) return;
-      cache.set(startIdx, dataUrl);
+      cache.set(idx, dataUrl);
     }
     if (!ownsPipeline(pipeline, attempt)) return;
-    for (let idx = startIdx + 1; idx < startIdx + 1 + PRELOAD_AHEAD && idx < sentences.length; idx++) {
-      if (!cache.has(idx)) preloadSentence(pipeline, idx);
+    for (let nextIdx = idx + 1; nextIdx < idx + 1 + PRELOAD_AHEAD && nextIdx < sentences.length; nextIdx++) {
+      if (!cache.has(nextIdx)) preloadSentence(pipeline, nextIdx);
     }
-    await highlightCurrentSentence(tabId, startIdx, pipeline, attempt);
+    await highlightCurrentSentence(tabId, idx, pipeline, attempt);
     if (!ownsPipeline(pipeline, attempt)) return;
     attempt.dataUrl = dataUrl;
     setAttemptPhase(pipeline, attempt, "ready");
@@ -1354,7 +1339,9 @@ function requestActivation(pipeline, attempt) {
       adoptPageReceipt(pipeline, attempt, result?.result);
       if (attempt.audioId) scheduleCompletionPoll(pipeline, attempt);
     }).catch(error => {
-      if (pipeline.intentRevision === capability.intentRevision) failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+      if (pipeline.intentRevision === capability.intentRevision && pipeline.mediaRevision === capability.mediaRevision) {
+        failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+      }
     }).finally(() => { if (ownsPipeline(pipeline, attempt) && attempt.activationRequest === request) attempt.activationRequest = null; });
 }
 
@@ -1397,12 +1384,17 @@ async function pollCompletion(pipeline, attempt) {
     }
 
     attempt.completionConsumed = true;
-    attempt.retired = true;
-    clearTimeout(attempt.pollTimer);
-    attempt.pollTimer = null;
-    if (!pipeline.repeatCurrentEnabled) pipeline.currentIdx = attempt.idx + 1;
-    if (pipeline.currentIdx >= pipeline.sentences.length && pipeline.loopEnabled) pipeline.currentIdx = 0;
-    void playNextSentence(pipeline);
+    let nextIdx = pipeline.repeatCurrentEnabled ? attempt.idx : attempt.idx + 1;
+    if (nextIdx >= pipeline.sentences.length) {
+      if (pipeline.loopEnabled) nextIdx = 0;
+      else { void playNextSentence(pipeline, attempt); return; }
+    }
+    pipeline.currentIdx = nextIdx;
+    const nextAttempt = createAttempt(pipeline);
+    pipeline.intentRevision++; viewRevision++;
+    void selectAttempt(pipeline, nextAttempt);
+    void applyWorkerIntent(pipeline, workerIntent(pipeline));
+    void playNextSentence(pipeline, nextAttempt);
   } catch (error) {
     if (ownsPipeline(pipeline, attempt)) logError("polling playback", error);
   } finally {

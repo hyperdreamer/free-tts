@@ -1,4 +1,5 @@
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -84,16 +85,39 @@ def test_split_sentences_keeps_closing_quotes_with_sentence(
     assert split_sentences_like_frontend(relative_path, text) == expected
 
 
-# --- Pipeline guard: startIdx prevents concurrent index advancing ----------
+# --- Pipeline ownership and retained web-preview source guard --------------
+@pytest.mark.parametrize(
+    "case",
+    [
+        "W15 same_index_and_return_navigation",
+        "W16 poll_identity_and_no_overlap",
+    ],
+)
+def test_extension_pipeline_attempt_ownership(case):
+    result = subprocess.run(
+        [
+            "node",
+            "--test",
+            "--test-reporter=tap",
+            "--test-name-pattern",
+            case,
+            "tests/extension_playback.test.cjs",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert re.search(rf"(?m)^ok \d+ - {re.escape(case)}\r?$", result.stdout), (
+        f"Named ownership case did not run and pass: {case}\n{output}"
+    )
+
+
 @pytest.mark.parametrize(
     ("relative_path", "function_name", "guard_line"),
     [
-        pytest.param(
-            "extension/background.js",
-            "playNextSentence",
-            "const startIdx = currentIdx;",
-            id="extension-speak-this",
-        ),
         pytest.param(
             "script.js",
             "playNextPreviewSentence",
