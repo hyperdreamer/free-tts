@@ -305,13 +305,16 @@ async function changePausedState(pipeline, paused) {
     viewRevision++;
   }
 
+  // Replay selection may yield to a newer command; retain this command's
+  // accepted capability so its response cannot borrow that command's receipt.
+  const capability = workerIntent(pipeline);
   const acceptedSnapshot = buildPlaybackSnapshot(pipeline);
   const acceptedRender = updateControlBar(pipeline, acceptedSnapshot, playbackModes(pipeline));
   if (replayCompletedAttempt) {
     await selectAttempt(pipeline, attempt);
     if (!ownsPipeline(pipeline, attempt)) return commandResponse(false);
   }
-  const receipt = await applyWorkerIntent(pipeline, workerIntent(pipeline));
+  const receipt = await applyWorkerIntent(pipeline, capability);
   let currentRender = Promise.resolve();
   if (ownsPipeline(pipeline, attempt)) {
     if (!pipeline.isPaused) void playNextSentence(pipeline, attempt);
@@ -1381,7 +1384,13 @@ async function fetchSentenceAudio(serverUrl, voice, speed, sentence) {
     const contentType = resp.headers.get("content-type") || "audio/mpeg";
     return arrayBufferToDataUrl(buffer, contentType);
   } catch (error) {
-    if (controller.signal.aborted) error.code = "load-timeout";
+    if (controller.signal.aborted) {
+      // Native DOMException.code is read-only; keep application codes on an
+      // owned error while preserving the browser's message and cause.
+      const timeoutError = new Error(error.message || String(error), { cause: error });
+      timeoutError.code = "load-timeout";
+      throw timeoutError;
+    }
     throw error;
   } finally {
     clearTimeout(timeout);

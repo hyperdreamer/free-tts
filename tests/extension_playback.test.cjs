@@ -123,13 +123,14 @@ function harness(options = {}) {
     }
     return pages.get(tabId)[world];
   }
+  const abortError = options.abortError || (() => new Error('aborted'));
   const worker = vm.createContext({ chrome, ...timers, console: quietConsole, crypto: { randomUUID }, URL, AbortController, Uint8Array,
     Date: class extends Date { static now() { return clock.now; } }, btoa: value => Buffer.from(value, 'binary').toString('base64'),
     fetch(url, options) {
       const response = new Deferred(), body = new Deferred();
       const sentence = JSON.parse(options.body).ssml.includes('Second sentence.') ? 2 : 1;
       const entry = { url, options, response, body, sentence }; fetches.push(entry);
-      options.signal.addEventListener('abort', () => { response.reject(new Error('aborted')); body.reject(new Error('aborted')); });
+      options.signal.addEventListener('abort', () => { const error = abortError(options.signal); response.reject(error); body.reject(error); });
       return response.promise;
     },
   });
@@ -811,6 +812,61 @@ test('W09 end_observed_paused_replay', async () => {
   assert.equal(pipeline.attempt, successor);
   assert.equal(pipeline.currentIdx, 0);
   await h.finish();
+});
+
+// Rereading intent after replay selection must not acknowledge a newer pause
+// as the accepted resume's MAIN application.
+test('W09 paused_end_resume_overtaken_during_selection', async t => {
+  for (const boundary of ['selection-execution', 'selection-completion']) await t.test(boundary, async () => {
+    const h = harness();
+    try {
+      const started = h.start(); await h.ready(); await started;
+      const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
+      await h.pause();
+      const poll = await startOwnedEndPoll(h, endedAttempt);
+      await finishOwnedEndPoll(h, poll);
+      assert.equal(endedAttempt.completionObservedWhilePaused, true);
+
+      const entriesBefore = h.scripts.entries.length;
+      const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+      const replay = pipeline.attempt;
+      assert.notEqual(replay, endedAttempt); assert.equal(replay.idx, 0);
+      assert.equal(pipeline.intentRevision, 3);
+      const binding = { leaseId: pipeline.leaseId, sessionId: pipeline.sessionId,
+        lifecycleRevision: pipeline.lifecycleRevision, attemptId: replay.attemptId, mediaBase: 0 };
+      const selectingReplay = entry => entry.func.name === 'injectSelectAttempt' && entry.args[0].attemptId === replay.attemptId;
+      await h.flush({ holdScript: selectingReplay });
+      const selection = h.scripts.pending(selectingReplay);
+      assert.deepEqual({ ...selection.args[0] }, { ...binding, intentRevision: 3, paused: false });
+      if (boundary === 'selection-completion') h.execute(selection);
+
+      const paused = await h.pause(entry => entry === selection);
+      assert.equal(paused.accepted, true); assert.equal(paused.disposition, 'applied'); assert.equal(paused.pageApplied, true);
+      assert.equal(paused.intentRevision, 4); assert.equal(paused.state, 'paused');
+      assert.equal(selection.completion.settled, false, 'new pause acknowledges without releasing replay selection');
+      if (!selection.executed) h.execute(selection);
+      await h.complete(selection); await h.flush();
+      const response = await resumed;
+      const applications = h.scripts.entries.slice(entriesBefore).filter(entry => entry.func.name === 'injectWorkerIntent');
+      t.diagnostic(JSON.stringify({ boundary, response, capabilities: applications.map(entry => entry.args[0]) }));
+      assert.deepEqual({ ok: response.ok, accepted: response.accepted, disposition: response.disposition,
+        pageApplied: response.pageApplied, commandError: response.commandError },
+      { ok: true, accepted: true, disposition: 'superseded', pageApplied: false, commandError: null });
+      assert.deepEqual(applications.map(entry => ({ ...entry.args[0] })), [
+        { ...binding, intentRevision: 4, paused: true },
+        { ...binding, intentRevision: 3, paused: false },
+      ], 'each MAIN application retains its own accepted capability');
+      assert.deepEqual(applications.map(entry => entry.result.disposition), ['applied', 'stale']);
+      const { ok, accepted, disposition, pageApplied, commandError, ...snapshot } = response;
+      assert.deepEqual(snapshot, { ...await h.snapshot() }, 'superseded response carries the current canonical snapshot');
+      assert.equal(snapshot.state, 'paused'); assert.equal(snapshot.intentRevision, 4);
+      assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, true);
+      assert.equal(h.page(7).__freeTtsPlayback.attemptId, replay.attemptId);
+      assert.equal(pipeline.attempt, replay); assert.equal(pipeline.currentIdx, 0);
+      assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 1, 'overtaken resume cannot start replay Audio');
+      h.assertPausedBar();
+    } finally { await h.finish(); }
+  });
 });
 
 // F-10: a fresh paused observation must retain completion before a later
@@ -2109,6 +2165,33 @@ test('W24 current_errors', async t => {
     assert.equal(h.worker.pipeline, null);
     const snapshot = await h.snapshot(); assert.equal(snapshot.state, 'idle'); assert.equal(snapshot.error.code, failure);
     assertIdlePage(h); await h.finish();
+  });
+
+  await t.test('load-timeout-native-abort', async () => {
+    const h = harness({ abortError: signal => signal.reason });
+    try {
+      const started = h.start();
+      await h.flush({ holdResponse: () => true }); await started;
+      await h.clock.advance(10000); await h.drain();
+      const fallback = h.fetches[2], loader = h.worker.pipeline.attempt.loadPromise;
+      assert.ok(fallback, 'fallback dispatched after the 10000 ms cache bound');
+      for (const request of h.fetches) request.body.promise.catch(() => {});
+      await h.clock.advance(119999);
+      await h.flush({ holdResponse: () => true, holdBody: () => true });
+      assert.equal(fallback.options.signal.aborted, false, 'fallback remains live before its 120000 ms deadline');
+      assert.equal((await h.snapshot()).state, 'playing'); assert.equal((await h.snapshot()).error, null);
+      await h.clock.advance(1); await h.flush();
+      const nativeAbort = fallback.options.signal.reason;
+      assert.ok(nativeAbort instanceof DOMException); assert.equal(nativeAbort.name, 'AbortError');
+      const snapshot = await h.snapshot();
+      assert.equal(h.worker.pipeline, null); assert.equal(snapshot.state, 'idle');
+      assert.equal(snapshot.error.code, 'load-timeout', 'native AbortError must retain the public timeout classification');
+      assert.equal(snapshot.error.message, nativeAbort.message);
+      const failure = await loader.catch(error => error);
+      assert.equal(failure.cause, nativeAbort, 'timeout wrapper retains its native cause');
+      assert.equal(nativeAbort.code, 20, 'native read-only error code is preserved');
+      assertIdlePage(h);
+    } finally { await h.finish(); }
   });
 
   for (const operation of ['intent', 'activation', 'poll', 'render', 'create-bar']) {
