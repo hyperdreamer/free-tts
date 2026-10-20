@@ -43,7 +43,7 @@ function failOwnedPlayback(pipeline, code, error, attempt = null) {
   pipeline.failure = { code, message: error.message || String(error) };
   lastError = pipeline.failure;
   logError(code, error);
-  void stopPlayback(pipeline, false);
+  return stopPlayback(pipeline, false);
 }
 
 function commandResponse(accepted, receipt = null, commandError = null) {
@@ -107,10 +107,10 @@ function normalizeSpeed(value) {
 
 function sendAsyncResponse(sendResponse, promise) {
   promise
-    .then((result = { ok: true }) => sendResponse(result))
+    .then((result) => sendResponse({ ...result, ...buildPlaybackSnapshot() }))
     .catch((error) => {
       logError("handling runtime message", error);
-      sendResponse({ ok: false, error: error.message || "Operation failed" });
+      sendResponse(commandResponse(false, null, { code: "page-operation-failure", message: error.message || "Operation failed" }));
     });
   return true;
 }
@@ -124,60 +124,32 @@ function clearOwnedPlayback(pipeline) {
   if (sentencePipeline === pipeline) { clearPlayback(); viewRevision++; }
 }
 
-// --- Messages from popup ---------------------------------------------------
+// --- Messages from popup, bound bar, and isolated media relay ----------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (["speakSentences", "getPlaybackState", "pausePlayback", "resumePlayback", "togglePlayback"].includes(msg.action)) {
+  if (["speakSentences", "getPlaybackState", "pausePlayback", "resumePlayback", "togglePlayback", "stopPlayback",
+    "mediaPause", "mediaResume", "audioPlaybackEvent", "prevSentence", "nextSentence", "jumpToSentence",
+    "setLoopState", "setRepeatCurrentState"].includes(msg.action)) {
     return sendAsyncResponse(sendResponse, acceptRuntimeCommand(msg, sender));
   }
-  if (msg.action === "stopPlayback") {
-    const pipeline = sentencePipeline;
-    const bound = !!sender.tab || msg.source === "bar" || msg.source === "media";
-    if (bound && (!ownsPipeline(pipeline) || sender.tab?.id !== pipeline.tabId ||
-        !["bar", "media"].includes(msg.source) || msg.sessionId !== pipeline.sessionId ||
-        msg.leaseId !== pipeline.leaseId || msg.lifecycleRevision !== pipeline.lifecycleRevision)) {
-      sendResponse(commandResponse(false)); return false;
-    }
-    return sendAsyncResponse(sendResponse, stopPlayback(pipeline, !bound));
-  }
-
-  // Media keys already paused/played the Audio element in the page; only sync
-  // worker state (pipeline + control bar + context menu) without re-issuing
-  // audio control.
-  if (msg.action === "mediaPause") {
-    return sendAsyncResponse(sendResponse, syncPausedState(true).then(() => ({ ok: true })));
-  }
-  if (msg.action === "mediaResume") {
-    return sendAsyncResponse(sendResponse, syncPausedState(false).then(() => ({ ok: true })));
-  }
-  if (["prevSentence", "nextSentence", "jumpToSentence"].includes(msg.action)) {
-    const pipeline = sentencePipeline;
-    const bound = !!sender.tab || msg.source === "bar" || msg.source === "media";
-    if (!ownsPipeline(pipeline) || (bound && (sender.tab?.id !== pipeline.tabId ||
-        !["bar", "media"].includes(msg.source) || msg.leaseId !== pipeline.leaseId ||
-        msg.sessionId !== pipeline.sessionId || msg.lifecycleRevision !== pipeline.lifecycleRevision))) {
-      sendResponse(commandResponse(false)); return false;
-    }
-    const owner = pageOwner(pipeline);
-    return sendAsyncResponse(sendResponse, msg.action === "prevSentence" ? prevSentence(owner)
-      : msg.action === "nextSentence" ? nextSentence(owner) : jumpToSentence(owner, msg.idx));
-  }
-  if (msg.action === "setLoopState") {
-    if (sentencePipeline && sender.tab?.id === sentencePipeline.tabId) {
-      sentencePipeline.loopEnabled = msg.enabled !== false;
-      if (msg.enabled) sentencePipeline.repeatCurrentEnabled = false;
-    }
-    sendResponse({ ok: true });
-    return false;
-  }
-  if (msg.action === "setRepeatCurrentState") {
-    if (sentencePipeline && sender.tab?.id === sentencePipeline.tabId) {
-      sentencePipeline.repeatCurrentEnabled = msg.enabled !== false;
-      if (msg.enabled) sentencePipeline.loopEnabled = false;
-    }
-    sendResponse({ ok: true });
-    return false;
-  }
 });
+
+function resolveCommandPipeline(msg, sender) {
+  const pipeline = sentencePipeline;
+  if (!ownsPipeline(pipeline)) return null;
+  if (!sender.tab && !["bar", "media"].includes(msg.source)) return pipeline;
+  return ["bar", "media"].includes(msg.source) && sender.tab?.id === pipeline.tabId &&
+    msg.leaseId === pipeline.leaseId && msg.sessionId === pipeline.sessionId && msg.lifecycleRevision === pipeline.lifecycleRevision
+    ? pipeline : null;
+}
+
+function admitMediaAction(pipeline, msg) {
+  if (!pipeline || !Number.isSafeInteger(msg.intentRevision) || msg.intentRevision < pipeline.localIntentFloor ||
+      msg.intentRevision > pipeline.intentRevision || !Number.isSafeInteger(msg.mediaSequence) ||
+      msg.mediaSequence <= pipeline.lastMediaSequence || !Number.isSafeInteger(msg.mediaRevision) || msg.mediaRevision < 0 ||
+      typeof msg.paused !== "boolean") return false;
+  pipeline.lastMediaSequence = msg.mediaSequence;
+  return true;
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   const lease = pageLeases.get(tabId);
@@ -273,10 +245,33 @@ async function acceptRuntimeCommand(msg, sender) {
       if (pendingStart === ticket) pendingStart = null;
     }
   }
-  const pipeline = sentencePipeline;
-  if (!pipeline || (sender.tab
-    ? msg.source !== "bar" || sender.tab.id !== pipeline.tabId || msg.leaseId !== pipeline.leaseId || msg.sessionId !== pipeline.sessionId || msg.lifecycleRevision !== pipeline.lifecycleRevision
-    : msg.source === "bar")) return commandResponse(false);
+  const pipeline = resolveCommandPipeline(msg, sender);
+  const bound = !!sender.tab || ["bar", "media"].includes(msg.source);
+  if (msg.action === "stopPlayback" && !bound) return stopPlayback(sentencePipeline, true);
+  if (!pipeline) return commandResponse(false);
+  if (msg.action === "audioPlaybackEvent") return msg.source === "media" ? handleAudioOutcome(pipeline, msg) : commandResponse(false);
+  if (msg.source === "media" && !admitMediaAction(pipeline, msg)) return commandResponse(false);
+  if (["mediaPause", "mediaResume"].includes(msg.action)) {
+    return msg.source === "media" ? syncPausedState(pipeline, msg) : commandResponse(false);
+  }
+  if (msg.action === "stopPlayback") return stopPlayback(pipeline, false);
+  const owner = pageOwner(pipeline);
+  const media = msg.source === "media" ? msg : null;
+  if (msg.action === "prevSentence") return prevSentence(owner, media);
+  if (msg.action === "nextSentence") return nextSentence(owner, media);
+  if (msg.action === "jumpToSentence") return jumpToSentence(owner, msg.idx);
+  if (["setLoopState", "setRepeatCurrentState"].includes(msg.action)) {
+    if (typeof msg.enabled !== "boolean") return commandResponse(false, null, { code: "invalid-argument", message: "Mode must be a boolean" });
+    const key = msg.action === "setLoopState" ? "loopEnabled" : "repeatCurrentEnabled";
+    const other = key === "loopEnabled" ? "repeatCurrentEnabled" : "loopEnabled";
+    if (pipeline[key] !== msg.enabled || (msg.enabled && pipeline[other])) {
+      pipeline[key] = msg.enabled;
+      if (msg.enabled) pipeline[other] = false;
+      viewRevision++;
+    }
+    await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+    return commandResponse(true, null, pipeline.failure || null);
+  }
   return msg.action === "pausePlayback" || (msg.action === "togglePlayback" && !pipeline.isPaused) ? pausePlayback(pipeline) : resumePlayback(pipeline);
 }
 
@@ -342,30 +337,142 @@ function applyWorkerIntent(pipeline, capability) {
     const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: injectWorkerIntent, args: [capability] });
     application.receipt = result?.result;
     if (ownsPipeline(pipeline, attempt)) {
+      if (!validPageReceipt(pipeline, application.receipt) && pipeline.intentRevision === capability.intentRevision) {
+        throw new Error("MAIN intent returned no valid owned receipt");
+      }
       adoptPageReceipt(pipeline, attempt, application.receipt);
       if (attempt.audioId) scheduleCompletionPoll(pipeline, attempt);
       if (pipeline.intentApplication === application) requestActivation(pipeline, attempt);
     }
     return application.receipt;
   })().catch(error => {
-    if (pipeline.intentApplication === application) failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+    if (pipeline.intentApplication === application && pipeline.intentRevision === capability.intentRevision) {
+      failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+    }
     return null;
   });
   return application.promise;
 }
 
+function validPageReceipt(pipeline, receipt) {
+  return !!receipt && receipt.leaseId === pipeline.leaseId && receipt.sessionId === pipeline.sessionId &&
+    receipt.lifecycleRevision === pipeline.lifecycleRevision && Number.isSafeInteger(receipt.intentRevision) &&
+    Number.isSafeInteger(receipt.mediaRevision) && receipt.mediaRevision >= 0 && typeof receipt.paused === "boolean" &&
+    Number.isSafeInteger(receipt.audioRevision) && receipt.audioRevision >= 0 &&
+    ["none", "starting", "playing", "paused", "ended", "error"].includes(receipt.audioStatus) &&
+    (receipt.audioId === null || (typeof receipt.audioId === "string" && Number.isSafeInteger(receipt.startSerial)));
+}
+
 function adoptPageReceipt(pipeline, attempt, receipt) {
-  if (!ownsPipeline(pipeline, attempt) || !receipt || receipt.sessionId !== pipeline.sessionId || receipt.lifecycleRevision !== pipeline.lifecycleRevision ||
+  if (!ownsPipeline(pipeline, attempt) || !validPageReceipt(pipeline, receipt) ||
       receipt.intentRevision !== pipeline.intentRevision || receipt.mediaRevision < pipeline.mediaRevision) return;
-  pipeline.isPaused = receipt.paused;
-  pipeline.mediaRevision = receipt.mediaRevision;
-  if (receipt.attemptId !== attempt.attemptId || receipt.audioRevision <= attempt.audioRevision) return;
-  attempt.audioId = receipt.audioId;
-  attempt.audioRevision = receipt.audioRevision;
-  attempt.startSerial = receipt.startSerial;
-  attempt.audioStatus = receipt.audioStatus;
-  if (receipt.audioId && ["starting", "playing", "paused"].includes(receipt.audioStatus)) setAttemptPhase(pipeline, attempt, receipt.audioStatus);
-  viewRevision++;
+  const learnedMedia = receipt.mediaRevision > pipeline.mediaRevision;
+  if (pipeline.isPaused !== receipt.paused || learnedMedia) {
+    pipeline.isPaused = receipt.paused;
+    pipeline.mediaRevision = receipt.mediaRevision;
+    viewRevision++;
+  }
+  if (receipt.attemptId !== attempt.attemptId) {
+    if (learnedMedia) requestPageObservation(pipeline, attempt);
+    return;
+  }
+  attempt.pageReceipt = receipt;
+  let learnedInvocation = false;
+  if (receipt.audioRevision > attempt.audioRevision && (!attempt.audioId || receipt.audioId === attempt.audioId) &&
+      (attempt.startSerial === null || receipt.startSerial >= attempt.startSerial)) {
+    learnedInvocation = !!receipt.audioId && (!attempt.audioId || receipt.startSerial > attempt.startSerial);
+    attempt.audioId = receipt.audioId;
+    attempt.audioRevision = receipt.audioRevision;
+    attempt.startSerial = receipt.startSerial;
+    attempt.audioStatus = receipt.audioStatus;
+    if (receipt.audioId && ["starting", "playing", "paused"].includes(receipt.audioStatus)) setAttemptPhase(pipeline, attempt, receipt.audioStatus);
+    viewRevision++;
+    if (receipt.audioStatus === "error") {
+      failOwnedPlayback(pipeline, "play-rejection", new Error(receipt.audioError?.message || "Audio play rejected"), attempt);
+      return;
+    }
+  }
+  if (learnedMedia || learnedInvocation) requestPageObservation(pipeline, attempt);
+}
+
+// One no-effect read and one follow-up bit per live attempt. Reads never admit
+// media actions and cannot grant a stale command permission to play again.
+function requestPageObservation(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt)) return;
+  if (attempt.observationPromise) { attempt.observationNeeded = true; return; }
+  let intentRevision = pipeline.intentRevision;
+  const observation = (async () => {
+    await pipeline.installPromise;
+    // A worker attempt can be published before its MAIN selection executes.
+    // Only sample once that selection has an owned receipt; the preceding
+    // attempt's Audio is not evidence that the new attempt is missing Audio.
+    await selectAttempt(pipeline, attempt);
+    do {
+      if (!ownsPipeline(pipeline, attempt)) return;
+      attempt.observationNeeded = false;
+      intentRevision = pipeline.intentRevision;
+      const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
+        func: injectPlaybackObservation, args: [pageOwner(pipeline), attempt.attemptId] });
+      if (!ownsPipeline(pipeline, attempt)) return;
+      const receipt = result?.result;
+      if (intentRevision !== pipeline.intentRevision) continue;
+      if (!validPageReceipt(pipeline, receipt)) throw new Error("MAIN observation returned no valid owned receipt");
+      if (!receipt.owned || (attempt.audioId && !receipt.audioId)) {
+        if (receipt.intentRevision === pipeline.intentRevision && receipt.attemptId === attempt.attemptId) {
+          failOwnedPlayback(pipeline, "missing-audio", new Error("Owned Audio is missing"), attempt);
+        }
+        return;
+      }
+      adoptPageReceipt(pipeline, attempt, receipt);
+      if (ownsPipeline(pipeline, attempt)) await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+    } while (attempt.observationNeeded);
+  })().catch(error => {
+    if (intentRevision === pipeline.intentRevision) failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+  }).finally(() => {
+    if (attempt.observationPromise !== observation) return;
+    attempt.observationPromise = null;
+    if (!ownsPipeline(pipeline, attempt)) return;
+    if (attempt.observationNeeded) requestPageObservation(pipeline, attempt);
+    else continueObservedPlayback(pipeline, attempt);
+  });
+  attempt.observationPromise = observation;
+}
+
+function injectPlaybackObservation(owner, attemptId) {
+  const record = window.__freeTtsPlayback;
+  if (!record?.receipt || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
+      record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId) return null;
+  return { ...record.receipt("applied"), owned: !record.audioId || !!record.audio, ended: !!record.audio?.ended };
+}
+
+function continueObservedPlayback(pipeline, attempt) {
+  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || attempt.observationPromise || attempt.observationNeeded) return;
+  if (attempt.completionObservedWhilePaused && !attempt.completionConsumed) {
+    attempt.completionConsumed = true;
+    const replay = createAttempt(pipeline, pipeline.initialized ? "loading" : "initializing");
+    pipeline.intentRevision++; viewRevision++;
+    void selectAttempt(pipeline, replay);
+    void applyWorkerIntent(pipeline, workerIntent(pipeline));
+    void playNextSentence(pipeline, replay);
+    return;
+  }
+  if (attempt.audioId) scheduleCompletionPoll(pipeline, attempt);
+  void playNextSentence(pipeline, attempt);
+  requestActivation(pipeline, attempt);
+}
+
+async function handleAudioOutcome(pipeline, message) {
+  const attempt = pipeline.attempt;
+  if (!validPageReceipt(pipeline, message) || message.attemptId !== attempt.attemptId ||
+      (attempt.audioId && message.audioId !== attempt.audioId) || message.mediaRevision < pipeline.mediaRevision ||
+      message.audioRevision <= attempt.audioRevision || (attempt.startSerial !== null && message.startSerial < attempt.startSerial)) {
+    return commandResponse(false);
+  }
+  if (message.intentRevision === pipeline.intentRevision && message.mediaRevision === pipeline.mediaRevision) {
+    adoptPageReceipt(pipeline, attempt, message);
+  } else requestPageObservation(pipeline, attempt);
+  if (ownsPipeline(pipeline, attempt)) await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+  return commandResponse(true, null, pipeline.failure || null);
 }
 
 // Claims serialize only the short per-tab establishment, never data or play.
@@ -502,18 +609,23 @@ function injectPlaybackSession(owner, workerToken) {
   window.__freeTtsAudio = null;
   record.receipt = (disposition) => ({ leaseId: record.leaseId, sessionId: record.sessionId, lifecycleRevision: record.lifecycleRevision,
     attemptId: record.attemptId, intentRevision: record.workerIntentRevision, mediaRevision: record.mediaRevision, paused: record.desiredPaused,
+    mediaSequence: record.mediaSequence, audioError: record.audioError,
     audioId: record.audioId, audioStatus: record.audioStatus, startSerial: record.audioId ? record.startSerial : null, audioRevision: record.audioRevision, disposition });
+  record.setMediaState = state => {
+    try { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = state; }
+    catch (error) { console.warn("free-tts: Media Session state unavailable", error); }
+  };
   record.pause = () => {
     record.startSerial++; record.audioError = null;
     if (record.audio) { record.audio.pause(); record.audioStatus = "paused"; record.audioRevision++; }
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    record.setMediaState("paused");
   };
   record.play = () => {
     if (record !== window.__freeTtsPlayback || record.retired || record.desiredPaused || !record.audio || record.audio.ended || ["starting", "playing"].includes(record.audioStatus)) return;
     const audio = record.audio, serial = ++record.startSerial, attemptId = record.attemptId;
     const audioId = record.audioId;
     record.audioStatus = "starting"; record.audioError = null; record.audioRevision++;
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    record.setMediaState("paused");
     // Newer running intents may retain this invocation. Reconcile its outcome
     // with the current running snapshot; an applied pause invalidates its serial.
     const live = () => record === window.__freeTtsPlayback && !record.retired && record.audio === audio && record.audioId === audioId &&
@@ -523,7 +635,7 @@ function injectPlaybackSession(owner, workerToken) {
       record.audioStatus = error ? "error" : "playing";
       record.audioError = error ? { code: "play-rejection", message: error.message || String(error) } : null;
       record.audioRevision++;
-      if (!error && "mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      if (!error) record.setMediaState("playing");
       window.postMessage({ __freeTtsMedia: true, action: "audioPlaybackEvent", ...record.receipt("applied"), audioError: record.audioError }, "*");
     };
     try { Promise.resolve(audio.play()).then(() => settled(null), settled); } catch (error) { settled(error); }
@@ -542,6 +654,8 @@ function selectAttempt(pipeline, attempt) {
         func: injectSelectAttempt, args: [capability] });
       if (!ownsPipeline(pipeline, attempt)) return null;
       attempt.selectionReceipt = result?.result;
+      if (!validPageReceipt(pipeline, attempt.selectionReceipt)) throw new Error("MAIN selection returned no valid owned receipt");
+      adoptPageReceipt(pipeline, attempt, attempt.selectionReceipt);
       requestActivation(pipeline, attempt);
       return attempt.selectionReceipt;
     })().catch(error => {
@@ -595,16 +709,17 @@ function injectActivation(capability) {
 // Sync worker state after a media key already paused/resumed the Audio element
 // in the page. Updates the pipeline flag, context menu, and control bar without
 // re-issuing audio control (the page already did it, with lower latency).
-async function syncPausedState(paused) {
-  const pipeline = sentencePipeline;
-  if (!ownsPipeline(pipeline) || pipeline.isPaused === paused) return;
-  // An ended Audio cannot resume directly in MAIN; replay through the same
-  // captured-owner continuation used by explicit resume.
-  if (!paused && pipeline.attempt.completionObservedWhilePaused && !pipeline.attempt.completionConsumed) {
-    return changePausedState(pipeline, false);
+async function syncPausedState(pipeline, notification) {
+  const attempt = pipeline.attempt;
+  if (notification.mediaRevision >= pipeline.mediaRevision &&
+      (pipeline.isPaused !== notification.paused || pipeline.mediaRevision !== notification.mediaRevision)) {
+    pipeline.isPaused = notification.paused;
+    pipeline.mediaRevision = notification.mediaRevision;
+    viewRevision++;
   }
-  pipeline.isPaused = paused;
+  requestPageObservation(pipeline, attempt);
   await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
+  return commandResponse(true, notification, pipeline.failure || null);
 }
 
 // --- Media Session (system media keys) --------------------------------------
@@ -645,8 +760,7 @@ function injectMediaSession(owner) {
   const live = () => record === window.__freeTtsPlayback && !record.retired;
   const send = (action) => {
     if (!live()) return;
-    try { window.postMessage({ __freeTtsMedia: true, action, leaseId: owner.leaseId, sessionId: owner.sessionId,
-      lifecycleRevision: owner.lifecycleRevision }, "*"); } catch {}
+    try { window.postMessage({ __freeTtsMedia: true, action, ...record.receipt("applied") }, "*"); } catch {}
   };
 
   // Play/pause: directly control the Audio element for latency (no service
@@ -654,20 +768,23 @@ function injectMediaSession(owner) {
   // state and the floating control bar / context menu.
   optionalSetup(() => navigator.mediaSession.setActionHandler("play", () => {
     if (!live()) return;
+    record.mediaSequence++; record.mediaRevision++;
     record.desiredPaused = false;
     record.play();
     send("mediaResume");
   }));
   optionalSetup(() => navigator.mediaSession.setActionHandler("pause", () => {
     if (!live()) return;
+    record.mediaSequence++; record.mediaRevision++;
     record.desiredPaused = true;
     record.pause();
     send("mediaPause");
   }));
   // Prev/next/stop: bridge to the service worker via the isolated-world relay.
-  optionalSetup(() => navigator.mediaSession.setActionHandler("previoustrack", () => send("prevSentence")));
-  optionalSetup(() => navigator.mediaSession.setActionHandler("nexttrack", () => send("nextSentence")));
-  optionalSetup(() => navigator.mediaSession.setActionHandler("stop", () => send("stopPlayback")));
+  const request = action => { if (live()) { record.mediaSequence++; send(action); } };
+  optionalSetup(() => navigator.mediaSession.setActionHandler("previoustrack", () => request("prevSentence")));
+  optionalSetup(() => navigator.mediaSession.setActionHandler("nexttrack", () => request("nextSentence")));
+  optionalSetup(() => navigator.mediaSession.setActionHandler("stop", () => request("stopPlayback")));
 
   optionalSetup(() => { navigator.mediaSession.metadata = new MediaMetadata({
     title: "free-tts",
@@ -768,7 +885,10 @@ async function showControlBar(owner, snapshot, modes) {
       func: (binding, supplied, suppliedModes) => {
         const view = window.__freeTtsView;
         if (!view || view.retired || view.leaseId !== binding.leaseId || view.sessionId !== binding.sessionId || view.lifecycleRevision !== binding.lifecycleRevision) return "deferred";
-        if (view.barCreated) return "rendered";
+        if (view.barCreated) {
+          if (!document.getElementById("free-tts-bar")) throw new Error("Owned control bar is missing");
+          return "rendered";
+        }
         const pending = view.pendingRender;
         const latest = pending && pending.snapshot.viewRevision > supplied.viewRevision ? pending : { snapshot: supplied, modes: suppliedModes };
         let alive = true;
@@ -946,9 +1066,10 @@ async function showControlBar(owner, snapshot, modes) {
       },
       args: [pageOwner(owner), snapshot, modes],
     });
-    return result?.result;
+    if (!["rendered", "deferred"].includes(result?.result)) throw new Error("Control bar creation returned no receipt");
+    return result.result;
   } catch (error) {
-    logError("showing control bar", error);
+    if (snapshot.viewRevision === viewRevision) failOwnedPlayback(owner, "render-failure", error);
     return "deferred";
   }
 }
@@ -982,9 +1103,10 @@ async function updateControlBar(owner, snapshot, modes) {
       },
       args: [pageOwner(owner), snapshot, modes],
     });
-    return result?.result;
+    if (!["rendered", "deferred"].includes(result?.result)) throw new Error("Control bar update returned no receipt");
+    return result.result;
   } catch (error) {
-    logError("updating control bar", error);
+    if (snapshot.viewRevision === viewRevision) failOwnedPlayback(pipeline, "render-failure", error);
     return "deferred";
   }
 }
@@ -1012,15 +1134,17 @@ function navigationPipeline(owner) {
     owner.sessionId === pipeline.sessionId && owner.lifecycleRevision === pipeline.lifecycleRevision ? pipeline : null;
 }
 
-async function navigateToSentence(pipeline, idx) {
+async function navigateToSentence(pipeline, idx, media = null) {
   // Selection and accepted running intent are synchronous worker decisions.
   // MAIN selection only displaces the old Audio; it cannot undo a newer pause.
   pipeline.currentIdx = idx;
   const attempt = createAttempt(pipeline, pipeline.initialized ? "loading" : "initializing");
-  pipeline.isPaused = false;
-  pipeline.localIntentFloor = ++pipeline.intentRevision;
+  if (!media || media.mediaRevision >= pipeline.mediaRevision) pipeline.isPaused = false;
+  pipeline.intentRevision++;
+  if (!media) pipeline.localIntentFloor = pipeline.intentRevision;
   viewRevision++;
   const capability = workerIntent(pipeline);
+  if (media) capability.mediaBase = media.mediaRevision;
   const render = updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
   const selection = selectAttempt(pipeline, attempt);
   const application = applyWorkerIntent(pipeline, capability);
@@ -1029,13 +1153,13 @@ async function navigateToSentence(pipeline, idx) {
   return commandResponse(true, receipt || { disposition: "stale" }, pipeline.failure || null);
 }
 
-async function prevSentence(owner) {
+async function prevSentence(owner, media = null) {
   const pipeline = navigationPipeline(owner);
   if (!pipeline || pipeline.currentIdx === 0) return commandResponse(false);
-  return navigateToSentence(pipeline, pipeline.currentIdx - 1);
+  return navigateToSentence(pipeline, pipeline.currentIdx - 1, media);
 }
 
-async function nextSentence(owner) {
+async function nextSentence(owner, media = null) {
   const pipeline = navigationPipeline(owner);
   if (!pipeline) return commandResponse(false);
   let idx = pipeline.currentIdx + 1;
@@ -1043,7 +1167,7 @@ async function nextSentence(owner) {
     if (pipeline.repeatCurrentEnabled || pipeline.loopEnabled) idx = 0;
     else return stopPlayback(pipeline, false);
   }
-  return navigateToSentence(pipeline, idx);
+  return navigateToSentence(pipeline, idx, media);
 }
 
 async function jumpToSentence(owner, idx) {
@@ -1191,6 +1315,9 @@ async function fetchSentenceAudio(serverUrl, voice, speed, sentence) {
     const buffer = await resp.arrayBuffer();
     const contentType = resp.headers.get("content-type") || "audio/mpeg";
     return arrayBufferToDataUrl(buffer, contentType);
+  } catch (error) {
+    if (controller.signal.aborted) error.code = "load-timeout";
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -1248,7 +1375,8 @@ function createAttempt(pipeline, phase = "loading") {
   }
   return pipeline.attempt = { attemptId: ++pipeline.nextAttemptId, idx: pipeline.currentIdx, phase, retired: false,
     dataUrl: null, loadPromise: null, selectionPromise: null, selectionReceipt: null,
-    activationRequest: null, audioId: null, audioStatus: "none", audioRevision: -1,
+    activationRequest: null, pageReceipt: null, observationPromise: null, observationNeeded: false,
+    audioId: null, audioStatus: "none", audioRevision: -1,
     startSerial: null, pollTimer: null, pollInFlight: false, completionObserved: false,
     completionObservedWhilePaused: false, completionConsumed: false };
 }
@@ -1310,12 +1438,12 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = pipeline?
     await attempt.loadPromise;
     if (ownsPipeline(pipeline, attempt) && !pipeline.isPaused) requestActivation(pipeline, attempt);
   } catch (error) {
-    failOwnedPlayback(pipeline, "load-failure", error, attempt);
+    failOwnedPlayback(pipeline, error.code === "load-timeout" ? "load-timeout" : "load-failure", error, attempt);
   }
 }
 
 function requestActivation(pipeline, attempt) {
-  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || !attempt.dataUrl || attempt.audioStatus === "ended" ||
+  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || attempt.observationPromise || attempt.observationNeeded || !attempt.dataUrl || attempt.audioStatus === "ended" ||
       ["starting", "playing"].includes(attempt.audioStatus) || attempt.completionObserved) return;
   const selection = attempt.selectionReceipt;
   if (!selection || selection.leaseId !== pipeline.leaseId || selection.sessionId !== pipeline.sessionId ||
@@ -1323,8 +1451,8 @@ function requestActivation(pipeline, attempt) {
       !["applied", "idempotent"].includes(selection.disposition)) return;
   // Loading, selection, and intent application race independently. Whichever
   // finishes last continues the ready attempt after both page boundaries apply.
-  const application = pipeline.intentApplication, receipt = application?.receipt;
-  if (!receipt || application.capability.attemptId !== attempt.attemptId || receipt.leaseId !== pipeline.leaseId ||
+  const receipt = attempt.pageReceipt;
+  if (!receipt || receipt.attemptId !== attempt.attemptId || receipt.leaseId !== pipeline.leaseId ||
       receipt.sessionId !== pipeline.sessionId || receipt.lifecycleRevision !== pipeline.lifecycleRevision ||
       receipt.intentRevision !== pipeline.intentRevision || receipt.mediaRevision !== pipeline.mediaRevision || receipt.paused ||
       !["applied", "idempotent"].includes(receipt.disposition)) return;
@@ -1336,6 +1464,7 @@ function requestActivation(pipeline, attempt) {
   request.promise = chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: injectActivation, args: [capability] })
     .then(([result]) => {
       if (!ownsPipeline(pipeline, attempt) || pipeline.intentRevision !== capability.intentRevision || pipeline.mediaRevision !== capability.mediaRevision) return;
+      if (!validPageReceipt(pipeline, result?.result)) throw new Error("MAIN activation returned no valid owned receipt");
       adoptPageReceipt(pipeline, attempt, result?.result);
       if (attempt.audioId) scheduleCompletionPoll(pipeline, attempt);
     }).catch(error => {
@@ -1353,12 +1482,14 @@ function scheduleCompletionPoll(pipeline, attempt) {
 async function pollCompletion(pipeline, attempt) {
   if (!ownsPipeline(pipeline, attempt) || attempt.pollInFlight || attempt.completionObserved || !attempt.audioId) return;
   attempt.pollInFlight = true;
+  const intentRevision = pipeline.intentRevision;
   try {
     const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: (owner, attemptId, audioId) => {
       const record = window.__freeTtsPlayback;
       if (!record || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
           record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId ||
-          record.audioId !== audioId || !record.audio) return { owned: false, status: "missing-or-stale" };
+          record.audioId !== audioId) return { owned: false, status: "stale" };
+      if (!record.audio) return { owned: false, status: "missing-audio" };
       const ended = !!record.audio.ended;
       if (ended && record.audioStatus !== "ended") { record.audioStatus = "ended"; record.audioRevision++; }
       return { ...record.receipt("applied"), owned: true, ended, audioStatus: record.audioStatus,
@@ -1366,7 +1497,18 @@ async function pollCompletion(pipeline, attempt) {
     }, args: [pageOwner(pipeline), attempt.attemptId, attempt.audioId] });
     if (!ownsPipeline(pipeline, attempt)) return;
     const sample = result?.result;
-    if (!sample?.owned || sample.attemptId !== attempt.attemptId || sample.audioId !== attempt.audioId) return;
+    if (!sample?.owned || sample.attemptId !== attempt.attemptId || sample.audioId !== attempt.audioId) {
+      if (pipeline.intentRevision === intentRevision && sample?.status === "missing-audio") {
+        failOwnedPlayback(pipeline, "missing-audio", new Error("Owned Audio is missing"), attempt);
+      } else if (!sample && pipeline.intentRevision === intentRevision) {
+        throw new Error("Completion poll returned no receipt");
+      }
+      return;
+    }
+    if (sample.audioStatus === "error" && sample.intentRevision === pipeline.intentRevision && sample.mediaRevision === pipeline.mediaRevision) {
+      adoptPageReceipt(pipeline, attempt, sample);
+      return;
+    }
     if (sample.audioRevision > attempt.audioRevision) {
       attempt.audioRevision = sample.audioRevision;
       attempt.audioStatus = sample.audioStatus;
@@ -1396,7 +1538,7 @@ async function pollCompletion(pipeline, attempt) {
     void applyWorkerIntent(pipeline, workerIntent(pipeline));
     void playNextSentence(pipeline, nextAttempt);
   } catch (error) {
-    if (ownsPipeline(pipeline, attempt)) logError("polling playback", error);
+    if (ownsPipeline(pipeline, attempt) && pipeline.intentRevision === intentRevision) failOwnedPlayback(pipeline, "poll-failure", error, attempt);
   } finally {
     if (ownsPipeline(pipeline, attempt)) {
       attempt.pollInFlight = false;

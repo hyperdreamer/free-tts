@@ -20,6 +20,45 @@ let serverUrl = DEFAULT_SERVER;
 let voices = [];
 let defaultVoice = DEFAULT_VOICE;
 let popupState = "idle";  // idle | playing | paused
+let acceptedWorkerId = null;
+let renderedViewRevision = -1;
+let popupRequestEpoch = 0;
+let acceptedWorkerEpoch = 0;
+
+function applyPopupSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot.workerId !== "string" || !Number.isSafeInteger(snapshot.viewRevision) ||
+      !["idle", "playing", "paused"].includes(snapshot.state)) return false;
+  if (snapshot.workerId !== acceptedWorkerId) {
+    acceptedWorkerId = snapshot.workerId;
+    acceptedWorkerEpoch = popupRequestEpoch;
+    renderedViewRevision = -1;
+  }
+  if (snapshot.viewRevision < renderedViewRevision) return false;
+  renderedViewRevision = snapshot.viewRevision;
+  popupState = snapshot.state;
+  updateButtons();
+  return true;
+}
+
+async function handlePopupResponse(response, command, request = { requestEpoch: popupRequestEpoch }) {
+  if (!response || typeof response.workerId !== "string") throw new Error(`No playback snapshot for ${command}`);
+  if (response.workerId !== acceptedWorkerId && request.requestEpoch < acceptedWorkerEpoch) return;
+  const previousWorker = acceptedWorkerId;
+  const applied = applyPopupSnapshot(response);
+  if (applied && previousWorker !== acceptedWorkerId) acceptedWorkerEpoch = request.requestEpoch;
+  if (response.commandError) console.warn(`free-tts popup: ${command}`, response.commandError);
+}
+
+async function requestPlayback(command, payload = {}, refreshOnFailure = true) {
+  const request = { requestEpoch: ++popupRequestEpoch, workerIdAtIssue: acceptedWorkerId };
+  try {
+    const response = await chrome.runtime.sendMessage({ source: "popup", action: command, ...payload });
+    await handlePopupResponse(response, command, request);
+  } catch (error) {
+    console.warn(`free-tts popup: ${command} transport failed`, error);
+    if (refreshOnFailure) await requestPlayback("getPlaybackState", {}, false);
+  }
+}
 
 function normalizeServerUrl(value) {
   try {
@@ -84,9 +123,7 @@ async function init() {
   defaultVoice = savedVoice;
 
   // Check current playback state from background
-  const { state } = await chrome.runtime.sendMessage({ action: "getPlaybackState" });
-  popupState = state || "idle";
-  updateButtons();
+  await requestPlayback("getPlaybackState");
 
   // Auto-fill with selected text from the active tab
   try {
@@ -132,10 +169,7 @@ async function init() {
     speedSlider.value = s;
     chrome.storage.sync.set({ speed: s }).catch(() => {});
   });
-  speakBtn.addEventListener("click", () => speak().catch(() => {
-    popupState = "idle";
-    updateButtons();
-  }));
+  speakBtn.addEventListener("click", () => speak());
   stopBtn.addEventListener("click", () => stop());
   optionsLink.addEventListener("click", (event) => {
     event.preventDefault();
@@ -237,22 +271,8 @@ function updateButtons() {
 }
 
 async function speak() {
-  if (popupState === "playing") {
-    // Pause
-    const response = await chrome.runtime.sendMessage({ action: "pausePlayback" });
-    if (!response?.ok) throw new Error(response?.error || "Failed to pause playback");
-    popupState = "paused";
-    updateButtons();
-    return;
-  }
-  if (popupState === "paused") {
-    // Resume
-    const response = await chrome.runtime.sendMessage({ action: "resumePlayback" });
-    if (!response?.ok) throw new Error(response?.error || "Failed to resume playback");
-    popupState = "playing";
-    updateButtons();
-    return;
-  }
+  if (popupState === "playing") return requestPlayback("pausePlayback");
+  if (popupState === "paused") return requestPlayback("resumePlayback");
 
   // Start new playback
   const text = textInput.value.trim();
@@ -265,16 +285,11 @@ async function speak() {
     chrome.storage.sync.set({ voice }).catch(() => {});
   }
 
-  const response = await chrome.runtime.sendMessage({ action: "speakSentences", text });
-  if (!response?.ok) return;
-  popupState = "playing";
-  updateButtons();
+  await requestPlayback("speakSentences", { text });
 }
 
 async function stop() {
-  await chrome.runtime.sendMessage({ action: "stopPlayback" }).catch(() => {});
-  popupState = "idle";
-  updateButtons();
+  await requestPlayback("stopPlayback");
 }
 
 // --- Start ----------------------------------------------------------------

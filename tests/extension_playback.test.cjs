@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const source = fs.readFileSync(path.join(__dirname, '../extension/background.js'), 'utf8');
+const popupSource = fs.readFileSync(path.join(__dirname, '../extension/popup.js'), 'utf8');
 
 class Deferred {
   constructor() { this.settled = false; this.promise = new Promise((resolve, reject) => { this._resolve = resolve; this._reject = reject; }); }
@@ -89,7 +90,7 @@ function harness() {
     if (!pages.has(tabId)) {
       const document = fixtureDocument(node => audioSpy.effects.push({ kind: 'remove', id: node.id, className: node.className, tabId })), contexts = {};
       for (const name of ['MAIN', 'ISOLATED']) {
-        const events = new Map(), context = { ...timers, console: quietConsole, document, NodeFilter: { SHOW_TEXT: 4 }, navigator: {}, scrollX: 0, scrollY: 0, innerHeight: 900, scrollTo() {},
+        const events = new Map(), context = { ...timers, console: quietConsole, document, NodeFilter: { SHOW_TEXT: 4 }, navigator: {}, listeners: events, scrollX: 0, scrollY: 0, innerHeight: 900, scrollTo() {},
           getSelection: () => ({ toString: () => 'First sentence. Second sentence.', isCollapsed: false }),
           addEventListener(type, fn) { events.set(type, [...(events.get(type) || []), fn]); },
           removeEventListener(type, fn) { events.set(type, (events.get(type) || []).filter(cb => cb !== fn)); },
@@ -132,7 +133,7 @@ function harness() {
       return response.promise;
     },
   });
-  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, get pendingStart() { return pendingStart; }, get leases() { return pageLeases; }, start: startSentenceTTS, stop: stopPlayback, poll: pollCompletion };`, worker);
+  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, get pendingStart() { return pendingStart; }, get leases() { return pageLeases; }, start: startSentenceTTS, stop: stopPlayback, poll: pollCompletion, setupMediaSession, showControlBar, pageOwner, buildPlaybackSnapshot, failOwnedPlayback };`, worker);
   assert.equal(typeof commandListener, 'function');
   const api = { clock, scripts, storage, fetches, queries, audioSpy, messages, logs, worker: worker.__worker, page,
     holdTabQueries(value = true) { holdTabQueries = value; },
@@ -149,7 +150,27 @@ function harness() {
       }
       return result;
     },
-    send(message, sender = { tab: { id: 7 } }) { return new Promise((resolve, reject) => { try { listener(message, sender, resolve); } catch (error) { reject(error); } }); },
+    send(message, sender = { tab: { id: 7 } }) { return new Promise((resolve, reject) => {
+      try {
+        let responded = false;
+        const pending = listener(message, sender, value => { responded = true; resolve(value); });
+        if (pending !== true && !responded) resolve(undefined);
+      } catch (error) { reject(error); }
+    }); },
+    async command(message, sender = {}) { const result = api.send(message, sender); await api.flush(); return result; },
+    mediaAction(tabId, action) {
+      const media = page(tabId, 'MAIN').navigator.mediaSession;
+      const handler = media?.handlers.get(action);
+      assert.equal(typeof handler, 'function', `missing MAIN media handler: ${action}`);
+      handler();
+      return messages.filter(message => message.tabId === tabId && message.world === 'MAIN').at(-1)?.data;
+    },
+    deliverRelay(tabId, data, validSource = true) {
+      const isolated = page(tabId, 'ISOLATED');
+      const sourceWindow = vm.runInContext('window', isolated), before = messages.length;
+      for (const callback of isolated.listeners.get('message') || []) callback({ source: validSource ? sourceWindow : {}, data });
+      return messages.slice(before).filter(message => message.tabId === tabId && message.world === 'ISOLATED').at(-1)?.data;
+    },
     execute(entry) {
       assert.equal(entry.executed, false); entry.executed = true;
       try { entry.result = vm.runInContext(`(${entry.source})(...${JSON.stringify(entry.args)})`, page(entry.target.tabId, entry.world)); }
@@ -198,8 +219,67 @@ function harness() {
   };
   return api;
 }
+
+function popupAdapter(h, initial = {}) {
+  const ids = ['voiceSelect', 'textInput', 'speedSlider', 'speedInput', 'speakBtn', 'stopBtn', 'optionsLink',
+    'statusDot', 'hostInput', 'portInput', 'serverConfig', 'moreOptionsLink'];
+  const elements = new Map();
+  const makeElement = id => {
+    const classes = new Set();
+    const node = { id, value: '', textContent: '', title: '', disabled: false, className: '', children: [], listeners: new Map(),
+      classList: { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value),
+        toggle(value) { if (classes.has(value)) { classes.delete(value); return false; } classes.add(value); return true; } },
+      addEventListener(type, callback) { this.listeners.set(type, [...(this.listeners.get(type) || []), callback]); },
+      appendChild(child) { this.children.push(child); return child; }, replaceChildren(...children) { this.children = children; } };
+    elements.set(id, node); return node;
+  };
+  for (const id of ids) makeElement(id);
+  const document = { getElementById: id => elements.get(id), createElement: tag => makeElement(`${tag}-${elements.size}`) };
+  const requests = [], warnings = [], heldActions = new Set(), failures = new Map(), overrides = new Map();
+  const adapter = {
+    requests, elements, warnings,
+    holdNext(action) { heldActions.add(action); },
+    failNext(action, error = new Error('transport unavailable')) { failures.set(action, error); },
+    overrideNext(action, response) { overrides.set(action, response); },
+    async release(entry) {
+      await entry.actualPromise;
+      entry.gate.resolve(entry.actual);
+      await Promise.resolve();
+    },
+  };
+  const runtime = {
+    sendMessage(message) {
+      const entry = { message, actual: null, gate: new Deferred() };
+      requests.push(entry);
+      if (failures.has(message.action)) {
+        const error = failures.get(message.action); failures.delete(message.action);
+        entry.actualPromise = Promise.reject(error);
+        return entry.actualPromise;
+      }
+      if (overrides.has(message.action)) {
+        entry.actualPromise = Promise.resolve(overrides.get(message.action)); overrides.delete(message.action);
+      } else entry.actualPromise = h.send(message, {});
+      const result = entry.actualPromise.then(value => { entry.actual = value; return value; });
+      if (heldActions.delete(message.action)) return entry.gate.promise;
+      return result;
+    },
+    openOptionsPage() {},
+  };
+  const chrome = { runtime, storage: { sync: { get: defaults => Promise.resolve({ ...defaults, ...initial }), set: () => Promise.resolve() } },
+    tabs: { query: () => Promise.resolve([{ id: 7 }]) }, scripting: { executeScript: () => Promise.resolve([{ result: '' }]) } };
+  const context = vm.createContext({ chrome, document, URL, AbortSignal, console: { warn(...args) { warnings.push(args); }, error() {} },
+    fetch: async () => ({ ok: true, json: async () => ({ voices: [] }) }) });
+  const instrumented = popupSource.replace(/\ninit\(\);\s*$/, '\nglobalThis.__popupInit = init();');
+  assert.notEqual(instrumented, popupSource, 'popup startup invocation must be captured by the VM adapter');
+  vm.runInContext(`${instrumented}\nglobalThis.__popup = { speak, stop, get state() { return popupState; }, get workerId() { return acceptedWorkerId; }, get viewRevision() { return renderedViewRevision; }, apply: typeof applyPopupSnapshot === 'function' ? applyPopupSnapshot : null, handle: typeof handlePopupResponse === 'function' ? handlePopupResponse : null };`, context);
+  adapter.context = context;
+  adapter.ready = context.__popupInit;
+  return adapter;
+}
+
 const activation = entry => entry.world === 'MAIN' && (entry.func.name === 'injectActivation' || entry.source.includes('new Audio('));
 const highlight = entry => entry.world === 'ISOLATED' && entry.source.includes('const allRects');
+const renderUpdate = entry => entry.world === 'ISOLATED' && entry.source.includes('const btn = document.getElementById("free-tts-toggle")');
 
 // Removing early shell publication or the loader's pause/ownership checks must
 // expose an audible start at one of these independently held boundaries.
@@ -561,7 +641,7 @@ test('F-2 direct_media_pause_then_popup_resume', async t => {
     media.handlers.get('pause')();
     assert.equal(audio.paused, true, 'direct pause takes effect without the worker');
     const boundary = h.audioSpy.media.length;
-    const synced = h.send(h.messages.at(-1).data); await h.flush(); await synced;
+    const synced = h.send(h.deliverRelay(7, h.messages.at(-1).data)); await h.flush(); await synced;
     if (outcome === 'pending-reject') initial.outcome.reject(new Error('invalidated direct pause'));
     else initial.outcome.resolve();
     await h.drain();
@@ -589,10 +669,12 @@ test('F-2 direct_media_pause_then_popup_resume', async t => {
 
 const completionPoll = entry => entry.world === 'MAIN' && entry.source.includes('const ended = !!record.audio.ended');
 
-function boundModeMessage(h, action, enabled) {
+async function boundModeMessage(h, action, enabled, holdScript = () => false) {
   const pipeline = h.worker.pipeline;
-  return h.send({ action, enabled, source: 'bar', leaseId: pipeline.leaseId,
+  const result = h.send({ action, enabled, source: 'bar', leaseId: pipeline.leaseId,
     sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision }, { tab: { id: pipeline.tabId } });
+  await h.flush({ holdScript });
+  return result;
 }
 
 async function startOwnedEndPoll(h, attempt) {
@@ -750,7 +832,7 @@ test('W09 F-4 media_resume_after_paused_completion', async () => {
   const notification = h.messages.at(-1);
   assert.equal(notification.world, 'MAIN');
   assert.equal(notification.data.action, 'mediaResume');
-  const resumed = h.send(notification.data, { tab: { id: 7 } });
+  const resumed = h.send(h.deliverRelay(7, notification.data), { tab: { id: 7 } });
   await h.flush(); await resumed;
   await h.clock.advance(2000); await h.flush();
 
@@ -880,7 +962,7 @@ test('W11 pause_at_completion_decision', async t => {
     const started = h.start(); await h.ready(); await started;
     const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
     const poll = await startOwnedEndPoll(h, endedAttempt);
-    await boundModeMessage(h, 'setRepeatCurrentState', true);
+    await boundModeMessage(h, 'setRepeatCurrentState', true, entry => entry === poll);
     h.page(7, 'ISOLATED').document.getElementById('free-tts-repeat-current').checked = false;
     await h.pause(entry => entry === poll);
     await finishOwnedEndPoll(h, poll);
@@ -898,7 +980,7 @@ test('W11 pause_at_completion_decision', async t => {
     const started = h.start(); await h.ready(); await started;
     const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
     const poll = await startOwnedEndPoll(h, endedAttempt);
-    await boundModeMessage(h, 'setRepeatCurrentState', true);
+    await boundModeMessage(h, 'setRepeatCurrentState', true, entry => entry === poll);
     h.page(7, 'ISOLATED').document.getElementById('free-tts-repeat-current').checked = false;
     const originalPlayCount = h.audioSpy.plays.length;
     await finishOwnedEndPoll(h, poll);
@@ -1179,7 +1261,7 @@ const retiredBar = entry => entry.world === 'ISOLATED' && entry.source.includes(
 
 // Completion, error and explicit stop must use the same captured retirement.
 // Holding each cleanup at dispatch and completion exposes rediscovered globals.
-test('terminal_cleanup_cannot_clear_successor', async t => {
+test('W18 terminal_cleanup_overlap', async t => {
   for (const terminal of ['stop', 'completion', 'error']) for (const part of ['media', 'highlights', 'bar']) for (const boundary of ['dispatch', 'completion']) {
     await t.test(`${terminal}-${part}-${boundary}`, async () => {
       const h = harness(); const first = h.start('First sentence.');
@@ -1714,6 +1796,498 @@ test('W17 late_failure', async t => {
     assert.deepEqual(await h.snapshot(), snapshot); assert.equal(h.page(7).__freeTtsAudio, audio);
     assert.equal(audio.paused, false); assert.equal(pipeline.cache.has(1), false);
     assert.ok(h.page(7, 'ISOLATED').document.getElementById('free-tts-bar'));
+    await h.finish();
+  });
+});
+
+test('W19 media_direct_without_worker', async t => {
+  await t.test('unfinished-audio', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const main = h.page(7), record = main.__freeTtsPlayback, audio = main.__freeTtsAudio;
+    const initialTime = audio.currentTime, initialSequence = record.mediaSequence, initialMediaRevision = record.mediaRevision;
+    const pause = h.mediaAction(7, 'pause');
+    assert.equal(audio.paused, true, 'pause applies before worker delivery');
+    assert.equal(audio.currentTime, initialTime, 'pause preserves the current position');
+    assert.equal(record.mediaSequence, initialSequence + 1);
+    assert.equal(record.mediaRevision, initialMediaRevision + 1);
+    assert.deepEqual([pause.intentRevision, pause.mediaSequence, pause.mediaRevision, pause.paused],
+      [record.workerIntentRevision, initialSequence + 1, initialMediaRevision + 1, true]);
+    const play = h.mediaAction(7, 'play');
+    assert.equal(main.__freeTtsAudio, audio, 'resume reuses the unfinished Audio identity');
+    assert.equal(audio.currentTime, initialTime, 'resume preserves the current position');
+    assert.equal(audio.paused, false, 'resume applies before worker delivery');
+    assert.equal(record.mediaSequence, initialSequence + 2);
+    assert.equal(record.mediaRevision, initialMediaRevision + 2);
+    assert.equal(play.audioId, record.audioId);
+    assert.equal(vm.runInContext('typeof chrome', main), 'undefined', 'MAIN has no extension API access');
+    await h.finish();
+  });
+
+  await t.test('loading-without-audio', async () => {
+    const h = harness(); const started = h.start();
+    await h.flush({ holdResponse: () => true }); await started;
+    const main = h.page(7), record = main.__freeTtsPlayback;
+    assert.equal(main.__freeTtsAudio, null);
+    const sequence = record.mediaSequence, revision = record.mediaRevision, constructors = h.audioSpy.constructors.length;
+    const pause = h.mediaAction(7, 'pause');
+    assert.equal(record.desiredPaused, true); assert.equal(pause.paused, true); assert.equal(pause.audioId, null);
+    assert.equal(record.mediaSequence, sequence + 1); assert.equal(record.mediaRevision, revision + 1);
+    const play = h.mediaAction(7, 'play');
+    assert.equal(record.desiredPaused, false);
+    assert.equal(record.mediaSequence, sequence + 2);
+    assert.equal(record.mediaRevision, revision + 2);
+    assert.equal(play.audioId, null);
+    assert.equal(h.audioSpy.constructors.length, constructors, 'media play never constructs Audio while loading');
+    assert.equal(h.audioSpy.plays.length, 0);
+    await h.finish();
+  });
+
+  await t.test('ended-audio-is-not-replayed-directly', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const main = h.page(7), record = main.__freeTtsPlayback, audio = main.__freeTtsAudio;
+    audio.ended = true;
+    const plays = h.audioSpy.plays.length, constructors = h.audioSpy.constructors.length;
+    const sequence = record.mediaSequence, revision = record.mediaRevision, position = audio.currentTime;
+    const play = h.mediaAction(7, 'play');
+    assert.equal(record.desiredPaused, false); assert.equal(play.audioId, record.audioId);
+    assert.equal(main.__freeTtsAudio, audio); assert.equal(audio.currentTime, position);
+    assert.equal(record.mediaSequence, sequence + 1); assert.equal(record.mediaRevision, revision + 1);
+    assert.equal(h.audioSpy.plays.length, plays, 'ended Audio requires worker continuation');
+    assert.equal(h.audioSpy.constructors.length, constructors, 'MAIN media play cannot allocate a replay');
+    await h.finish();
+  });
+});
+
+test('W20 media_pause_fences_queued_start', async t => {
+  for (const operation of ['activation', 'resume']) await t.test(operation, async () => {
+    const h = harness(); const started = h.start(); await h.ready(operation === 'activation' ? activation : () => false);
+    await started;
+    if (operation === 'resume') await h.pause();
+    const match = operation === 'activation' ? activation : entry => entry.func.name === 'injectWorkerIntent' && !entry.args[0].paused;
+    const resume = operation === 'resume' ? h.send({ action: 'resumePlayback', source: 'popup' }, {}) : null;
+    if (resume) await h.flush({ holdScript: match });
+    const queued = h.scripts.pending(match), main = h.page(7), record = main.__freeTtsPlayback;
+    const revision = record.mediaRevision, constructors = h.audioSpy.constructors.length, plays = h.audioSpy.plays.length;
+    const pause = h.mediaAction(7, 'pause');
+    assert.equal(record.mediaRevision, revision + 1, 'direct page pause advances the activation fence synchronously');
+    assert.equal(pause.mediaRevision, revision + 1);
+    const receipt = h.execute(queued); await h.complete(queued); await h.flush();
+    assert.equal(receipt.disposition, operation === 'activation' ? 'no-effect' : 'superseded-by-media');
+    assert.equal(h.audioSpy.constructors.length, constructors, 'old operation cannot construct after direct pause');
+    assert.equal(h.audioSpy.plays.length, plays, 'old operation cannot play after direct pause');
+    assert.equal(main.__freeTtsPlayback.desiredPaused, true);
+    if (resume) assert.equal((await resume).disposition, 'superseded');
+    await h.finish();
+  });
+});
+
+test('W21 media_notification_reordering', async t => {
+  for (const finalAction of ['play', 'pause']) await t.test(`final-${finalAction}`, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, main = h.page(7), plays = h.audioSpy.plays.length;
+    const first = h.mediaAction(7, 'pause');
+    const second = h.mediaAction(7, 'play');
+    const last = finalAction === 'pause' ? h.mediaAction(7, 'pause') : second;
+    const newest = h.deliverRelay(7, last);
+    assert.equal(newest.source, 'media');
+    await h.command(newest, { tab: { id: 7 } });
+    const stale = h.deliverRelay(7, first);
+    await h.command(stale, { tab: { id: 7 } });
+    const duplicate = h.deliverRelay(7, last);
+    await h.command(duplicate, { tab: { id: 7 } });
+    const expectedPaused = finalAction === 'pause';
+    assert.equal(pipeline.isPaused, expectedPaused, 'highest admitted media revision controls the worker snapshot');
+    assert.equal((await h.snapshot()).state, expectedPaused ? 'paused' : 'playing');
+    assert.equal(h.audioSpy.plays.length, plays + 1, 'worker reconciliation never replays direct page effects');
+    assert.equal(pipeline.lastMediaSequence, last.mediaSequence);
+    assert.equal(main.__freeTtsPlayback.mediaRevision, last.mediaRevision);
+    await h.finish();
+  });
+});
+
+test('W22 mixed_media_worker_intents', async t => {
+  await t.test('media-pause-while-page-selection-is-pending', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline;
+    const navigating = h.send({ action: 'jumpToSentence', source: 'popup', idx: 1 }, {});
+    const selection = entry => entry.func.name === 'injectSelectAttempt';
+    await h.flush({ holdScript: selection });
+    const held = h.scripts.pending(selection), attempt = pipeline.attempt;
+    const pause = h.mediaAction(7, 'pause');
+    const syncing = h.send(h.deliverRelay(7, pause), { tab: { id: 7 } });
+    await h.flush({ holdScript: entry => entry === held });
+    assert.equal(h.worker.pipeline, pipeline, 'not-yet-selected Audio is not a current-owner failure');
+    assert.equal((await h.snapshot()).state, 'paused');
+    assert.equal(pipeline.attempt, attempt); assert.equal(pipeline.currentIdx, 1);
+    await h.flush(); await navigating; await syncing;
+    assert.equal(h.worker.pipeline, pipeline); assert.equal((await h.snapshot()).state, 'paused');
+    assert.equal(h.page(7).__freeTtsPlayback.attemptId, attempt.attemptId);
+    assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, true);
+    await h.finish();
+  });
+
+  await t.test('popup-intent-outlives-duplicate-media', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pause = h.mediaAction(7, 'pause'), notification = h.deliverRelay(7, pause);
+    await h.command(notification, { tab: { id: 7 } });
+    assert.equal(h.worker.pipeline.isPaused, true);
+    const resumed = await h.command({ action: 'resumePlayback', source: 'popup' });
+    assert.equal(resumed.state, 'playing');
+    await h.command(notification, { tab: { id: 7 } });
+    assert.equal((await h.snapshot()).state, 'playing', 'duplicate old media pause cannot roll back popup intent');
+    await h.finish();
+  });
+
+  await t.test('later-bar-toggle-with-conflict-receipt-delayed', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started; await h.pause();
+    const pipeline = h.worker.pipeline, record = h.page(7).__freeTtsPlayback, plays = h.audioSpy.plays.length;
+    const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    const resumeMatch = entry => entry.func.name === 'injectWorkerIntent' && !entry.args[0].paused;
+    await h.flush({ holdScript: resumeMatch }); const old = h.scripts.pending(resumeMatch);
+    const pause = h.mediaAction(7, 'pause'), receipt = h.execute(old);
+    assert.equal(receipt.disposition, 'superseded-by-media');
+    const toggle = boundNavigation(h, 'togglePlayback');
+    assert.equal(pipeline.isPaused, true, 'later toggle uses accepted worker running intent');
+    const latestIntent = pipeline.intentRevision;
+    await h.flush({ holdScript: entry => entry === old }); const newest = await toggle;
+    assert.equal(newest.state, 'paused'); assert.equal(newest.disposition, 'superseded'); assert.equal(newest.pageApplied, false);
+    const ignored = await h.send(h.deliverRelay(7, pause), { tab: { id: 7 } });
+    assert.equal(ignored.accepted, false, 'older media worker base is below the new local floor');
+    await h.complete(old); await h.flush(); const older = await resumed;
+    assert.equal(older.state, 'paused'); assert.equal(older.intentRevision, latestIntent);
+    assert.equal(record.desiredPaused, true); assert.equal(h.audioSpy.plays.length, plays, 'no conflict receipt retries running intent');
+    const fresh = await h.command({ action: 'resumePlayback', source: 'popup' });
+    assert.equal(fresh.state, 'playing'); assert.equal(h.audioSpy.plays.length, plays + 1); await h.finish();
+  });
+
+  await t.test('page-pause-wins-old-worker-base', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    await h.pause();
+    const pipeline = h.worker.pipeline, record = h.page(7).__freeTtsPlayback, plays = h.audioSpy.plays.length;
+    const resumePromise = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    const pendingIntent = entry => entry.func.name === 'injectWorkerIntent' && entry.args[0].paused === false;
+    await h.flush({ holdScript: pendingIntent });
+    const resumeScript = h.scripts.pending(pendingIntent);
+    const revision = record.mediaRevision;
+    const notification = h.mediaAction(7, 'pause');
+    assert.equal(record.mediaRevision, revision + 1);
+    const receipt = h.execute(resumeScript);
+    assert.equal(receipt.disposition, 'superseded-by-media');
+    await h.complete(resumeScript); await h.flush();
+    const response = await resumePromise;
+    assert.equal(record.desiredPaused, true);
+    assert.equal(h.audioSpy.plays.length, plays, 'conflicted running intent is never blindly retried');
+    assert.equal(response.disposition, 'superseded');
+    assert.equal(response.state, 'paused');
+    assert.equal(pipeline.mediaRevision, revision + 1);
+    assert.equal(notification.paused, true);
+    const retry = await h.command({ action: 'resumePlayback', source: 'popup' });
+    assert.equal(retry.state, 'playing', 'a new post-reconciliation command can resume');
+    await h.finish();
+  });
+});
+
+test('W23 originating_session_messages', async () => {
+  const h = harness(); const first = h.start('First sentence.'); await h.ready(); await first;
+  const predecessor = h.worker.pipeline, old = { source: 'bar', action: 'togglePlayback', leaseId: predecessor.leaseId,
+    sessionId: predecessor.sessionId, lifecycleRevision: predecessor.lifecycleRevision };
+  const mediaOld = { ...old, source: 'media', action: 'mediaPause', intentRevision: predecessor.intentRevision,
+    mediaSequence: 1, mediaRevision: 1, paused: true, attemptId: predecessor.attempt.attemptId,
+    audioId: predecessor.attempt.audioId, audioStatus: 'paused', startSerial: 1, audioRevision: 2 };
+  const second = h.start('First sentence.'); const successor = h.worker.pipeline;
+  await h.ready(); await second;
+  const staleBar = await h.send(old, { tab: { id: 7 } });
+  const staleMedia = await h.command(mediaOld, { tab: { id: 7 } });
+  const wrongTab = await h.send(old, { tab: { id: 8 } });
+  assert.equal(staleBar.sessionId, successor.sessionId);
+  assert.equal(staleMedia.sessionId, successor.sessionId);
+  assert.equal(wrongTab.sessionId, successor.sessionId);
+  assert.equal(staleBar.accepted, false); assert.equal(staleMedia.accepted, false); assert.equal(wrongTab.accepted, false);
+  for (const action of ['jumpToSentence', 'togglePlayback', 'setLoopState', 'setRepeatCurrentState', 'stopPlayback']) {
+    for (const tabId of [7, 8]) {
+      const ignored = await h.command({ ...old, action, idx: 0, enabled: true }, { tab: { id: tabId } });
+      assert.equal(ignored.disposition, 'ignored'); assert.equal(ignored.accepted, false);
+      assert.equal(ignored.sessionId, successor.sessionId); assert.equal(h.worker.pipeline, successor);
+    }
+  }
+  for (const action of ['mediaPause', 'mediaResume', 'nextSentence', 'prevSentence', 'stopPlayback']) {
+    const ignored = await h.command({ ...mediaOld, action }, { tab: { id: 7 } });
+    assert.equal(ignored.disposition, 'ignored'); assert.equal(ignored.accepted, false); assert.equal(ignored.sessionId, successor.sessionId);
+  }
+  assert.equal(successor.isPaused, false, 'old session media cannot mutate the replacement');
+  const popupPause = await h.command({ action: 'pausePlayback', source: 'popup' });
+  assert.equal(popupPause.sessionId, successor.sessionId); assert.equal(popupPause.state, 'paused');
+  await h.finish();
+
+  const pending = harness(); const oldStart = pending.start('First sentence.'); await pending.ready(); await oldStart;
+  const owner = pending.worker.pipeline;
+  pending.holdTabQueries();
+  const newTicket = pending.send({ action: 'speakSentences', source: 'popup', text: 'Second sentence.' }, {});
+  await pending.drain(); const ticket = pending.worker.pendingStart;
+  assert.ok(ticket, 'new target lookup ticket is live while the prior session remains published');
+  const stopPromise = pending.send({ source: 'bar', action: 'stopPlayback', leaseId: owner.leaseId,
+    sessionId: owner.sessionId, lifecycleRevision: owner.lifecycleRevision }, { tab: { id: 7 } });
+  await pending.flush();
+  const stop = await stopPromise;
+  assert.equal(stop.sessionId, null);
+  assert.equal(pending.worker.pendingStart, ticket, 'bound predecessor stop cannot cancel an unrelated pending start');
+  pending.queries[0].resolve([{ id: 7 }]); await pending.flush(); await newTicket;
+  assert.notEqual(pending.worker.pipeline?.sessionId, owner.sessionId);
+  await pending.finish();
+});
+
+test('W24 current_errors', async t => {
+  for (const unsupported of ['absent', 'handlers', 'metadata', 'playback-state']) await t.test(`optional-media-${unsupported}`, async () => {
+    const h = harness(), main = h.page(7), media = main.navigator.mediaSession;
+    if (unsupported === 'absent') delete main.navigator.mediaSession;
+    else if (unsupported === 'handlers') media.setActionHandler = () => { throw new Error('handlers unavailable'); };
+    else main.navigator.mediaSession = new Proxy(media, { set(target, key, value) {
+      if (key === (unsupported === 'metadata' ? 'metadata' : 'playbackState')) throw new Error('optional media property unavailable');
+      return Reflect.set(target, key, value);
+    } });
+    const started = h.start(); await h.ready(); const response = await started;
+    assert.equal(response.ok, true); assert.equal(response.state, 'playing');
+    assert.equal(h.audioSpy.plays.length, 1, 'optional media failure cannot prevent Audio play');
+    h.audioSpy.plays[0].outcome.resolve(); await h.clock.advance(500); await h.flush();
+    assert.equal((await h.snapshot()).audioStatus, 'playing');
+    await h.pause(); h.assertPausedBar(); assert.equal(main.__freeTtsAudio.paused, true);
+    assert.equal((await h.snapshot()).error, null); await h.finish();
+  });
+
+  await t.test('settings-failure-is-terminal', async () => {
+    const h = harness(); const started = h.start();
+    const settings = h.storage.find(entry => 'serverUrl' in entry.defaults);
+    await h.flush({ holdStorage: entry => entry === settings });
+    settings.gate.reject(new Error('settings unavailable')); await h.flush(); await started;
+    assert.equal((await h.snapshot()).error.code, 'settings-failure');
+    assert.equal(h.worker.pipeline, null); assertIdlePage(h); await h.finish();
+  });
+
+  for (const failure of ['load-failure', 'load-timeout']) await t.test(failure, async () => {
+    const h = harness(); const started = h.start();
+    await h.flush({ holdResponse: () => true }); await started;
+    await h.clock.advance(10000); await h.drain();
+    const fallback = h.fetches[2]; assert.ok(fallback, 'fallback dispatched after cache bound');
+    if (failure === 'load-timeout') {
+      for (const fetch of h.fetches) fetch.body.promise.catch(() => {});
+      await h.clock.advance(120000);
+    } else fallback.response.reject(new Error('current fetch failed'));
+    await h.flush();
+    assert.equal(h.worker.pipeline, null);
+    const snapshot = await h.snapshot(); assert.equal(snapshot.state, 'idle'); assert.equal(snapshot.error.code, failure);
+    assertIdlePage(h); await h.finish();
+  });
+
+  for (const operation of ['intent', 'activation', 'poll', 'render', 'create-bar']) {
+    for (const failure of ['reject', 'no-receipt']) await t.test(`${operation}-${failure}`, async () => {
+      const h = harness(); let started, command;
+      const match = operation === 'intent' ? entry => entry.func.name === 'injectWorkerIntent'
+        : operation === 'activation' ? activation : operation === 'poll' ? completionPoll
+        : operation === 'create-bar' ? entry => entry.source.includes('const bar = document.createElement') : renderUpdate;
+      if (operation === 'intent' || operation === 'render' || operation === 'poll') {
+        started = h.start(); await h.ready(); await started;
+        if (operation === 'poll') { await h.clock.advance(500); await h.drain(); }
+        else command = h.send({ action: 'pausePlayback', source: 'popup' }, {});
+      } else started = h.start();
+      await h.ready(match);
+      if (operation === 'create-bar') {
+        const pipeline = h.worker.pipeline;
+        command = h.worker.showControlBar(pipeline, h.worker.buildPlaybackSnapshot(),
+          { loopEnabled: pipeline.loopEnabled, repeatCurrentEnabled: pipeline.repeatCurrentEnabled });
+        await h.drain();
+      }
+      const held = ['create-bar', 'render'].includes(operation) ? h.scripts.entries.findLast(entry => !entry.executed && match(entry)) : h.scripts.pending(match);
+      if (failure === 'reject') await h.fail(held, new Error(`${operation} injection failed`));
+      else { h.execute(held); await h.complete(held, null); }
+      await h.flush(); await started;
+      const response = command && operation !== 'create-bar' ? await command : await h.snapshot();
+      if (operation === 'create-bar') await command;
+      assert.equal(response.state, 'idle', `${operation} failure retires its owner`);
+      const expected = operation === 'poll' ? 'poll-failure' : ['render', 'create-bar'].includes(operation) ? 'render-failure' : 'page-operation-failure';
+      assert.equal(response.error.code, expected);
+      if (command && operation !== 'create-bar') { assert.equal(response.ok, false); assert.equal(response.disposition, 'failed'); }
+      assert.equal(h.worker.pipeline, null); assertIdlePage(h); await h.finish();
+    });
+  }
+
+  await t.test('missing-owned-audio-is-terminal', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt;
+    h.page(7).__freeTtsPlayback.audio = null;
+    await h.clock.advance(500); await h.flush();
+    assert.equal((await h.snapshot()).error.code, 'missing-audio'); assert.equal(h.worker.pipeline, null);
+    assert.equal(pipeline.currentIdx, 0); assert.equal(attempt.completionObserved, false);
+    await h.finish();
+  });
+
+  for (const operation of ['activation', 'render']) await t.test(`obsolete-${operation}-failure-after-pause`, async () => {
+    const h = harness(), match = operation === 'activation' ? activation : renderUpdate;
+    const started = h.start(); await h.ready(match);
+    const held = h.scripts.pending(match), pipeline = h.worker.pipeline, attempt = pipeline.attempt;
+    await h.pause(entry => entry === held);
+    const snapshot = await h.snapshot();
+    await h.fail(held, new Error('obsolete operation failed')); await h.flush(); await started;
+    assert.equal(h.worker.pipeline, pipeline); assert.equal(pipeline.attempt, attempt);
+    assert.deepEqual(await h.snapshot(), snapshot); assert.equal(snapshot.error, null); h.assertPausedBar();
+    await h.finish();
+  });
+
+  await t.test('missing-live-bar-is-terminal', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    h.page(7, 'ISOLATED').document.getElementById('free-tts-bar').remove();
+    const response = await h.command({ action: 'pausePlayback', source: 'popup' });
+    assert.equal(response.state, 'idle'); assert.equal(response.error.code, 'render-failure');
+    assert.equal(response.ok, false); await h.finish();
+  });
+
+  await t.test('current-play-rejection-is-terminal', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const play = h.audioSpy.plays.at(-1); play.outcome.reject(new Error('current play rejected')); await h.drain();
+    const event = h.messages.findLast(message => message.tabId === 7 && message.world === 'MAIN' && message.data.action === 'audioPlaybackEvent');
+    assert.ok(event, 'current play outcome is reported from MAIN');
+    const forwarded = h.deliverRelay(7, event.data);
+    const response = await h.command(forwarded, { tab: { id: 7 } });
+    assert.equal(response.state, 'idle');
+    assert.equal(response.error.code, 'play-rejection');
+    assert.equal(h.worker.pipeline, null);
+    await h.finish();
+  });
+
+  await t.test('poll-failure-is-terminal', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    await h.clock.advance(500); await h.drain();
+    const poll = h.scripts.pending(completionPoll);
+    await h.fail(poll, new Error('poll transport failed')); await h.flush();
+    assert.equal(h.worker.pipeline, null, 'owned observer failure retires the affected session');
+    const snapshot = await h.snapshot();
+    assert.equal(snapshot.state, 'idle'); assert.equal(snapshot.error.code, 'poll-failure');
+    await h.finish();
+  });
+
+  await t.test('response-is-canonical-while-play-promise-is-pending', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    await h.pause();
+    const before = h.audioSpy.plays.length;
+    const response = await h.command({ action: 'resumePlayback', source: 'popup' });
+    assert.equal(h.audioSpy.plays.length, before + 1);
+    assert.equal(response.state, 'playing'); assert.equal(response.phase, 'starting');
+    assert.equal(response.audioStatus, 'starting', 'accepted intent is not reported as audible success');
+    assert.equal(response.pageApplied, true);
+    await h.finish();
+  });
+});
+
+test('W26 relay_and_world_invariants', async () => {
+  const h = harness(); const started = h.start(); await h.ready(); await started;
+  const pipeline = h.worker.pipeline, owner = h.worker.pageOwner(pipeline), isolated = h.page(7, 'ISOLATED');
+  for (let i = 0; i < 2; i++) { const setup = h.worker.setupMediaSession(pipeline); await h.flush(); await setup; }
+  assert.equal(isolated.listeners.get('message').length, 1, 'repeated relay installation remains idempotent');
+  const keepalives = [...h.clock.timers.values()].filter(timer => timer.repeat === 25000);
+  assert.equal(keepalives.length, 1, 'repeated media setup leaves one keepalive interval');
+  const full = h.mediaAction(7, 'pause');
+  for (const field of ['action', 'leaseId', 'sessionId', 'lifecycleRevision', 'intentRevision', 'mediaSequence', 'mediaRevision',
+    'paused', 'attemptId', 'audioId', 'audioStatus', 'startSerial', 'audioRevision']) assert.ok(field in full, `missing token field ${field}`);
+  const forwarded = h.deliverRelay(7, full);
+  assert.deepEqual(Object.fromEntries(Object.entries(forwarded).filter(([key]) => key !== 'source')),
+    Object.fromEntries(Object.entries(full)), 'relay preserves the complete token');
+  assert.equal(forwarded.source, 'media');
+  const record = h.page(7).__freeTtsPlayback, audio = h.page(7).__freeTtsAudio;
+  for (const [action, command] of [['previoustrack', 'prevSentence'], ['nexttrack', 'nextSentence'], ['stop', 'stopPlayback']]) {
+    const sequence = record.mediaSequence, mediaRevision = record.mediaRevision, effects = h.audioSpy.effects.length;
+    const notification = h.mediaAction(7, action);
+    assert.equal(notification.action, command); assert.equal(notification.mediaSequence, sequence + 1);
+    assert.equal(record.mediaRevision, mediaRevision); assert.equal(record.desiredPaused, true);
+    assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(h.audioSpy.effects.length, effects,
+      'media navigation/stop only requests worker action');
+  }
+  assert.equal(h.deliverRelay(7, full, false), undefined, 'relay rejects non-window message sources');
+  assert.equal(vm.runInContext('typeof chrome', h.page(7, 'MAIN')), 'undefined');
+  assert.ok(owner.sessionId);
+  const mainEffects = h.scripts.entries.filter(entry => (entry.source.includes('mediaSession') || entry.source.includes('record.audio')) &&
+    !(entry.func.name === 'injectPageLease' && entry.args[0] === 'ISOLATED'));
+  assert.ok(mainEffects.length > 0);
+  assert.ok(mainEffects.every(entry => entry.world === 'MAIN'), 'Audio and Media Session effects execute only in MAIN');
+  assert.equal(source.includes('free-tts-media-session'), false);
+  await h.finish();
+  const cleanup = h.scripts.entries.find(entry => entry.func.name === 'clearMediaSession');
+  const first = await runPageFunction(h, cleanup, cleanup.args, 'MAIN');
+  const second = await runPageFunction(h, cleanup, cleanup.args, 'MAIN');
+  assert.equal(first.disposition, 'applied'); assert.equal(second.disposition, 'applied');
+  for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'stop']) assert.equal(h.page(7).navigator.mediaSession.handlers.get(action), null);
+  assert.equal(h.clock.timers.has(h.page(7).__freeTtsKeepalive), false);
+  for (const play of h.audioSpy.plays) play.outcome.resolve();
+  await h.flush(); h.assertNoUnintendedTimers();
+});
+
+test('W27 snapshot_and_popup_responses', async t => {
+  await t.test('popup-start-pause-resume-stop-during-settings', async () => {
+    const h = harness(), popup = popupAdapter(h); await popup.ready;
+    const consumer = popup.context.__popup;
+    assert.equal(consumer.state, 'idle'); popup.elements.get('textInput').value = 'First sentence.';
+    const heldSettings = entry => 'serverUrl' in entry.defaults;
+    const started = consumer.speak(); await h.drain(); await h.flush({ holdStorage: heldSettings }); await started;
+    assert.equal(consumer.state, 'playing'); assert.equal((await h.snapshot()).phase, 'initializing');
+    const pause = consumer.speak(); await h.flush({ holdStorage: heldSettings }); await pause;
+    assert.equal(consumer.state, 'paused');
+    const resume = consumer.speak(); await h.flush({ holdStorage: heldSettings }); await resume;
+    assert.equal(consumer.state, 'playing'); assert.equal(h.audioSpy.constructors.length, 0);
+    const stopped = consumer.stop(); await h.flush({ holdStorage: heldSettings }); await stopped;
+    assert.equal(consumer.state, 'idle'); assert.equal(popup.elements.get('stopBtn').disabled, true);
+    assert.ok(popup.requests.every(entry => entry.message.source === 'popup'));
+    await h.flush(); await h.finish();
+  });
+
+  await t.test('canonical-view-order-and-worker-epoch', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const popup = popupAdapter(h); await popup.ready;
+    const consumer = popup.context.__popup;
+    assert.equal(consumer.state, 'playing');
+    assert.equal(typeof consumer.apply, 'function', 'popup exposes the shared canonical snapshot consumer');
+    assert.equal(typeof consumer.handle, 'function', 'popup commands use the shared response consumer');
+    const oldWorker = consumer.workerId, oldRevision = consumer.viewRevision;
+    popup.holdNext('pausePlayback');
+    const pause = consumer.speak();
+    await h.drain(); const held = popup.requests.findLast(entry => entry.message.action === 'pausePlayback');
+    assert.ok(held); await h.flush(); await held.actualPromise;
+    const resume = await h.command({ action: 'resumePlayback', source: 'popup' });
+    assert.equal(resume.state, 'playing');
+    assert.equal(consumer.apply(resume), true);
+    await popup.release(held); await pause;
+    assert.equal(consumer.state, 'playing', 'older delayed command snapshot cannot roll back a newer view');
+
+    const ignored = { ...resume, state: 'paused', disposition: 'ignored', viewRevision: resume.viewRevision + 1 };
+    await consumer.handle(ignored, 'pausePlayback');
+    assert.equal(consumer.state, 'paused', 'ignored responses render the worker snapshot rather than requested intent');
+    await consumer.handle({ ...ignored, state: 'playing', disposition: 'superseded', viewRevision: ignored.viewRevision + 1 }, 'pausePlayback');
+    assert.equal(consumer.state, 'playing', 'a superseded pause renders the actual running state');
+    const commandError = { code: 'cleanup-failure', message: 'page unavailable' };
+    await consumer.handle({ ...ignored, ok: false, commandError, state: 'paused', disposition: 'failed', viewRevision: ignored.viewRevision + 2 }, 'stopPlayback');
+    assert.equal(consumer.state, 'paused', 'a failed stop renders its actual owner snapshot');
+    assert.equal(popup.warnings.at(-1)[1], commandError);
+    const fresh = { ...resume, workerId: `${oldWorker}-restart`, viewRevision: 1, state: 'idle', sessionId: null,
+      intentRevision: null, mediaRevision: null, phase: 'idle', audioStatus: 'none' };
+    assert.equal(consumer.apply(fresh), true);
+    assert.equal(consumer.workerId, fresh.workerId); assert.equal(consumer.viewRevision, 1);
+    await consumer.handle({ ...resume, workerId: oldWorker, viewRevision: oldRevision + 100, state: 'playing' }, 'resumePlayback',
+      { requestEpoch: 1, workerIdAtIssue: oldWorker, acceptedEpochAtIssue: 0 });
+    assert.equal(consumer.state, 'idle', 'response from the former worker cannot overwrite the new worker');
+    await h.finish();
+  });
+
+  await t.test('transport-error-refreshes-once-and-retains-confirmed-state', async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started;
+    const popup = popupAdapter(h); await popup.ready; const consumer = popup.context.__popup;
+    popup.failNext('pausePlayback');
+    const button = popup.elements.get('speakBtn');
+    await button.listeners.get('click')[0]();
+    assert.equal(popup.requests.filter(entry => entry.message.action === 'getPlaybackState').length, 2,
+      'initial read plus exactly one bounded transport refresh');
+    assert.equal(consumer.state, 'playing', 'transport failure does not guess idle or paused');
+    popup.failNext('pausePlayback'); popup.failNext('getPlaybackState');
+    await button.listeners.get('click')[0]();
+    assert.equal(popup.requests.filter(entry => entry.message.action === 'getPlaybackState').length, 3,
+      'failed refresh does not recursively refresh again');
+    assert.equal(consumer.state, 'playing', 'failed command and refresh retain the last confirmed state');
     await h.finish();
   });
 });

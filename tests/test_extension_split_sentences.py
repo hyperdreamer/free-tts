@@ -94,21 +94,24 @@ def test_split_sentences_keeps_closing_quotes_with_sentence(
     ],
 )
 def test_extension_pipeline_attempt_ownership(case):
-    result = subprocess.run(
-        [
-            "node",
-            "--test",
-            "--test-reporter=tap",
-            "--test-name-pattern",
-            case,
-            "tests/extension_playback.test.cjs",
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    output = result.stdout + result.stderr
+    try:
+        result = subprocess.run(
+            [
+                "node",
+                "--test",
+                "--test-reporter=tap",
+                "--test-name-pattern",
+                f"^{re.escape(case)}$",
+                "tests/extension_playback.test.cjs",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(f"Named ownership case timed out after 120 seconds: {case}\n{error}")
+    output = (result.stdout + result.stderr)[-12000:]
     assert result.returncode == 0, output
     assert re.search(rf"(?m)^ok \d+ - {re.escape(case)}\r?$", result.stdout), (
         f"Named ownership case did not run and pass: {case}\n{output}"
