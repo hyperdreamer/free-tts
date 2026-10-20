@@ -129,7 +129,7 @@ function harness() {
       return response.promise;
     },
   });
-  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, start: startSentenceTTS };`, worker);
+  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, start: startSentenceTTS, poll: pollCompletion };`, worker);
   assert.equal(typeof commandListener, 'function');
   const api = { clock, scripts, storage, fetches, audioSpy, messages, logs, worker: worker.__worker, page,
     start(text = 'First sentence. Second sentence.', tabId = 7) {
@@ -576,6 +576,240 @@ test('F-2 direct_media_pause_then_popup_resume', async t => {
     assert.equal(media.playbackState, 'paused', 'direct play is not audible success before settlement');
     h.audioSpy.plays[2].outcome.resolve(); await h.drain();
     assert.equal(record.audioStatus, 'playing'); assert.equal(media.playbackState, 'playing');
+    await h.finish();
+  });
+});
+
+const completionPoll = entry => entry.world === 'MAIN' && entry.source.includes('record.audio.ended');
+
+function boundModeMessage(h, action, enabled) {
+  const pipeline = h.worker.pipeline;
+  return h.send({ action, enabled, source: 'bar', leaseId: pipeline.leaseId,
+    sessionId: pipeline.sessionId, lifecycleRevision: pipeline.lifecycleRevision }, { tab: { id: pipeline.tabId } });
+}
+
+async function startOwnedEndPoll(h, attempt) {
+  const audio = h.audioSpy.constructors.find(item => item.audio === h.page(7).__freeTtsAudio)?.audio;
+  assert.ok(audio, 'attempt owns a MAIN-world Audio');
+  audio.ended = true;
+  await h.clock.advance(500);
+  await h.drain();
+  const poll = h.scripts.pending(completionPoll);
+  assert.equal(poll.args[1], attempt.attemptId, 'poll is bound to the captured attempt');
+  const sample = h.execute(poll);
+  assert.equal(sample.owned, true);
+  assert.equal(sample.ended, true);
+  return poll;
+}
+
+async function finishOwnedEndPoll(h, poll) {
+  await h.complete(poll);
+  await h.drain();
+}
+
+test('W07 resume_during_pending_load', async t => {
+  for (const finalState of ['running-before-load', 'paused-through-ready']) await t.test(finalState, async () => {
+    const h = harness();
+    const started = h.start(); started.catch(() => {});
+    await h.flush({ holdResponse: () => true });
+    await started;
+    await h.clock.advance(10000); await h.drain();
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, loader = attempt.loadPromise;
+    assert.ok(loader, 'the single current-attempt load is pending');
+    assert.ok(h.fetches.some(entry => entry.sentence === 1 && !entry.response.settled), 'fallback fetch is held');
+
+    const actions = finalState === 'running-before-load'
+      ? ['pausePlayback', 'resumePlayback', 'pausePlayback', 'resumePlayback']
+      : ['pausePlayback', 'resumePlayback', 'pausePlayback'];
+    const commands = actions.map(action => h.send({ action, source: 'popup' }, {}));
+    assert.equal(pipeline.isPaused, finalState === 'paused-through-ready');
+    await h.flush({ holdResponse: () => true, holdBody: () => true });
+    await Promise.all(commands);
+    assert.equal(h.audioSpy.constructors.length, 0);
+    assert.equal(h.audioSpy.plays.length, 0);
+    assert.equal(attempt.loadPromise, loader, 'rapid intent changes retain the same loader');
+
+    await h.flush(); await h.clock.advance(200); await h.flush();
+    await h.drain();
+    assert.equal(pipeline.attempt, attempt);
+    assert.equal(attempt.loadPromise, loader);
+    assert.equal(attempt.dataUrl, 'data:audio/mpeg;base64,AQ==');
+    if (finalState === 'paused-through-ready') {
+      assert.equal(attempt.phase, 'ready');
+      assert.equal(h.audioSpy.constructors.length, 0, 'ending paused cannot start at load completion');
+      assert.equal(h.audioSpy.plays.length, 0, 'ending paused cannot play at load completion');
+      const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+      await h.flush(); await resumed;
+    }
+    assert.equal(h.audioSpy.constructors.length, 1);
+    assert.equal(h.audioSpy.plays.length, 1, 'latest running intent activates once');
+    assert.equal(h.audioSpy.constructors[0].url, attempt.dataUrl);
+    const fetchCount = h.fetches.filter(entry => entry.sentence === 1).length;
+    const playCount = h.audioSpy.plays.length, constructorCount = h.audioSpy.constructors.length;
+    const poll = await startOwnedEndPoll(h, attempt);
+    await finishOwnedEndPoll(h, poll);
+    await h.flush(); await h.clock.advance(200); await h.flush();
+    assert.equal(attempt.completionObserved, true);
+    assert.equal(attempt.completionConsumed, true);
+    assert.equal(pipeline.currentIdx, 1, 'one accepted completion advances exactly once');
+    assert.equal(pipeline.attempt.idx, 1);
+    assert.equal(h.audioSpy.constructors.length, constructorCount + 1);
+    assert.equal(h.audioSpy.plays.length, playCount + 1);
+    assert.equal(h.fetches.filter(entry => entry.sentence === 1).length, fetchCount,
+      'completion handling reuses the owned loader and does not refetch its sentence');
+    const scriptCount = h.scripts.entries.length;
+    await h.worker.poll(pipeline, attempt); await h.drain();
+    assert.equal(h.scripts.entries.length, scriptCount, 'duplicate completion cannot create another advancement');
+    await h.finish();
+  });
+});
+
+test('W08 ready_paused_resume', async () => {
+  const h = harness();
+  const started = h.start(); started.catch(() => {});
+  await h.flush({ holdResponse: () => true });
+  const paused = h.pause();
+  await paused;
+  const pipeline = h.worker.pipeline, attempt = pipeline.attempt, loader = attempt.loadPromise;
+  await h.flush(); await h.clock.advance(200); await h.flush();
+  await started;
+  assert.equal(attempt.phase, 'ready');
+  assert.equal(attempt.dataUrl, 'data:audio/mpeg;base64,AQ==');
+  assert.equal(attempt.loadPromise, loader);
+  assert.equal(h.audioSpy.constructors.length, 0);
+
+  const first = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+  const second = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+  await h.flush();
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.accepted, true); assert.equal(secondResult.accepted, true);
+  assert.equal(pipeline.attempt, attempt);
+  assert.equal(attempt.loadPromise, loader);
+  assert.equal(h.audioSpy.constructors.length, 1);
+  assert.equal(h.audioSpy.plays.length, 1);
+  assert.equal(h.audioSpy.constructors[0].url, attempt.dataUrl);
+  await h.finish();
+});
+
+test('W09 end_observed_paused_replay', async () => {
+  const h = harness();
+  const started = h.start(); await h.ready(); await started;
+  const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
+  await h.pause();
+  const poll = await startOwnedEndPoll(h, endedAttempt);
+  await finishOwnedEndPoll(h, poll);
+  assert.equal(pipeline.attempt, endedAttempt);
+  assert.equal(endedAttempt.phase, 'ended');
+  assert.equal(endedAttempt.completionObserved, true);
+  assert.equal(endedAttempt.completionObservedWhilePaused, true);
+  assert.equal(endedAttempt.completionConsumed, false);
+  assert.equal(pipeline.currentIdx, 0);
+
+  const constructors = h.audioSpy.constructors.length, plays = h.audioSpy.plays.length;
+  const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+  await h.flush(); await resumed;
+  assert.notEqual(pipeline.attempt, endedAttempt);
+  assert.equal(pipeline.attempt.idx, 0);
+  assert.equal(endedAttempt.retired, true);
+  assert.equal(endedAttempt.completionConsumed, true);
+  assert.equal(h.audioSpy.constructors.length, constructors + 1);
+  assert.equal(h.audioSpy.plays.length, plays + 1);
+  const successor = pipeline.attempt;
+  const scriptCount = h.scripts.entries.length;
+  await h.worker.poll(pipeline, endedAttempt);
+  await h.drain();
+  assert.equal(h.scripts.entries.length, scriptCount, 'a duplicate old end sample cannot dispatch a successor poll');
+  assert.equal(pipeline.attempt, successor);
+  assert.equal(pipeline.currentIdx, 0);
+  await h.finish();
+});
+
+test('W10 end_observed_after_resume', async t => {
+  for (const policy of ['modes-off', 'repeat-current', 'loop-at-last']) await t.test(policy, async () => {
+    const h = harness();
+    const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline;
+    if (policy === 'loop-at-last') {
+      const binding = { source: 'bar', leaseId: pipeline.leaseId, sessionId: pipeline.sessionId,
+        lifecycleRevision: pipeline.lifecycleRevision, action: 'jumpToSentence', idx: 1 };
+      const jumped = h.send(binding, { tab: { id: pipeline.tabId } });
+      await h.flush(); await jumped;
+      assert.equal(pipeline.currentIdx, 1);
+      await boundModeMessage(h, 'setLoopState', true);
+    } else if (policy === 'repeat-current') {
+      await boundModeMessage(h, 'setRepeatCurrentState', true);
+    }
+    const endedAttempt = pipeline.attempt;
+    await h.pause();
+    const poll = await startOwnedEndPoll(h, endedAttempt);
+    const playCount = h.audioSpy.plays.length, constructorCount = h.audioSpy.constructors.length;
+
+    const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    await h.flush({ holdScript: entry => entry === poll }); await resumed;
+    assert.equal(pipeline.attempt, endedAttempt, 'resume before poll acceptance keeps the same attempt');
+    assert.equal(h.audioSpy.plays.length, playCount, 'resume never plays the physically ended Audio');
+    assert.equal(h.audioSpy.constructors.length, constructorCount);
+
+    await finishOwnedEndPoll(h, poll);
+    await h.flush(); await h.clock.advance(200); await h.flush();
+    const expectedIndex = policy === 'modes-off' ? 1 : 0;
+    assert.equal(pipeline.currentIdx, expectedIndex);
+    assert.notEqual(pipeline.attempt, endedAttempt);
+    assert.equal(pipeline.attempt.idx, expectedIndex);
+    assert.equal(endedAttempt.completionObserved, true);
+    assert.equal(endedAttempt.completionObservedWhilePaused, false);
+    assert.equal(h.audioSpy.constructors.length, constructorCount + 1);
+    assert.equal(h.audioSpy.plays.length, playCount + 1);
+    await h.finish();
+  });
+});
+
+test('W11 pause_at_completion_decision', async t => {
+  await t.test('pause-before-decision', async () => {
+    const h = harness();
+    const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
+    const poll = await startOwnedEndPoll(h, endedAttempt);
+    await boundModeMessage(h, 'setRepeatCurrentState', true);
+    h.page(7, 'ISOLATED').document.getElementById('free-tts-repeat-current').checked = false;
+    await h.pause(entry => entry === poll);
+    await finishOwnedEndPoll(h, poll);
+    assert.equal(pipeline.currentIdx, 0);
+    assert.equal(pipeline.attempt, endedAttempt);
+    assert.equal(endedAttempt.completionObserved, true);
+    assert.equal(endedAttempt.completionObservedWhilePaused, true);
+    assert.equal(endedAttempt.phase, 'ended');
+    assert.equal(h.audioSpy.plays.length, 1);
+    await h.finish();
+  });
+
+  await t.test('decision-before-pause', async () => {
+    const h = harness();
+    const started = h.start(); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, endedAttempt = pipeline.attempt;
+    const poll = await startOwnedEndPoll(h, endedAttempt);
+    await boundModeMessage(h, 'setRepeatCurrentState', true);
+    h.page(7, 'ISOLATED').document.getElementById('free-tts-repeat-current').checked = false;
+    const originalPlayCount = h.audioSpy.plays.length;
+    await finishOwnedEndPoll(h, poll);
+    assert.equal(pipeline.currentIdx, 0, 'decision uses the worker-owned repeat mode, not the DOM checkbox');
+    assert.notEqual(pipeline.attempt, endedAttempt);
+    assert.equal(pipeline.attempt.idx, 0);
+    assert.equal(endedAttempt.completionConsumed, true);
+
+    const pause = h.pause(activation);
+    await pause;
+    assert.equal(pipeline.isPaused, true);
+    assert.equal(pipeline.attempt.phase, 'ready');
+    assert.equal(h.audioSpy.constructors.length, 1, 'new replay does not construct Audio while its activation is held');
+    assert.equal(h.audioSpy.plays.length, originalPlayCount);
+    await h.flush();
+    assert.equal(h.audioSpy.constructors.length, 1, 'the queued replay activation is fenced by the newer pause');
+    assert.equal(h.audioSpy.plays.length, originalPlayCount);
+    const resumed = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+    await h.flush(); await resumed;
+    assert.equal(h.audioSpy.constructors.length, 2);
+    assert.equal(h.audioSpy.plays.length, originalPlayCount + 1);
     await h.finish();
   });
 });
