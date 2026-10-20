@@ -73,11 +73,11 @@ function fixtureDocument(onRemove = () => {}) {
   };
 }
 
-function harness() {
-  const clock = new VirtualClock(), scripts = new ScriptGate(), storage = [], fetches = [], queries = [], messages = [], logs = [];
+function harness(options = {}) {
+  const clock = options.clock || new VirtualClock(), scripts = new ScriptGate(), storage = [], fetches = [], queries = [], messages = [], logs = [];
   let holdTabQueries = false, tabRemoved;
-  const audioSpy = { constructors: [], plays: [], pauses: [], writes: [], media: [], effects: [] };
-  const pages = new Map(); let listener, commandListener;
+  const audioSpy = options.audioSpy || { constructors: [], plays: [], pauses: [], writes: [], media: [], effects: [] };
+  const pages = options.pages || new Map(); let listener, commandListener;
   const timers = Object.fromEntries(['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'].map(key => [key, clock[key].bind(clock)]));
   const chrome = {
     runtime: { onMessage: { addListener(fn) { listener = fn; } } }, commands: { onCommand: { addListener(fn) { commandListener = fn; } } },
@@ -133,9 +133,9 @@ function harness() {
       return response.promise;
     },
   });
-  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, get pendingStart() { return pendingStart; }, get leases() { return pageLeases; }, start: startSentenceTTS, stop: stopPlayback, poll: pollCompletion, setupMediaSession, showControlBar, pageOwner, buildPlaybackSnapshot, failOwnedPlayback };`, worker);
+  vm.runInContext(`${source}\nglobalThis.__worker = { get pipeline() { return sentencePipeline; }, get active() { return activePlayback; }, get pendingStart() { return pendingStart; }, get leases() { return pageLeases; }, split: splitSentences, start: startSentenceTTS, stop: stopPlayback, poll: pollCompletion, setupMediaSession, showControlBar, pageOwner, buildPlaybackSnapshot, failOwnedPlayback };`, worker);
   assert.equal(typeof commandListener, 'function');
-  const api = { clock, scripts, storage, fetches, queries, audioSpy, messages, logs, worker: worker.__worker, page,
+  const api = { clock, scripts, storage, fetches, queries, audioSpy, messages, logs, pages, worker: worker.__worker, page,
     holdTabQueries(value = true) { holdTabQueries = value; },
     shortcut: () => commandListener('speak-selection'),
     closeTab: tabId => tabRemoved?.(tabId),
@@ -2230,7 +2230,7 @@ test('W24 F-9 poll_before_unreconciled_play_rejection', async t => {
     assert.equal(sample.audioStatus, 'error'); assert.equal(sample.audioRevision, failure.audioRevision);
     await h.complete(poll); await h.drain();
     assert.ok(attempt.audioRevision < failure.audioRevision, 'unreconciled poll cannot consume the rejected observation revision');
-    assert.ok(h.scripts.entries.some(entry => !entry.executed && entry.func.name === 'injectPlaybackObservation'),
+    assert.ok(h.scripts.entries.some(entry => !entry.executed && freshObservation(entry)),
       'poll requests a fresh owned sample before any activation continuation');
 
     if (delivery === 'action-before-outcome') {
@@ -2245,6 +2245,445 @@ test('W24 F-9 poll_before_unreconciled_play_rejection', async t => {
     assert.equal(snapshot.error?.message, 'direct media play rejected before poll');
     assert.equal(h.worker.pipeline, null); assert.equal(pipeline.currentIdx, 0);
     assert.equal(attempt.completionObserved, false); assertIdlePage(h);
+    await h.finish();
+  });
+});
+
+// Mode messages must never act as playback intent, and each end policy must
+// consume one completion even when the DOM mode inputs disagree with the worker.
+test('W25 modes_and_splitting', async t => {
+  await t.test('real-splitter-retained-fixtures', () => {
+    const h = harness();
+    for (const [text, expected] of [
+      ['First line\nSecond line\nThird line', ['First line', 'Second line', 'Third line']],
+      ['Heading\nThis is sentence one.\nThis is sentence two.', ['Heading', 'This is sentence one.', 'This is sentence two.']],
+      ['第一句\n第二句。\n第三句', ['第一句', '第二句。', '第三句']],
+      ['One. Two! Three?', ['One.', 'Two!', 'Three?']],
+      ['He said "Hello." Then left.', ['He said "Hello."', 'Then left.']],
+      ['“Hello.” Then left.', ['“Hello.”', 'Then left.']],
+      ['He said “Hello.”\nThen left.', ['He said “Hello.”', 'Then left.']],
+      ['「你好。」然后走了。', ['「你好。」', '然后走了。']],
+      ['Sentence one." Sentence two.', ['Sentence one."', 'Sentence two.']],
+      ['Sentence one.” Sentence two.', ['Sentence one.”', 'Sentence two.']],
+      ['Sentence one.) Sentence two.', ['Sentence one.)', 'Sentence two.']],
+      ['Sentence one!"\nSentence two?"', ['Sentence one!"', 'Sentence two?"']],
+    ]) assert.deepEqual(Array.from(h.worker.split(text)), expected, text);
+    h.assertNoUnintendedTimers();
+  });
+  await t.test('defaults-exclusivity-and-bound-navigation', async () => {
+    const h = harness(); const started = h.worker.start(7, 'First sentence. Second sentence.');
+    await h.ready(); await started; const pipeline = h.worker.pipeline;
+    assert.equal(pipeline.loopEnabled, true); assert.equal(pipeline.repeatCurrentEnabled, false);
+    await h.pause(); const revision = pipeline.intentRevision, floor = pipeline.localIntentFloor, attempt = pipeline.attempt;
+    for (const [action, enabled, loop, repeat] of [
+      ['setRepeatCurrentState', true, false, true], ['setRepeatCurrentState', false, false, false],
+      ['setLoopState', true, true, false], ['setLoopState', false, false, false],
+      ['setRepeatCurrentState', true, false, true], ['setLoopState', true, true, false],
+    ]) {
+      const response = await boundModeMessage(h, action, enabled);
+      assert.equal(response.accepted, true); assert.equal(response.state, 'paused');
+      assert.equal(pipeline.loopEnabled, loop); assert.equal(pipeline.repeatCurrentEnabled, repeat);
+      assert.equal(pipeline.intentRevision, revision); assert.equal(pipeline.localIntentFloor, floor);
+      assert.equal(pipeline.attempt, attempt); assert.equal(h.audioSpy.plays.length, 1);
+    }
+    const previous = await boundNavigation(h, 'prevSentence'); assert.equal(previous.accepted, false);
+    for (const idx of [-1, 2, 0.5, '0']) assert.equal((await boundNavigation(h, 'jumpToSentence', idx)).commandError.code, 'invalid-argument');
+    assert.equal(pipeline.attempt, attempt); assert.equal(pipeline.isPaused, true);
+    for (const [action, idx] of [['nextSentence', 1], ['prevSentence', 0], ['jumpToSentence', 0]]) {
+      const old = pipeline.attempt, result = boundNavigation(h, action, idx);
+      assert.notEqual(pipeline.attempt.attemptId, old.attemptId); assert.equal(old.retired, true);
+      assert.equal(pipeline.currentIdx, idx); assert.equal(pipeline.isPaused, false);
+      await h.flush(); assert.equal((await result).accepted, true);
+    }
+    assert.equal(h.audioSpy.constructors.length, 4); assert.equal(h.audioSpy.plays.length, 4);
+    await h.finish();
+  });
+  for (const policy of ['advance', 'repeat-current', 'loop-at-last', 'complete-at-last', 'next-loop', 'next-repeat', 'next-complete']) {
+    await t.test(policy, async () => {
+      const h = harness(); const started = h.start(); await h.ready(); await started;
+      const pipeline = h.worker.pipeline;
+      if (policy.includes('last') || policy.startsWith('next-')) { const jump = boundNavigation(h, 'jumpToSentence', 1); await h.flush(); await jump; }
+      if (policy === 'repeat-current' || policy === 'next-repeat') await boundModeMessage(h, 'setRepeatCurrentState', true);
+      if (policy === 'loop-at-last' || policy === 'next-loop') await boundModeMessage(h, 'setLoopState', true);
+      const old = pipeline.attempt, count = h.audioSpy.plays.length;
+      const document = h.page(7, 'ISOLATED').document;
+      document.getElementById('free-tts-loop').checked = !pipeline.loopEnabled;
+      document.getElementById('free-tts-repeat-current').checked = !pipeline.repeatCurrentEnabled;
+      h.page(7, 'ISOLATED').__freeTtsLoop = !pipeline.loopEnabled;
+      if (policy.startsWith('next-')) { const next = boundNavigation(h, 'nextSentence'); await h.flush(); await next; }
+      else {
+        const poll = await startOwnedEndPoll(h, old); await finishOwnedEndPoll(h, poll); await h.flush();
+        const scripts = h.scripts.entries.length; await h.worker.poll(pipeline, old); await h.drain();
+        assert.equal(h.scripts.entries.length, scripts, 'one completion decision per attempt');
+      }
+      if (policy.includes('complete')) { assert.equal((await h.snapshot()).state, 'idle'); assert.equal(h.audioSpy.plays.length, count); }
+      else {
+        assert.equal(h.worker.pipeline, pipeline); assert.notEqual(pipeline.attempt.attemptId, old.attemptId);
+        assert.equal(pipeline.currentIdx, policy === 'advance' ? 1 : 0);
+        assert.equal(h.audioSpy.plays.length, count + 1, 'one replay/advance at the boundary');
+      }
+      await h.finish();
+    });
+  }
+  await t.test('normalized-settings-reused-by-preload-and-fallback', async () => {
+    const h = harness(); const started = h.start('First & <sentence>. Second sentence.');
+    h.storage.find(entry => 'serverUrl' in entry.defaults).gate.resolve({ serverUrl: 'http://localhost:5000/path///?ignored=yes#fragment', voice: 'voice"&', speed: 25 });
+    await h.flush({ holdResponse: () => true }); await started;
+    await h.clock.advance(10000); await h.drain();
+    assert.equal(h.fetches.length, 3, 'two preloads and one fallback');
+    for (const entry of h.fetches) {
+      assert.equal(entry.url, 'http://localhost:5000/path/generate-and-download-tts');
+      const { ssml } = JSON.parse(entry.options.body);
+      assert.ok(ssml.includes('name="voice&quot;&amp;"')); assert.ok(ssml.includes('rate="125%"'));
+    }
+    assert.ok(JSON.parse(h.fetches[2].options.body).ssml.includes('First &amp; &lt;sentence&gt;.'));
+    await h.ready(); assert.equal(h.audioSpy.plays.length, 1); await h.finish();
+  });
+});
+
+// A new worker must explicitly claim the old worlds. Queued operations from
+// the former lease cannot reinstall UI/media or retire the new worker's Audio.
+test('W28 lease_and_lifecycle_tombstones', async t => {
+  for (const boundary of ['successor-session', 'stop-tombstone', 'fresh-worker']) await t.test(boundary, async () => {
+    const h = harness(); const first = h.start(); await h.ready(); await first;
+    const old = h.worker.pipeline, templates = h.scripts.entries.filter(entry =>
+      leaseClaim(entry) || sessionInstall(entry) || entry.func.name === 'injectViewSession' || mediaSetup(entry) ||
+      highlightInit(entry) || highlight(entry) || activation(entry) || entry.source.includes('const initialLoopEnabled'));
+    const observed = ['MAIN', 'ISOLATED'].map(world => {
+      const record = h.page(7, world)[world === 'MAIN' ? '__freeTtsPlayback' : '__freeTtsView'];
+      return { leaseId: record.leaseId, lifecycleFloor: record.lifecycleFloor };
+    });
+    if (boundary !== 'fresh-worker') {
+      const stopped = h.send({ source: 'popup', action: 'stopPlayback' }, {}); await h.flush(); await stopped;
+    }
+    let liveHarness = h;
+    if (boundary === 'fresh-worker') {
+      liveHarness = harness({ pages: h.pages, audioSpy: h.audioSpy, clock: h.clock });
+      assert.equal((await liveHarness.snapshot()).state, 'idle', 'worker restart cannot restore a lost pipeline');
+      assert.equal(liveHarness.page(7).__freeTtsPlayback.sessionId, old.sessionId, 'old page owner is still live across worker loss');
+      assert.equal(liveHarness.page(7).__freeTtsAudio.paused, false);
+    }
+    if (boundary !== 'stop-tombstone') { const next = liveHarness.start(); await liveHarness.ready(); await next; }
+    if (boundary === 'fresh-worker') {
+      const stopped = h.worker.stop(old, false); await h.flush(); await stopped;
+    }
+    const retired = h.scripts.entries.filter(entry => entry.func.name === 'clearMediaSession' || retiredBar(entry) || retiredHighlights(entry));
+    const current = liveHarness.worker.pipeline, audio = liveHarness.page(7).__freeTtsAudio;
+    const bar = liveHarness.page(7, 'ISOLATED').document.getElementById('free-tts-bar');
+    const count = h.audioSpy.plays.length, effects = h.audioSpy.effects.length;
+    for (const template of [...templates, ...retired]) await runPageFunction(h, template, template.args);
+    for (const [index, world] of ['MAIN', 'ISOLATED'].entries()) {
+      const claim = templates.find(entry => leaseClaim(entry) && entry.world === world);
+      const result = await runPageFunction(h, claim, [world, 'claim', observed[index], 'stale-contender', 'stale-worker']);
+      assert.equal(result.claimed, false, 'CAS checks the lifecycle floor as well as the token');
+      const install = templates.find(entry => entry.func.name === (world === 'MAIN' ? 'injectPlaybackSession' : 'injectViewSession'));
+      assert.equal((await runPageFunction(h, install, install.args)).installed, false, 'equal retired lifecycle cannot be installed');
+    }
+    assert.equal(h.audioSpy.plays.length, count);
+    if (current) assert.equal(h.audioSpy.effects.length, effects);
+    else assert.ok(h.audioSpy.effects.slice(effects).every(effect => effect.cleared), 'repeated idle cleanup only clears already retired media');
+    assert.equal(liveHarness.worker.pipeline, current); assert.equal(liveHarness.page(7).__freeTtsAudio, audio);
+    assert.equal(liveHarness.page(7, 'ISOLATED').document.getElementById('free-tts-bar'), bar);
+    if (current) { assert.equal(liveHarness.page(7).__freeTtsPlayback.sessionId, current.sessionId); assert.equal(audio.paused, false); }
+    else assertIdlePage(h);
+    assert.equal(old.cancelled, true); await liveHarness.finish(); h.assertNoUnintendedTimers();
+  });
+  await t.test('three-claim-contention-bound', async () => {
+    const h = harness(); const started = h.start(); const pipeline = h.worker.pipeline;
+    for (let round = 0; round < 3; round++) {
+      await h.flush({ holdScript: leaseClaim }); const claim = h.scripts.pending(leaseClaim);
+      const record = h.page(7).__freeTtsPlayback;
+      assert.equal((await runPageFunction(h, claim, ['MAIN', 'claim', { leaseId: record?.leaseId ?? null, lifecycleFloor: record?.lifecycleFloor ?? 0 }, `winner-${round}`, 'competing-worker'])).claimed, true);
+      assert.equal(h.execute(claim).claimed, false); await h.complete(claim);
+    }
+    await h.flush(); assert.equal((await started).commandError.code, 'page-operation-failure');
+    assert.equal(h.scripts.entries.filter(entry => leaseClaim(entry) && entry.args[3] === pipeline.leaseId).length, 3);
+    assert.equal((await h.snapshot()).state, 'idle'); await h.finish();
+  });
+});
+
+const freshObservation = entry => entry.func.name === 'injectPlaybackObservation' || entry.func.name === 'injectFreshObservation';
+const workerIntentRequest = entry => entry.func.name === 'injectWorkerIntent';
+
+async function settleAudio(h, play, outcome) {
+  if (outcome === 'fulfill') play.outcome.resolve(); else play.outcome.reject(new Error('early live play rejected'));
+  await h.drain();
+  const message = h.messages.findLast(entry => entry.world === 'MAIN' && entry.data.action === 'audioPlaybackEvent');
+  assert.ok(message, 'live MAIN invocation publishes its retained outcome'); return message.data;
+}
+
+async function pausedCrossingFixture(holdPauseRead = false) {
+  const h = harness(); const started = h.start(); await h.ready(); await started;
+  h.audioSpy.plays[0].outcome.resolve(); await h.drain();
+  const pipeline = h.worker.pipeline, attempt = pipeline.attempt, record = h.page(7).__freeTtsPlayback;
+  // Seed only counter offsets after real install/selection/intent/audio paths,
+  // before dispatching the real R4 pause and its read. Ownership, Audio identity,
+  // direct handlers, outcomes and every sample remain production behavior.
+  pipeline.intentRevision = pipeline.localIntentFloor = record.workerIntentRevision = 3;
+  pipeline.mediaRevision = record.mediaRevision = 2;
+  attempt.audioRevision = record.audioRevision = 11;
+  await h.pause(holdPauseRead ? freshObservation : () => false);
+  assert.deepEqual([record.workerIntentRevision, record.mediaRevision, record.startSerial, record.audioRevision], [4, 2, 3, 12]);
+  const notification = h.mediaAction(7, 'play');
+  assert.deepEqual([notification.intentRevision, notification.mediaRevision, notification.startSerial, notification.audioRevision], [4, 3, 4, 13]);
+  assert.equal(notification.audioStatus, 'starting'); assert.equal(h.audioSpy.plays.length, 2);
+  return { h, pipeline, attempt, record, notification, play: h.audioSpy.plays[1], audio: record.audio };
+}
+
+// Dropping a structurally current early outcome, accepting an obsolete starting
+// receipt, or continuing from a provisional read loses the failure or replays it.
+test('W29 early_audio_outcome', async t => {
+  for (const failure of ['reject', 'no-receipt', 'missing-audio']) await t.test(`current-fresh-read-${failure}`, async () => {
+    const h = harness(); const started = h.start(); await h.ready(); await started; await h.pause();
+    const notification = h.mediaAction(7, 'play'), delivery = h.send(h.deliverRelay(7, notification));
+    await h.flush({ holdScript: freshObservation }); await delivery;
+    const read = h.scripts.pending(freshObservation);
+    if (failure === 'missing-audio') h.page(7).__freeTtsPlayback.audio = null;
+    h.execute(read);
+    if (failure === 'reject') await h.fail(read, new Error('current owned read rejected'));
+    else await h.complete(read, failure === 'no-receipt' ? null : read.result);
+    await h.flush();
+    assert.equal((await h.snapshot()).state, 'idle');
+    assert.equal((await h.snapshot()).error.code, failure === 'missing-audio' ? 'missing-audio' : 'page-operation-failure');
+    assert.equal(h.audioSpy.plays.length, 2, 'failed reads never retry the direct play');
+    await h.finish();
+  });
+  // A newer direct media pause leaves worker R unchanged. A failed old MAIN
+  // read is superseded by M, just as a local pause supersedes it by R.
+  for (const operation of ['fresh-read', 'completion-poll']) for (const failure of ['reject', 'no-receipt']) {
+    await t.test(`older-${operation}-${failure}-after-media-pause`, async () => {
+      const h = harness(); const started = h.start(); await h.ready(); await started; await h.pause();
+      const pipeline = h.worker.pipeline, attempt = pipeline.attempt, audio = h.page(7).__freeTtsAudio;
+      let pending, polling;
+      if (operation === 'fresh-read') {
+        const notification = h.mediaAction(7, 'play'), delivered = h.send(h.deliverRelay(7, notification));
+        await h.flush({ holdScript: freshObservation }); await delivered; pending = h.scripts.pending(freshObservation);
+      } else {
+        polling = h.worker.poll(pipeline, attempt); await h.drain(); pending = h.scripts.pending(completionPoll);
+      }
+      h.execute(pending);
+      const mediaPause = h.mediaAction(7, 'pause'), delivered = h.send(h.deliverRelay(7, mediaPause));
+      await h.flush({ holdScript: entry => entry === pending || freshObservation(entry) }); await delivered;
+      const mediaRevision = pipeline.mediaRevision, intentRevision = pipeline.intentRevision, plays = h.audioSpy.plays.length;
+      assert.equal(pipeline.isPaused, true); assert.equal(audio.paused, true);
+      if (failure === 'reject') await h.fail(pending, new Error('superseded MAIN read rejected'));
+      else await h.complete(pending, null);
+      await h.flush(); if (polling) await polling;
+      assert.equal(h.worker.pipeline, pipeline, 'an old media-base failure cannot retire the newer media pause');
+      assert.equal(pipeline.attempt, attempt); assert.equal(pipeline.intentRevision, intentRevision); assert.equal(pipeline.mediaRevision, mediaRevision);
+      assert.equal((await h.snapshot()).state, 'paused'); assert.equal((await h.snapshot()).error, null);
+      assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(audio.paused, true); assert.equal(h.audioSpy.plays.length, plays);
+      await h.finish();
+    });
+  }
+  for (const outcome of ['fulfill', 'reject']) for (const superseding of ['none', 'pause', 'navigation', 'replacement']) await t.test(`activation-receipt-${outcome}-${superseding}`, async () => {
+    const h = harness(); const started = h.start(); await h.ready(activation); await started;
+    const request = h.scripts.pending(activation), receipt = h.execute(request), attempt = h.worker.pipeline.attempt;
+    const event = await settleAudio(h, h.audioSpy.plays[0], outcome);
+    assert.equal(attempt.audioId, null, 'activation has executed but has not introduced its Audio to the worker');
+    if (superseding === 'pause') await h.pause(entry => entry === request);
+    if (superseding === 'navigation') { const jump = boundNavigation(h, 'jumpToSentence', 1); await h.flush({ holdScript: entry => entry === request }); await jump; }
+    if (superseding === 'replacement') { const replacement = h.start(); await h.ready(entry => entry === request); await replacement; }
+    const current = h.worker.pipeline, currentAttempt = current.attempt;
+    const delivery = h.send(h.deliverRelay(7, event));
+    await h.flush({ holdScript: entry => entry === request }); await delivery;
+    if (superseding === 'none') {
+      if (outcome === 'fulfill') {
+        assert.equal(attempt.audioId, event.audioId); assert.equal(attempt.startSerial, event.startSerial);
+        assert.equal(attempt.audioStatus, 'playing'); assert.equal(attempt.audioRevision, event.audioRevision);
+      } else assert.equal((await h.snapshot()).error.code, 'play-rejection');
+    }
+    assert.ok(receipt.audioRevision < event.audioRevision);
+    const count = h.audioSpy.plays.length, constructors = h.audioSpy.constructors.length;
+    await h.complete(request); await h.flush();
+    if (superseding === 'none') {
+      assert.equal((await h.snapshot()).audioStatus, outcome === 'fulfill' ? 'playing' : 'none');
+      assert.equal(constructors, 1); assert.equal(count, 1);
+    } else {
+      assert.equal(h.worker.pipeline, current); assert.equal(current.attempt, currentAttempt); assert.equal((await h.snapshot()).error, null);
+      if (superseding === 'pause') { assert.equal(current.isPaused, true); assert.equal(h.page(7).__freeTtsAudio.paused, true); }
+      else assert.notEqual(currentAttempt, attempt);
+    }
+    assert.equal(h.audioSpy.constructors.length, constructors); assert.equal(h.audioSpy.plays.length, count);
+    await h.finish();
+  });
+  for (const crossing of ['action', 'receipt', 'read-before-outcome']) for (const outcome of ['fulfill', 'reject']) {
+    for (const superseding of ['none', 'pause', 'navigation', 'replacement']) await t.test(`${crossing}-${outcome}-${superseding}`, async () => {
+      const { h, pipeline, attempt, record, notification, play, audio } = await pausedCrossingFixture(crossing === 'read-before-outcome');
+      const beforeReads = h.scripts.entries.filter(freshObservation).length - (crossing === 'read-before-outcome' ? 1 : 0);
+      const beforeSequence = pipeline.lastMediaSequence;
+      let conflict, popup, read, action;
+      if (crossing === 'receipt') {
+        popup = h.send({ action: 'resumePlayback', source: 'popup' }, {}); await h.drain();
+        conflict = h.scripts.pending(workerIntentRequest);
+        const receipt = h.execute(conflict);
+        assert.equal(receipt.disposition, 'superseded-by-media');
+        assert.deepEqual([receipt.intentRevision, receipt.mediaRevision, receipt.startSerial, receipt.audioRevision], [5, 3, 4, 13]);
+      } else if (crossing === 'read-before-outcome') {
+        // The pause receipt requested this read, but the newer direct play has
+        // executed before the read. Its M3/S4 invocation is still unknown.
+        read = h.scripts.pending(freshObservation); const sample = h.execute(read);
+        assert.equal(sample.audioStatus, 'starting'); assert.equal(sample.audioRevision, 13);
+        assert.equal(attempt.audioRevision, 12, 'uncompleted read has not authorized adoption');
+      }
+      const event = await settleAudio(h, play, outcome);
+      assert.deepEqual([event.intentRevision, event.mediaRevision, event.startSerial, event.audioRevision], [crossing === 'receipt' ? 5 : 4, 3, 4, 14]);
+      if (outcome === 'reject') { assert.equal(record.audioStatus, 'error'); assert.equal(record.audioError.code, 'play-rejection'); }
+      const delivered = h.send(h.deliverRelay(7, event));
+      await h.flush({ holdScript: entry => entry === conflict || entry === read || freshObservation(entry) }); await delivered;
+      const pendingReads = h.scripts.entries.filter(entry => freshObservation(entry) && !entry.completion.settled);
+      assert.equal(pendingReads.length, 1, 'one observation in flight per attempt');
+      if (read) assert.equal(attempt.observationNeeded, true, 'outcome after read execution guarantees a resample');
+      let latest = pipeline, latestAttempt = attempt, supersededCommand;
+      if (superseding === 'pause') {
+        // First learn that media is running, while reconciliation is still held.
+        // An explicit pause is otherwise redundant against accepted paused state.
+        if (conflict) { await h.complete(conflict); conflict = null; }
+        else { action = h.send(h.deliverRelay(7, notification)); await h.drain(); }
+        supersededCommand = h.send({ action: 'pausePlayback', source: 'popup' }, {});
+        await h.flush({ holdScript: entry => entry === conflict || freshObservation(entry) });
+        const response = await supersededCommand; assert.equal(response.state, 'paused'); assert.equal(response.pageApplied, true);
+        assert.equal(audio.paused, true, 'pause acknowledges independently of the old read');
+      } else if (superseding === 'navigation') {
+        supersededCommand = boundNavigation(h, 'jumpToSentence', 1); latestAttempt = pipeline.attempt;
+        await h.flush({ holdScript: entry => entry === conflict || freshObservation(entry) }); await supersededCommand;
+        assert.equal(attempt.observationNeeded, false, 'retiring an attempt clears its coalesced observation');
+      } else if (superseding === 'replacement') {
+        supersededCommand = h.start(); latest = h.worker.pipeline; latestAttempt = latest.attempt;
+        await h.ready(entry => entry === conflict || freshObservation(entry)); await supersededCommand;
+        assert.equal(attempt.observationNeeded, false, 'retiring a session clears its coalesced observation');
+      }
+      // Neither the read nor a receipt may consume the held action's sequence.
+      assert.equal(pipeline.lastMediaSequence, action ? notification.mediaSequence : beforeSequence);
+      if (conflict) { await h.complete(conflict); await h.drain(); }
+      if (!action) {
+        action = h.send(h.deliverRelay(7, notification)); await h.drain();
+        if (crossing === 'receipt' || superseding !== 'none') {
+          assert.equal((await action).accepted, false); assert.equal(pipeline.lastMediaSequence, beforeSequence);
+        }
+      }
+      await h.flush(); if (action) await action; if (popup) await popup;
+      const reads = h.scripts.entries.filter(freshObservation).slice(beforeReads).filter(entry => entry.args[0].sessionId === pipeline.sessionId && entry.args[1] === attempt.attemptId);
+      assert.ok(reads.length <= 2, `one read and one coalesced resample, observed ${reads.length}`);
+      if (superseding === 'none') {
+        assert.ok(reads.some(entry => entry.result?.audioRevision === 14), 'a post-outcome sample is guaranteed');
+        if (outcome === 'reject') { assert.equal((await h.snapshot()).state, 'idle'); assert.equal((await h.snapshot()).error.code, 'play-rejection'); }
+        else {
+          assert.equal(h.worker.pipeline, pipeline); assert.equal(attempt.audioStatus, 'playing'); assert.equal(attempt.audioRevision, 14);
+          assert.equal(attempt.startSerial, 4); assert.equal(record.audio, audio); assert.equal(audio.currentTime, 3);
+        }
+        assert.equal(h.audioSpy.constructors.length, 1); assert.equal(h.audioSpy.plays.length, 2, 'no worker replay of direct play');
+        if (crossing === 'receipt') assert.equal(pipeline.lastMediaSequence, beforeSequence, 'rejected N/R4 never advances sequence');
+      } else {
+        assert.equal(h.worker.pipeline, latest); assert.equal(latest.attempt, latestAttempt);
+        assert.equal((await h.snapshot()).error, null, 'superseded failure cannot retire a newer intent/owner');
+        if (superseding === 'pause') { assert.equal(latest.isPaused, true); assert.equal(h.audioSpy.plays.length, 2); }
+        else { assert.notEqual(latestAttempt, attempt); assert.equal(h.page(7).__freeTtsPlayback.attemptId, latestAttempt.attemptId); }
+      }
+      await h.finish();
+    });
+  }
+});
+
+// Removing the running intent's attempt check resumes the displaced idx-0
+// Audio before idx-1's selection, even though the new loader is still held.
+test('W30 navigation_resume_attempt_binding', async () => {
+  const h = harness(); const started = h.start(); await h.ready(activation); await started;
+  const staleStart = h.scripts.pending(activation); h.execute(staleStart);
+  const originalAudio = h.page(7).__freeTtsAudio, pipeline = h.worker.pipeline, original = pipeline.attempt;
+  const jump = boundNavigation(h, 'jumpToSentence', 1), latest = pipeline.attempt;
+  const selectingLatest = entry => entry.func.name === 'injectSelectAttempt' && entry.args[0].attemptId === latest.attemptId;
+  await h.flush({ holdScript: entry => entry === staleStart || selectingLatest(entry) || highlight(entry) });
+  const selection = h.scripts.pending(selectingLatest);
+  await h.pause(entry => entry === staleStart || entry === selection || highlight(entry));
+  const plays = h.audioSpy.plays.length;
+  const resume = h.send({ action: 'resumePlayback', source: 'popup' }, {});
+  await h.flush({ holdScript: entry => entry === staleStart || entry === selection || highlight(entry) }); await resume;
+  assert.equal(h.page(7).__freeTtsPlayback.attemptId, original.attemptId);
+  assert.equal(h.audioSpy.plays.length, plays, 'resume must not play the preceding attempt while selection is pending');
+  assert.equal(originalAudio.paused, true);
+  h.execute(selection); await h.complete(selection);
+  await h.flush({ holdScript: entry => entry === staleStart }); await jump;
+  assert.equal(pipeline.attempt, latest); assert.equal(latest.idx, 1); assert.equal(h.audioSpy.plays.length, plays + 1);
+  const audio = h.page(7).__freeTtsAudio; assert.notEqual(audio, originalAudio);
+  assert.equal(h.audioSpy.constructors.at(-1).url, 'data:audio/mpeg;base64,Ag==');
+  // Reexecute the already-dispatched old capability after the new attempt won.
+  await runPageFunction(h, staleStart, staleStart.args); await h.complete(staleStart); await h.flush();
+  assert.equal(h.page(7).__freeTtsAudio, audio); assert.equal(h.audioSpy.plays.length, plays + 1);
+  assert.equal(latest.audioId, h.page(7).__freeTtsPlayback.audioId); await h.finish();
+});
+
+// Media receipts must not consume action sequences or substitute a later pause's
+// mediaBase. Ordered next/next remains two requests without raising local floor.
+test('W31 delayed_media_navigation', async t => {
+  for (const action of ['nexttrack', 'previoustrack', 'stop']) await t.test(`older-than-local-pause-${action}`, async () => {
+    const h = harness(); const started = h.start('First sentence. Second sentence. Third sentence.'); await h.ready(); await started;
+    const jump = boundNavigation(h, 'jumpToSentence', 1); await h.flush(); await jump;
+    const pipeline = h.worker.pipeline, attempt = pipeline.attempt, notification = h.mediaAction(7, action);
+    await h.pause(); const snapshot = await h.snapshot(), count = h.audioSpy.plays.length;
+    const response = await h.command(h.deliverRelay(7, notification), { tab: { id: 7 } });
+    assert.equal(response.accepted, false); assert.equal(pipeline.attempt, attempt); assert.equal(pipeline.currentIdx, 1);
+    assert.deepEqual(await h.snapshot(), snapshot); assert.equal(h.audioSpy.plays.length, count); assert.equal(pipeline.lastMediaSequence, 0);
+    await h.finish();
+  });
+  await t.test('second-next-before-first-receipt', async () => {
+    const h = harness(); const started = h.start('First sentence. Second sentence. Third sentence.'); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, floor = pipeline.localIntentFloor, original = pipeline.attempt;
+    const first = h.mediaAction(7, 'nexttrack'), second = h.mediaAction(7, 'nexttrack');
+    const one = h.send(h.deliverRelay(7, first)); await h.drain(); const middle = pipeline.attempt;
+    const selection = h.scripts.pending(entry => entry.func.name === 'injectSelectAttempt'), intent = h.scripts.pending(workerIntentRequest);
+    h.execute(selection); h.execute(intent);
+    assert.equal(selection.completion.settled, false); assert.equal(intent.completion.settled, false);
+    const two = h.send(h.deliverRelay(7, second)); await h.drain(); const latest = pipeline.attempt;
+    assert.deepEqual([original.idx, middle.idx, latest.idx], [0, 1, 2]);
+    assert.equal(new Set([original.attemptId, middle.attemptId, latest.attemptId]).size, 3);
+    assert.equal(original.retired, true); assert.equal(middle.retired, true);
+    await h.flush({ holdScript: entry => entry === selection || entry === intent }); await two;
+    const audio = h.page(7).__freeTtsAudio, plays = h.audioSpy.plays.length;
+    assert.equal(h.page(7).__freeTtsPlayback.attemptId, latest.attemptId);
+    await h.complete(intent); await h.complete(selection); await h.flush(); await one;
+    assert.equal(pipeline.attempt, latest); assert.equal(pipeline.currentIdx, 2); assert.equal(h.page(7).__freeTtsAudio, audio);
+    assert.equal(pipeline.lastMediaSequence, second.mediaSequence); assert.equal(pipeline.localIntentFloor, floor);
+    assert.equal(h.audioSpy.plays.length, plays, 'old receipts cannot schedule the displaced middle attempt');
+    assert.equal(h.audioSpy.constructors.length, 2, 'only original and final attempts construct Audio');
+    assert.equal((await h.command(h.deliverRelay(7, second), { tab: { id: 7 } })).accepted, false);
+    assert.equal(h.audioSpy.plays.length, plays); await h.finish();
+  });
+  for (const interleave of ['none', 'pause-before-selection', 'pause-known-before-second', 'reverse-delivery']) await t.test(`ordered-next-burst-${interleave}`, async () => {
+    const h = harness(); const started = h.start('First sentence. Second sentence. Third sentence.'); await h.ready(); await started;
+    const pipeline = h.worker.pipeline, floor = pipeline.localIntentFloor, original = pipeline.attempt;
+    const first = h.mediaAction(7, 'nexttrack'), second = h.mediaAction(7, 'nexttrack');
+    const one = h.send(h.deliverRelay(7, interleave === 'reverse-delivery' ? second : first));
+    const middle = pipeline.attempt; assert.equal(middle.idx, 1); assert.notEqual(middle.attemptId, original.attemptId);
+    await h.drain(); const firstIntent = h.scripts.pending(workerIntentRequest);
+    const firstSelection = h.scripts.pending(entry => entry.func.name === 'injectSelectAttempt');
+    let pause;
+    if (interleave === 'pause-before-selection') pause = h.mediaAction(7, 'pause');
+    h.execute(firstSelection); await h.complete(firstSelection);
+    h.execute(firstIntent); await h.complete(firstIntent);
+    await h.flush({ holdScript: entry => freshObservation(entry) || activation(entry) }); await one;
+    assert.equal(pipeline.lastMediaSequence, interleave === 'reverse-delivery' ? second.mediaSequence : first.mediaSequence,
+      'first receipt cannot consume the undelivered action');
+    if (interleave === 'pause-known-before-second') {
+      pause = h.mediaAction(7, 'pause'); await h.command(h.deliverRelay(7, pause), { tab: { id: 7 } });
+    }
+    const two = h.send(h.deliverRelay(7, interleave === 'reverse-delivery' ? first : second)); await h.drain();
+    if (interleave === 'reverse-delivery' || interleave === 'pause-known-before-second') {
+      assert.equal((await two).accepted, false, 'highest admitted sequence suppresses lower undelivered actions');
+      assert.equal(pipeline.attempt, middle);
+    } else {
+      const latest = pipeline.attempt; assert.equal(latest.idx, 2); assert.notEqual(latest.attemptId, middle.attemptId);
+      const intent = h.scripts.pending(workerIntentRequest);
+      assert.equal(intent.args[0].mediaBase, second.mediaRevision, 'navigation uses the originating M, even if receipt learned a newer pause');
+      if (pause) assert.equal(pipeline.isPaused, true, 'known newer media pause survives selection');
+    }
+    await h.flush(); await two;
+    const latest = pipeline.attempt, count = h.audioSpy.plays.length;
+    const duplicate = await h.command(h.deliverRelay(7, second), { tab: { id: 7 } });
+    assert.equal(duplicate.accepted, false); assert.equal(pipeline.attempt, latest); assert.equal(h.audioSpy.plays.length, count);
+    assert.equal(pipeline.localIntentFloor, floor, 'media navigation does not raise local intent floor');
+    if (pause) { assert.equal(pipeline.isPaused, true); assert.equal(h.page(7).__freeTtsPlayback.desiredPaused, true); assert.equal(h.page(7).__freeTtsAudio, null); }
+    else assert.equal(h.page(7).__freeTtsPlayback.attemptId, latest.attemptId);
     await h.finish();
   });
 });

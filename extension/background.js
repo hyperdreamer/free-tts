@@ -401,10 +401,10 @@ function adoptPageReceipt(pipeline, attempt, receipt) {
 
 // One no-effect read and one follow-up bit per live attempt. Reads never admit
 // media actions and cannot grant a stale command permission to play again.
-function requestPageObservation(pipeline, attempt) {
+function requestFreshObservation(pipeline, attempt) {
   if (!ownsPipeline(pipeline, attempt)) return;
-  if (attempt.observationPromise) { attempt.observationNeeded = true; return; }
-  let intentRevision = pipeline.intentRevision;
+  if (attempt.observationRequest) { attempt.observationNeeded = true; return; }
+  let intentRevision = pipeline.intentRevision, mediaRevision = pipeline.mediaRevision;
   const observation = (async () => {
     await pipeline.installPromise;
     // A worker attempt can be published before its MAIN selection executes.
@@ -415,14 +415,15 @@ function requestPageObservation(pipeline, attempt) {
       if (!ownsPipeline(pipeline, attempt)) return;
       attempt.observationNeeded = false;
       intentRevision = pipeline.intentRevision;
+      mediaRevision = pipeline.mediaRevision;
       const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN",
-        func: injectPlaybackObservation, args: [pageOwner(pipeline), attempt.attemptId] });
+        func: injectFreshObservation, args: [pageOwner(pipeline), attempt.attemptId] });
       if (!ownsPipeline(pipeline, attempt)) return;
       const receipt = result?.result;
       if (intentRevision !== pipeline.intentRevision) continue;
       if (!validPageReceipt(pipeline, receipt)) throw new Error("MAIN observation returned no valid owned receipt");
       if (!receipt.owned || (attempt.audioId && !receipt.audioId)) {
-        if (receipt.intentRevision === pipeline.intentRevision && receipt.attemptId === attempt.attemptId) {
+        if (receipt.intentRevision === pipeline.intentRevision && receipt.mediaRevision >= pipeline.mediaRevision && receipt.attemptId === attempt.attemptId) {
           failOwnedPlayback(pipeline, "missing-audio", new Error("Owned Audio is missing"), attempt);
         }
         return;
@@ -431,18 +432,26 @@ function requestPageObservation(pipeline, attempt) {
       if (ownsPipeline(pipeline, attempt)) await updateControlBar(pipeline, buildPlaybackSnapshot(pipeline), playbackModes(pipeline));
     } while (attempt.observationNeeded);
   })().catch(error => {
-    if (intentRevision === pipeline.intentRevision) failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+    // Direct media intent can supersede a read without changing worker R.
+    if (intentRevision === pipeline.intentRevision && mediaRevision === pipeline.mediaRevision) {
+      failOwnedPlayback(pipeline, "page-operation-failure", error, attempt);
+    }
   }).finally(() => {
-    if (attempt.observationPromise !== observation) return;
-    attempt.observationPromise = null;
+    if (attempt.observationRequest !== observation) return;
+    attempt.observationRequest = null;
     if (!ownsPipeline(pipeline, attempt)) return;
     if (attempt.observationNeeded) requestPageObservation(pipeline, attempt);
     else continueObservedPlayback(pipeline, attempt);
   });
-  attempt.observationPromise = observation;
+  attempt.observationRequest = observation;
 }
 
-function injectPlaybackObservation(owner, attemptId) {
+// Preserve the predecessor's helper entrypoints while exposing the task's
+// canonical fresh-observation interface. The injected body stays self-contained.
+const requestPageObservation = requestFreshObservation;
+const injectPlaybackObservation = injectFreshObservation;
+
+function injectFreshObservation(owner, attemptId) {
   const record = window.__freeTtsPlayback;
   if (!record?.receipt || record.retired || record.leaseId !== owner.leaseId || record.sessionId !== owner.sessionId ||
       record.lifecycleRevision !== owner.lifecycleRevision || record.attemptId !== attemptId) return null;
@@ -452,7 +461,7 @@ function injectPlaybackObservation(owner, attemptId) {
 }
 
 function continueObservedPlayback(pipeline, attempt) {
-  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || attempt.observationPromise || attempt.observationNeeded) return;
+  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || attempt.observationRequest || attempt.observationNeeded) return;
   if (attempt.completionObservedWhilePaused && !attempt.completionConsumed) {
     attempt.completionConsumed = true;
     const replay = createAttempt(pipeline, pipeline.initialized ? "loading" : "initializing");
@@ -1378,10 +1387,11 @@ function createAttempt(pipeline, phase = "loading") {
     previous.cacheTimer = null;
     previous.cacheWake?.();
     previous.cacheWake = null;
+    previous.observationNeeded = false;
   }
   return pipeline.attempt = { attemptId: ++pipeline.nextAttemptId, idx: pipeline.currentIdx, phase, retired: false,
     dataUrl: null, loadPromise: null, selectionPromise: null, selectionReceipt: null,
-    activationRequest: null, pageReceipt: null, observationPromise: null, observationNeeded: false,
+    activationRequest: null, pageReceipt: null, observationRequest: null, observationNeeded: false,
     audioId: null, audioStatus: "none", audioRevision: -1,
     startSerial: null, pollTimer: null, pollInFlight: false, completionObserved: false,
     completionObservedWhilePaused: false, completionConsumed: false };
@@ -1449,7 +1459,7 @@ async function playNextSentence(pipeline = sentencePipeline, attempt = pipeline?
 }
 
 function requestActivation(pipeline, attempt) {
-  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || attempt.observationPromise || attempt.observationNeeded || !attempt.dataUrl || attempt.audioStatus === "ended" ||
+  if (!ownsPipeline(pipeline, attempt) || pipeline.isPaused || attempt.observationRequest || attempt.observationNeeded || !attempt.dataUrl || attempt.audioStatus === "ended" ||
       ["starting", "playing"].includes(attempt.audioStatus) || attempt.completionObserved) return;
   const selection = attempt.selectionReceipt;
   if (!selection || selection.leaseId !== pipeline.leaseId || selection.sessionId !== pipeline.sessionId ||
@@ -1512,7 +1522,7 @@ function observeAttemptCompletion(pipeline, attempt) {
 async function pollCompletion(pipeline, attempt) {
   if (!ownsPipeline(pipeline, attempt) || attempt.pollInFlight || attempt.completionObserved || !attempt.audioId) return;
   attempt.pollInFlight = true;
-  const intentRevision = pipeline.intentRevision;
+  const intentRevision = pipeline.intentRevision, mediaRevision = pipeline.mediaRevision;
   try {
     const [result] = await chrome.scripting.executeScript({ target: { tabId: pipeline.tabId }, world: "MAIN", func: (owner, attemptId, audioId) => {
       const record = window.__freeTtsPlayback;
@@ -1528,9 +1538,9 @@ async function pollCompletion(pipeline, attempt) {
     if (!ownsPipeline(pipeline, attempt)) return;
     const sample = result?.result;
     if (!sample?.owned || sample.attemptId !== attempt.attemptId || sample.audioId !== attempt.audioId) {
-      if (pipeline.intentRevision === intentRevision && sample?.status === "missing-audio") {
+      if (pipeline.intentRevision === intentRevision && pipeline.mediaRevision === mediaRevision && sample?.status === "missing-audio") {
         failOwnedPlayback(pipeline, "missing-audio", new Error("Owned Audio is missing"), attempt);
-      } else if (!sample && pipeline.intentRevision === intentRevision) {
+      } else if (!sample && pipeline.intentRevision === intentRevision && pipeline.mediaRevision === mediaRevision) {
         throw new Error("Completion poll returned no receipt");
       }
       return;
@@ -1546,7 +1556,9 @@ async function pollCompletion(pipeline, attempt) {
     if (!ownsPipeline(pipeline, attempt) || !sample.ended) return;
     observeAttemptCompletion(pipeline, attempt);
   } catch (error) {
-    if (ownsPipeline(pipeline, attempt) && pipeline.intentRevision === intentRevision) failOwnedPlayback(pipeline, "poll-failure", error, attempt);
+    if (ownsPipeline(pipeline, attempt) && pipeline.intentRevision === intentRevision && pipeline.mediaRevision === mediaRevision) {
+      failOwnedPlayback(pipeline, "poll-failure", error, attempt);
+    }
   } finally {
     if (ownsPipeline(pipeline, attempt)) {
       attempt.pollInFlight = false;

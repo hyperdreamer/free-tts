@@ -91,6 +91,7 @@ def test_split_sentences_keeps_closing_quotes_with_sentence(
     [
         "W15 same_index_and_return_navigation",
         "W16 poll_identity_and_no_overlap",
+        "W30 navigation_resume_attempt_binding",
     ],
 )
 def test_extension_pipeline_attempt_ownership(case):

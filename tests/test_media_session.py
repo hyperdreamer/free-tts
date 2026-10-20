@@ -71,7 +71,9 @@ def test_keepalive_ping_present():
         "W18 terminal_cleanup_overlap",
         "W19 media_direct_without_worker",
         "W20 media_pause_fences_queued_start",
+        "W25 modes_and_splitting",
         "W26 relay_and_world_invariants",
+        "W29 early_audio_outcome",
     ],
 )
 def test_media_session_behavior(case):
